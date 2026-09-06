@@ -32,6 +32,17 @@ struct DetectedModel {
   std::vector<std::string> outputs;
   std::string parent_model_type;     // supplements: the model they attach to
   std::string parent_param_class;
+  // The catalogue's pinned repo-relative files, when the directory was
+  // identified AS a catalogue entry. Empty for everything else.
+  //
+  // It is what told the entries of a multi-model repo apart (see
+  // catalog_pick_present_ in the .cc), and it is worth carrying out
+  // because a record that pins files RESOLVES to the subtree holding
+  // them -- `MiniMaxAI/MiniMax-H3` pins `FL2VA/...`, so the model root
+  // is `<dir>/FL2VA` and not `<dir>`. A registered model without this
+  // field resolves to the repo directory, which for a partitioned repo
+  // has no transformer/ in it at all.
+  std::vector<std::string> files;
   // "comfyui" for a Comfy-Org repack (one .safetensors per component
   // under diffusion_models/ | text_encoders/ | vae/, config in the
   // safetensors __metadata__), empty for the upstream diffusers/HF

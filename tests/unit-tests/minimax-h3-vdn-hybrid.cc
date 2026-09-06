@@ -21,6 +21,7 @@
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/vdn-geometry.h"
 
 #include <chrono>
 #include <cmath>
@@ -36,6 +37,7 @@ using namespace vpipe;
 using namespace vpipe::genai;
 using namespace vpipe::metal_compute;
 namespace h3 = vpipe::genai::minimax_h3;
+namespace vdn = vpipe::genai::minimax_h3::vdn;
 
 namespace {
 
@@ -521,4 +523,88 @@ TEST(minimax_h3_vdn, block_sparse_steel_matches_the_span_reference)
   // And it must not be ZERO either: two runs that took the same path
   // would agree exactly, which would mean the env A/B did nothing.
   EXPECT_TRUE(rel > 0.0);
+}
+
+TEST(minimax_h3_vdn, a_keyframe_anchor_is_a_global_row_not_a_video_frame)
+{
+  // WHAT THE HYBRID DOES WITH A FIRST/LAST-FRAME REQUEST, pinned --
+  // because the answer is a choice this port made and the reference
+  // cannot check.
+  //
+  // VDN IS A t2va MODEL. Its layout_from_indices REFUSES a video block
+  // that is not contiguous ("video rows are not contiguous in the packed
+  // sequence"), and H3's fl2va packs video as TWO runs -- the keyframe
+  // conditioning block and the target -- which are not adjacent. Both
+  // places the reference builds a sequence, training and rendering, pass
+  // keyframe_anchors=() explicitly. So there is no reference behaviour
+  // to match here.
+  //
+  // What vpipe does instead follows from the packed order,
+  // [text | keyframe conditions | target audio | target video]: the
+  // conditioning rows sit BELOW video_start, so the window's group
+  // formula puts them in group 0 with the prompt and the soundtrack --
+  // DENSE in both directions -- and the linear branch, which is sized
+  // from num_video_rows, never sees them at all. Every generated row
+  // therefore attends to every keyframe exactly, which is a coherent
+  // reading of an anchor and is NOT the same as making the keyframe
+  // frame 0 of the windowed block.
+  //
+  // NOTE the two unrelated senses of "anchor" this test sits between:
+  // a KEYFRAME anchor is a conditioning row of H3's layout, while
+  // AnchorFrames is the window's own mode, and under `both` it is
+  // generated frames 0 and F-1 that the branch drops. They never refer
+  // to the same rows.
+  MetalMiniMaxH3Transformer::Config cfg;   // defaults are enough: layout only
+  const int lath = 16, latw = 16, naud = 40, ntext = 16, latf = 20;
+  const int gh = lath / cfg.patch_h, gw = latw / cfg.patch_w;
+  const int tpf = gh * gw;
+
+  struct Case { const char* name; std::vector<h3::Anchor> anchors; };
+  const Case cases[] = {
+      {"t2va (no keyframe)", {}},
+      {"i2v  (first)", {h3::Anchor::kFirst}},
+      {"fl2va (first+last)", {h3::Anchor::kFirst, h3::Anchor::kLast}},
+  };
+  for (const Case& c : cases) {
+    h3::PackedLayout L;
+    const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+    ASSERT_TRUE(h3::build_packed_sequence(
+        tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
+        h3::kAudioChannels, c.anchors, &L));
+    ASSERT_TRUE(L.num_video_rows % tpf == 0);
+    if (L.num_video_rows % tpf != 0) { return; }
+    const int frames = L.num_video_rows / tpf;
+
+    // The window the hybrid would build for this layout.
+    vdn::WindowMask m;
+    m.seq_len = L.seq_len;
+    m.video_start = L.video_start;
+    m.num_frames = frames;
+    m.tokens_per_frame = tpf;
+    m.anchors = vdn::AnchorFrames::kBoth;
+    m.bounds = vdn::window_bounds(frames, 1, 5);
+
+    std::printf("[h3_vdn] %-20s seq %5d = %d text + %d cond + %d audio + "
+                "%d video (%d frames); window covers rows [%d, %d)\n",
+                c.name, L.seq_len, L.num_text_rows, L.num_condition_rows,
+                L.num_audio_rows, L.num_video_rows, frames,
+                L.video_start, m.video_end());
+
+    // The conditioning rows are BELOW the window's video block, so the
+    // mask treats them as global. Checked as a property of the mask and
+    // not of the layout, because it is the mask that decides.
+    for (int i = 0; i < L.num_condition_rows; ++i) {
+      const int r = L.condition_start + i;
+      EXPECT_TRUE(r < L.video_start);
+      // Dense both ways: every generated row sees this keyframe row, and
+      // the keyframe row sees everything.
+      EXPECT_TRUE(m.allows(L.video_start, r));
+      EXPECT_TRUE(m.allows(m.video_end() - 1, r));
+      EXPECT_TRUE(m.allows(r, m.video_end() - 1));
+    }
+    // And the frame count the branch is sized from is the GENERATED
+    // frames alone -- a keyframe never becomes a delta-rule frame.
+    EXPECT_TRUE(frames * tpf == L.num_video_rows);
+    EXPECT_TRUE(L.video_start >= L.condition_start + L.num_condition_rows);
+  }
 }

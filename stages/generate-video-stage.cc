@@ -1735,7 +1735,9 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
 // 9.9 GB of this process compressed. SharedBuffer::set_wired() is what
 // would pin them, and the block-residency path is its only caller.
 bool
-GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
+GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
+                                          const h3::PackedLayout& L,
+                                          int grid_h, int grid_w)
 {
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr || seq <= 0) { return true; }
@@ -1748,8 +1750,30 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
   // schedule exists.
   constexpr int kTimestepsUpperBound = 4;
   const bool dq = _h3_dit && _h3_dit->uses_matrix_cores();
-  const std::size_t need = genai::MetalMiniMaxH3Transformer::scratch_bytes(
-      _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq);
+  // AND THE BRANCH'S, which is a second allocation of the same order and
+  // is spent inside the first forward -- after this. Left out, the
+  // reserve below is short by a gigabyte or more and the DiT keeps
+  // blocks resident against a budget that has not heard of the branch;
+  // what follows is swap rather than a smaller resident set, which is
+  // the wrong failure. Zero when no branch is attached, and zero when
+  // the window covers the clip and the linear half does not run.
+  //
+  // Most of it is no longer a second allocation at all: the branch
+  // carves its scratch out of the DiT's attention arena, which is dead
+  // for exactly the stretch it runs in, so `vdn_arena` is a FLOOR on a
+  // buffer that exists either way and `vdn` is only what is left over
+  // -- the branch's two host-written constants and the readout. At both
+  // geometries measured the arena is the wider of the two and the floor
+  // costs nothing at all.
+  std::size_t vdn_arena = 0;
+  const std::size_t vdn =
+      _h3_dit ? _h3_dit->vdn_scratch_bytes(L, grid_h, grid_w, text_rows,
+                                           &vdn_arena)
+              : 0;
+  const std::size_t dit = genai::MetalMiniMaxH3Transformer::scratch_bytes(
+      _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq, /*narrow_ff=*/false,
+      vdn_arena);
+  const std::size_t need = dit + vdn;
 
   // Tell the DiT how much room to leave clear when it decides whether to
   // keep a streamed block resident. Its growth must not eat the scratch
@@ -1775,18 +1799,27 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
   if (mb.fits(need) && mb.fits_physical(need)) {
     session()->info(fmt(
         "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
-        "~{} MB of scratch", this->id(), parked >> 20, seq, need >> 20));
+        "~{} MB of scratch{}", this->id(), parked >> 20, seq, need >> 20,
+        vdn > 0 ? fmt(" ({} MB of it the VDN branch's, plus {} MB of arena "
+                      "it shares with the attention)", vdn >> 20,
+                      vdn_arena >> 20)()
+                : std::string()));
     return true;
   }
   session()->error(fmt(
       "GenerateVideoStage('{}'): not enough memory for a {}-row forward -- "
-      "it needs ~{} MB of scratch and there is ~{} MB of GPU working set / "
-      "~{} MB reclaimable{}. Refusing rather than thrashing: wired Metal "
+      "it needs ~{} MB of scratch{} and there is ~{} MB of GPU working set "
+      "/ ~{} MB reclaimable{}. Refusing rather than thrashing: wired Metal "
       "buffers cannot be paged out, so overcommitting here takes the whole "
       "machine down rather than failing this stage. Use a smaller "
       "height/width/frames, or free another model first",
-      this->id(), seq, need >> 20, mb.headroom >> 20,
-      mb.available_physical >> 20,
+      this->id(), seq, need >> 20,
+      vdn > 0 ? fmt(" ({} MB of it the VDN branch's own, and {} MB of "
+                    "arena it shares with the attention -- a shorter clip "
+                    "or no `linear_branch` would need neither)", vdn >> 20,
+                    vdn_arena >> 20)()
+              : std::string(),
+      mb.headroom >> 20, mb.available_physical >> 20,
       parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
                  : std::string()));
   return false;
@@ -1987,7 +2020,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   }
   // The sequence length is known now and nothing large has been allocated
   // yet, which is the only moment a preflight is worth anything.
-  if (!preflight_h3_scratch_(L.seq_len, text_rows)) { return false; }
+  if (!preflight_h3_scratch_(L.seq_len, text_rows, L, lh / c.patch_h,
+                             lw / c.patch_w)) {
+    return false;
+  }
 
   const int PE = c.video_patch_elems();
   const int AC = c.audio_channels;

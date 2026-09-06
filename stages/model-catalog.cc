@@ -1461,6 +1461,74 @@ builtin_catalog_()
      .files = {"minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step-split"},
+    // v1.2 of the 4-step 768p line, both copies. The SPLIT one is
+    // catalogued first because it is the one to reach for, and it is
+    // named without a suffix for the same reason -- `-comfyui` marks the
+    // fused copy here rather than `-split` marking the good one, which
+    // is the naming the older entries above would have had if the
+    // grouping trap had been understood when they were written.
+    //
+    // WHAT UPSTREAM SAYS ABOUT v1.1 AND v1.2 IS NOTHING. The model card
+    // documents only the 8-step v1.0 it deploys, so everything below is
+    // read off the FILENAME: fl2v, 4 steps, 768p, bf16. That is enough
+    // for the fields here, and the one number it does not carry is the
+    // SHIFT -- inherited from the rest of the 768p line at 6, because a
+    // distillation is fit to the sigma grid it was trained on and every
+    // 768p checkpoint in this repo was trained on that one. If a later
+    // release breaks that pattern it will do so silently, so the shift
+    // is the thing to re-check against upstream, not the step count.
+    //
+    // v1.1 is NOT catalogued. It is the same shape as v1.2 and nothing
+    // published says what changed between them, so registering both
+    // would offer a user a choice this file cannot describe -- and the
+    // later one is the one a version number is for.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.2 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.2"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.2 768p, shift 6, fused qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.2-comfyui"},
+    // The Ref2VA 8-step at 768p, both copies -- the SECOND adapter for
+    // the reference partition, where there was one.
+    //
+    // It is also the first Ref2VA adapter that does NOT run on the
+    // checkpoint's own shifts. Every other reference-partition option
+    // here was distilled at 544p on 12 / 3; this one is 768p, so it
+    // takes the 6 that the whole 768p line takes -- and a Ref2VA graph
+    // is exactly where that is easiest to miss, because the partition's
+    // own documentation never had to mention a shift before.
+    //
+    // Same reading as the v1.2 pair above: the fields come off the
+    // filename and the shift is inherited, because upstream's card
+    // describes only the FL2VA 8-step it deploys.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, fused qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /

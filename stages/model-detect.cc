@@ -310,9 +310,17 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
 // Comfy-Org's architecture tag, and the filename carries whatever the
 // architecture alone cannot say (for MiniMax-H3, which of the two
 // partitions the weights are).
+//
+// EVERY DiT in the repack has to agree, or there is no answer.
+// Comfy-Org's MiniMax-H3 repo publishes BOTH partitions under
+// diffusion_models/, and scan_repo walks it in filename order -- so
+// taking the first tag registered a two-partition checkout as whichever
+// sorts first, silently and always the same way.
 std::string
 comfy_repo_tag_(const fs::path& root)
 {
+  std::string tag;
+  bool seen = false;
   for (const genai::comfy::Component& c :
        genai::comfy::scan_repo(root.string())) {
     if (c.role != "diffusion_models" || c.meta_key != "config") { continue; }
@@ -327,18 +335,23 @@ comfy_repo_tag_(const fs::path& root)
     if (!t.is_object()) { continue; }
     const std::string im = str_field_(t, "image_model");
     const std::string name_lc = lower_(fs::path(c.file).filename().string());
+    std::string one;
     if (im == "minimax_h3") {
       // The repack embeds no partition, so the FILENAME is the only
       // signal -- the weights themselves are indistinguishable. A
       // `pruned` DiT is a different model rather than a different
       // packing of this one, so it stays untagged.
-      if (has_(name_lc, "pruned")) { return {}; }
-      if (has_(name_lc, "fl2va"))  { return "minimax-h3-fl2va"; }
-      if (has_(name_lc, "ref2va")) { return "minimax-h3-ref2va"; }
-      return {};
+      if (has_(name_lc, "pruned"))      { return {}; }
+      else if (has_(name_lc, "fl2va"))  { one = "minimax-h3-fl2va"; }
+      else if (has_(name_lc, "ref2va")) { one = "minimax-h3-ref2va"; }
+      else                              { return {}; }
     }
+    if (one.empty()) { continue; }
+    if (seen && one != tag) { return {}; }   // two models, one directory
+    tag  = one;
+    seen = true;
   }
-  return {};
+  return tag;
 }
 
 // What a Comfy-Org repo actually HOLDS, for the record's `variant`.
@@ -490,7 +503,53 @@ from_catalog_(const ModelCatalogEntry& e, DetectedModel& d)
   if (d.inputs.empty() && d.outputs.empty()) {
     catalog_default_io(e.model_type, d.inputs, d.outputs);
   }
-  d.detected_by = "catalog";
+  d.files              = e.files;
+  d.detected_by        = "catalog";
+}
+
+// WHICH catalogue entry a directory holds, when its repo publishes more
+// than one.
+//
+// `catalog_by_path` answers with the first, which is right only for a
+// repo with a single model -- and several here are not. MiniMax-H3 ships
+// FL2VA and Ref2VA from one repo in BOTH packings, and lightx2v
+// publishes eleven Turbo adapters from one repo whose parents differ
+// (FL2VA and Ref2VA side by side), which is the field the LoRA pickers
+// filter on. Taking the first offered a Ref2VA adapter to an FL2VA
+// graph and registered a Ref2VA checkpoint as FL2VA -- the second being
+// the worse of the two, since the partitions are byte-identical apart
+// from the manifest and the wrong one loads, runs and conditions on
+// nothing.
+//
+// The entries differ in the FILES they pin, and those files are on
+// disk, so that is what decides. The rule is the unique strict maximum
+// of files present, not "all of them": a hand-copied checkout that is
+// missing a tokenizer is still unambiguously that model, while an exact
+// tie -- both partitions in one directory, which is what Comfy-Org's
+// repo actually holds -- has no right answer and gets none.
+//
+// Entries pinning nothing cannot take part: an empty list is present in
+// every directory, so counting it as a match would make the unpinned
+// entry win everywhere.
+const ModelCatalogEntry*
+catalog_pick_present_(const std::vector<const ModelCatalogEntry*>& cands,
+                      const fs::path& root)
+{
+  const ModelCatalogEntry* best = nullptr;
+  std::size_t best_n = 0;
+  bool tied = false;
+  for (const ModelCatalogEntry* e : cands) {
+    if (e == nullptr || e->files.empty()) { continue; }
+    std::size_t n = 0;
+    std::error_code ec;
+    for (const std::string& f : e->files) {
+      if (fs::exists(root / f, ec) && !ec) { ++n; }
+    }
+    if (n == 0) { continue; }
+    if (n > best_n) { best = e; best_n = n; tied = false; }
+    else if (n == best_n) { tied = true; }
+  }
+  return tied ? nullptr : best;
 }
 
 // Whether the ABSENCE of a vision_config / audio_config in this family's
@@ -627,10 +686,23 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     return d;
   }
   if (!hf_path.empty()) {
-    if (const ModelCatalogEntry* e = catalog_by_path(hf_path)) {
-      from_catalog_(*e, d);
+    // One repo can publish several models, and then the path alone does
+    // not name one -- what is actually on disk does. See
+    // catalog_pick_present_.
+    const std::vector<const ModelCatalogEntry*> cands =
+        catalog_all_by_path(hf_path);
+    const ModelCatalogEntry* pick =
+        cands.size() == 1 ? cands.front()
+                          : catalog_pick_present_(cands, root);
+    if (pick != nullptr) {
+      from_catalog_(*pick, d);
       return d;
     }
+    // More than one and no way to tell: fall through and probe. The
+    // probes below read the checkpoint rather than the path, and one of
+    // them may still know (a Comfy repack names its partition in the
+    // filename); if none does, the type stays empty, which is the right
+    // answer for a directory holding two models.
   }
 
   // ---- 2. a diffusers pipeline (transformer/ + vae/) ------------------

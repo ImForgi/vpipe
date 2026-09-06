@@ -597,6 +597,150 @@ MetalVdnBranch::clear_solve_failures()
   if (!_fail.empty()) { std::memset(_fail.contents(), 0, sizeof(unsigned)); }
 }
 
+std::vector<SharedBuffer*>
+MetalVdnBranch::scratch_buffers_()
+{
+  // NOT _tr, which is a window into _A and allocates nothing -- the
+  // same reason _L, _Li and _inv are not members at all.
+  return {&_qf, &_kf, &_vf, &_beta, &_A, &_B, &_mean_b, &_ring_k, &_ring_v,
+          &_alpha_b, &_inj, &_prefix, &_suffix, &_fb, &_fa, &_state,
+          &_gate_b, &_tkf, &_tvf, &_tbeta, &_tA, &_tB, &_tL, &_tLi, &_tInv,
+          &_tTr, &_tState, &_ones, &_mmac, &_sgate_raw, &_roraw, &_dw_k,
+          &_dw_v, &_lo};
+}
+
+std::size_t
+MetalVdnBranch::scratch_resident_bytes() const
+{
+  std::size_t n = 0;
+  for (SharedBuffer* b :
+       const_cast<MetalVdnBranch*>(this)->scratch_buffers_()) {
+    // OWNED ONLY. A view reports its own byte_size, so counting one
+    // here would book an allocation that was never made -- which is
+    // true of every buffer in the list once an arena is lent, where the
+    // honest answer is pinned_bytes().
+    if (b->is_owned()) { n += b->byte_size(); }
+  }
+  return n;
+}
+
+// The same arithmetic reserve() does, with nothing allocated.
+//
+// It is written as a mirror rather than shared with reserve() because
+// reserve() must ALLOCATE in an order that lets a failure be reported
+// against the buffer that failed, and folding both into one pass would
+// either lose that or make this one require a device. The pairing is
+// held honest by a test that reserves and compares, which is the only
+// thing that keeps a mirror from drifting.
+std::size_t
+MetalVdnBranch::scratch_bytes(const Dims& dims, const vdn::Config& cfg,
+                              const Geometry& g)
+{
+  const int H = dims.heads, d = cfg.linear_head_dim;
+  const int S = g.tokens_per_frame(), C = H * d;
+  if (S <= 0 || g.frames <= 0) { return 0; }
+  const int Fi = cfg.anchors == vdn::AnchorFrames::kBoth
+                     ? (g.frames > 2 ? g.frames - 2 : 0)
+                     : g.frames;
+  if (Fi <= 0) { return 0; }
+  const int tile = std::max(1, std::min(Fi, dims.frame_tile));
+  const std::size_t fes = dims.bf16_features ? 2u : 4u;
+  const std::size_t ntile = (std::size_t)tile * S * C;
+  const std::size_t nhalo =
+      (std::size_t)std::min(Fi, tile + 2 * kConvHalo) * S * C;
+  const std::size_t per = (std::size_t)H * d * d;
+  std::size_t n = 0;
+  auto mk = [&](std::size_t e) { n += e * 4; };
+  auto mkf = [&](std::size_t e) { n += e * fes; };
+
+  // The low-rank gate's intermediate, allocated fp32-wide either way.
+  mk((std::size_t)tile * S * cfg.linear_head_dim);
+  // The matrix-core route's landing buffers and expanded conv weights.
+  const bool mma = dims.bf16_features;   // the route's own precondition
+  if (mma) {
+    n += std::max(ntile, (std::size_t)Fi * S * H) * 2;   // _mmac
+    n += ntile * 2;                                      // _roraw
+    n += 2u * (std::size_t)C * kDwBlock * 25u * 2u;      // _dw_k, _dw_v
+  }
+  mkf(ntile); mkf(ntile); mkf(ntile);                    // _qf _kf _vf
+  if (cfg.conv_k) { mkf(nhalo); }
+  if (cfg.conv_v) { mkf(nhalo); }
+  mkf((std::size_t)Fi * S * H);                          // _beta
+  mk((std::size_t)Fi * per); mk((std::size_t)Fi * per);  // _A _B
+  mk((std::size_t)Fi * dims.hidden);                     // _mean_b
+  mk((std::size_t)Fi * H * d);                           // _alpha_b
+  // _tr is a SUBVIEW of _A and allocates nothing; see reserve().
+  mk((std::size_t)Fi * per);                             // _inj
+  mk((std::size_t)Fi * per); mk((std::size_t)Fi * per);  // _prefix _suffix
+  mk((std::size_t)Fi * H * d); mk((std::size_t)Fi * H * d);  // _fb _fa
+  mk((std::size_t)Fi * per);                             // _state
+  mkf(ntile);                                            // _gate_b
+  mk((std::size_t)H * d);                                // _ones
+  if (g.text_len > 0 && cfg.enable_text_state) {
+    const std::size_t nt = (std::size_t)g.text_len * C;
+    mkf(nt); mkf(nt);
+    mkf((std::size_t)g.text_len * H);
+    for (int i = 0; i < 7; ++i) { mk(per); }   // tA tB tL tLi tInv tTr tState
+  } else {
+    mk(per);                                   // _tState
+  }
+  return n;
+}
+
+std::size_t
+MetalVdnBranch::pinned_bytes(const Dims& dims, const vdn::Config& cfg)
+{
+  const std::size_t H = (std::size_t)dims.heads;
+  const std::size_t d = (std::size_t)cfg.linear_head_dim;
+  // `_ones` [H, d] and `_tState` [H, d, d], both fp32.
+  return (H * d + H * d * d) * 4;
+}
+
+std::size_t
+MetalVdnBranch::arena_bytes(const Dims& dims, const vdn::Config& cfg,
+                            const Geometry& g)
+{
+  const std::size_t raw = scratch_bytes(dims, cfg, g);
+  if (raw == 0) { return 0; }
+  const std::size_t pin = pinned_bytes(dims, cfg);
+  // The carve's page alignment is not in scratch_bytes(), which sums
+  // the sizes asked for. Adding the worst case here rather than
+  // teaching that sum about the layout keeps the one number the test
+  // compares against reserve() exactly what reserve() requested.
+  return (raw > pin ? raw - pin : 0) + kCarveSlack;
+}
+
+void
+MetalVdnBranch::set_arena(const SharedBuffer& arena)
+{
+  if (arena.contents() == _arena.contents()
+      && arena.byte_size() == _arena.byte_size()) {
+    return;
+  }
+  // A SharedBuffer is move-only, so the handle this keeps is a window
+  // over the whole of the lender's -- which is also what makes the
+  // arena's lifetime explicit: the branch holds a reference to it, and
+  // a lender about to replace its arena has to lend nothing first or
+  // it will be holding two. See ensure_scratch_.
+  _arena = arena.byte_size() > 0 ? arena.subview(0, arena.byte_size())
+                                 : SharedBuffer{};
+  // DROP EVERY WINDOW THE LAST RESERVE HANDED OUT, and not merely the
+  // flag that says one happened.
+  //
+  // Two reasons, and the second is the one that costs memory. The
+  // windows point into whatever was lent then, so keeping them would
+  // keep WORKING -- off in an allocation the lender has already
+  // replaced, which is the silent version of not sharing at all. And
+  // each of them holds that allocation alive: a lender calling this to
+  // hand over a new arena would be paying for both until the next
+  // reserve() reassigned them one by one, which happens inside the next
+  // forward, after the replacement is allocated. That peak is exactly
+  // what carving exists to avoid.
+  for (SharedBuffer* b : scratch_buffers_()) { *b = SharedBuffer{}; }
+  _geom = Geometry{};
+  _arena_used = 0;
+}
+
 bool
 MetalVdnBranch::reserve(const Geometry& g, std::string* err)
 {
@@ -626,10 +770,31 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
   // per-frame statistics and by a readout that reads a per-frame state.
   // The banks below are the part that is genuinely global.
   const int tile = std::max(1, std::min(Fi, _dims.frame_tile));
+  // WHERE THE SCRATCH COMES FROM. With an arena lent (set_arena) every
+  // buffer below is a page-aligned window into it and this object
+  // allocates nothing; with none -- a bare branch, which is what the
+  // goldens and most tests build -- each is its own allocation, and
+  // nothing else about reserve() differs between the two.
+  //
+  // The fallback is per BUFFER and not per reserve, so an arena that
+  // is short only strands the tail of the list privately instead of
+  // failing. arena_bytes() is what stops that happening quietly; the
+  // test asserts the whole carve lands.
+  _arena_used = 0;
+  auto carve = [&](std::size_t bytes) -> SharedBuffer {
+    const std::size_t off =
+        (_arena_used + kCarveAlign - 1) & ~(kCarveAlign - 1);
+    if (!_arena.empty() && bytes <= _arena.byte_size() - off
+        && off < _arena.byte_size()) {
+      _arena_used = off + bytes;
+      return _arena.subview(off, bytes);
+    }
+    return _mc->make_shared_buffer(bytes);
+  };
   // The low-rank gate's intermediate: [tile rows, bottleneck]. The only
   // caller with a bottleneck is the output gate, which runs a tile at a
   // time; beta and the softmax gate go direct and never touch this.
-  _lo = _mc->make_shared_buffer((std::size_t)tile * S * d * sizeof(float));
+  _lo = carve((std::size_t)tile * S * d * sizeof(float));
   if (_lo.empty()) {
     return fail_(err, "cannot allocate the gate bottleneck");
   }
@@ -641,11 +806,9 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
   if (_mma) {
     const std::size_t need =
         std::max((std::size_t)tile * S * C, (std::size_t)Fi * S * H) * 2;
-    if (_mmac.byte_size() < need) {
-      _mmac = _mc->make_shared_buffer(need);
-      if (_mmac.empty()) {
-        return fail_(err, "cannot allocate the matmul landing buffer");
-      }
+    _mmac = carve(need);
+    if (_mmac.empty()) {
+      return fail_(err, "cannot allocate the matmul landing buffer");
     }
     // And the readout's own, which is a tile of the SAME shape. Its own
     // buffer rather than a second use of the one above: they are live in
@@ -653,11 +816,9 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
     // geometry is not worth a lifetime argument between two dispatches
     // whose order is the encoder's rather than anything written down.
     const std::size_t ro = (std::size_t)tile * S * C * 2;
-    if (_roraw.byte_size() < ro) {
-      _roraw = _mc->make_shared_buffer(ro);
-      if (_roraw.empty()) {
-        return fail_(err, "cannot allocate the readout product");
-      }
+    _roraw = carve(ro);
+    if (_roraw.empty()) {
+      return fail_(err, "cannot allocate the readout product");
     }
   }
   // The dest tile height for THIS patch grid: the padded row count is
@@ -683,12 +844,10 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
     const std::size_t dw =
         (std::size_t)C * kDwBlock * (std::size_t)(5 * 5) * 2;
     for (SharedBuffer* b : {&_dw_k, &_dw_v}) {
-      if (b->byte_size() < dw) {
-        *b = _mc->make_shared_buffer(dw);
-        if (b->empty()) {
-          return fail_(err, "cannot allocate the block-diagonal conv "
-                            "weights");
-        }
+      *b = carve(dw);
+      if (b->empty()) {
+        return fail_(err, "cannot allocate the block-diagonal conv "
+                          "weights");
       }
     }
   }
@@ -697,12 +856,12 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
       (std::size_t)std::min(Fi, tile + 2 * kConvHalo) * S * C;
   const std::size_t mat = (std::size_t)d * d;
   const std::size_t per = (std::size_t)H * mat;
-  auto mk = [&](std::size_t n) { return _mc->make_shared_buffer(n * 4); };
+  auto mk = [&](std::size_t n) { return carve(n * 4); };
   // The narrow ones. `_state` is NOT among them even though the readout
   // reads it narrow: it is aliased with the solve's fp32 `inv` (below),
   // so it has to be allocated wide and is merely WRITTEN narrow.
   const std::size_t fes = _dims.bf16_features ? 2u : 4u;
-  auto mkf = [&](std::size_t n) { return _mc->make_shared_buffer(n * fes); };
+  auto mkf = [&](std::size_t n) { return carve(n * fes); };
 
   _qf = mkf(ntile); _kf = mkf(ntile); _vf = mkf(ntile);
   // Only for the tensors that ARE convolved: the released config takes
@@ -714,7 +873,20 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
   _A = mk((std::size_t)Fi * per); _B = mk((std::size_t)Fi * per);
   _mean_b = mk((std::size_t)Fi * _dims.hidden);
   _alpha_b = mk((std::size_t)Fi * H * d);
-  _tr = mk((std::size_t)Fi * per);
+  // THE TRANSITION BORROWS A, for the same reason the solve's three
+  // borrow the scan's banks and by the same argument: A is read by the
+  // Cholesky and by nothing after it, while `tr` is written by
+  // inv_and_transition, which runs two kernels later. The whole of A's
+  // life is over before the first byte of tr is written.
+  //
+  // Worth a bank -- [Fi, H, d, d] is 3.5 MiB a frame, so 129 MB at the
+  // docs pipeline's 37 and 322 MB at 92 -- and the banks are 89% of the
+  // branch's scratch at the long end, so this is the one sharing that
+  // scales with the clip. Six of them is the floor without restructuring
+  // the solve: after it, tr, inj, prefix, suffix and state are all live
+  // into the scan, and `inj` cannot take B because the GEMM that writes
+  // it reads B a whole row at a time.
+  _tr = _A.subview(0, (std::size_t)Fi * per * 4);
   _inj = mk((std::size_t)Fi * per);
   // THE SOLVE'S THREE INTERMEDIATES SHARE THE SCAN'S BANKS. Each is
   // [Fi, H, d, d] -- 367 MB at production geometry, and the banks are
@@ -731,7 +903,12 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
   _prefix = mk((std::size_t)Fi * per); _suffix = mk((std::size_t)Fi * per);
   _fb = mk((std::size_t)Fi * H * d); _fa = mk((std::size_t)Fi * H * d);
   _state = mk((std::size_t)Fi * per); _gate_b = mkf(ntile);
-  _ones = mk((std::size_t)H * d);
+  // PINNED, not carved: the host fills it here and all 50 encodes read
+  // it, so its contents have to outlive a stretch in which the arena
+  // belongs to the attention and the FF. Same for `_tState` below.
+  // Together 3.5 MB -- see pinned_bytes().
+  _ones = _mc->make_shared_buffer((std::size_t)H * d * 4);
+  if (_ones.empty()) { return fail_(err, "cannot allocate the ones vector"); }
   {
     float* o = (float*)_ones.contents();
     for (std::size_t i = 0; i < (std::size_t)H * d; ++i) { o[i] = 1.0f; }
@@ -743,12 +920,24 @@ MetalVdnBranch::reserve(const Geometry& g, std::string* err)
     _tkf = mkf(nt); _tvf = mkf(nt);
     _tbeta = mkf((std::size_t)g.text_len * H);
     _tA = mk(per); _tB = mk(per); _tL = mk(per); _tLi = mk(per);
-    _tInv = mk(per); _tTr = mk(per); _tState = mk(per);
+    _tInv = mk(per); _tTr = mk(per);
+    _tState = _mc->make_shared_buffer(per * 4);   // pinned; see _ones
   } else {
+    // RELEASED, not merely unused. A later geometry with no prompt was
+    // leaving the previous one's text banks allocated -- seven [H, d, d]
+    // matrices, 21 MB, held for a path that no longer runs. Small, and
+    // invisible until the estimate above was compared with the
+    // allocation, which is what that comparison is for.
+    _tkf = SharedBuffer{}; _tvf = SharedBuffer{}; _tbeta = SharedBuffer{};
+    _tA = SharedBuffer{}; _tB = SharedBuffer{}; _tL = SharedBuffer{};
+    _tLi = SharedBuffer{}; _tInv = SharedBuffer{}; _tTr = SharedBuffer{};
     // The scans still need a start, and a zero one is the no-text
     // semantics. Allocated rather than branched around, so the encode
     // has one shape.
-    _tState = mk(per);
+    _tState = _mc->make_shared_buffer(per * 4);
+    if (_tState.empty()) {
+      return fail_(err, "cannot allocate the text state");
+    }
     std::memset(_tState.contents(), 0, per * 4);
   }
   if (_qf.empty() || _A.empty() || _prefix.empty() || _suffix.empty()

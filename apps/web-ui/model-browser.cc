@@ -143,9 +143,24 @@ list_installed_models(SessionContextIntf* sctx, string& err)
         // The record's own model_type is what tells them apart; it is
         // written at registration and is the same field the stage
         // allow-list matches on.
+        //
+        // AND THE VARIANT WHERE THE TYPE IS NOT ENOUGH. One repo can
+        // publish a dozen entries of the SAME type -- lightx2v ships
+        // eleven `minimax-h3-lora` Turbo adapters, whose parents differ
+        // between FL2VA and Ref2VA -- and matching the type alone then
+        // takes the first again, re-enriching a Ref2VA adapter from an
+        // FL2VA entry and overwriting the parent the record got right.
+        // The variant is what the catalogue makes distinct within a
+        // repo, and detection copies it verbatim, so it is exact when
+        // it is there at all.
+        const string rvar = fstr(ro, "variant");
         for (const ModelCatalogEntry* c : catalog_all_by_path(hf)) {
-          if (c != nullptr && !mtype.empty() && c->model_type == mtype) {
-            ce = c;
+          if (c == nullptr || mtype.empty() || c->model_type != mtype) {
+            continue;
+          }
+          if (ce == nullptr) { ce = c; }        // the type match, as before
+          if (!rvar.empty() && c->variant == rvar) {
+            ce = c;                             // ...refined to this one
             break;
           }
         }

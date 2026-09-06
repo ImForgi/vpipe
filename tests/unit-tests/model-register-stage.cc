@@ -14,6 +14,7 @@
 #include "pipeline/stage-registry.h"
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "stages/model-register-stage.h"
 #include "stages/model-registry.h"
 
@@ -119,6 +120,33 @@ make_model_dir_(const string& root, const string& owner, const string& repo,
     write_file_(dir, "config.json", config_json);
   }
   return dir;
+}
+
+// A minimal safetensors file: an 8-byte little-endian header length
+// then that many bytes of JSON. Enough for read_metadata(), which is
+// all the Comfy-Org repack detection reads -- it never touches a
+// tensor.
+void
+write_safetensors_(const filesystem::path& dir, const string& rel,
+                   const string& metadata_json)
+{
+  const string header = "{\"__metadata__\":" + metadata_json + "}";
+  const auto p = dir / rel;
+  error_code ec;
+  filesystem::create_directories(p.parent_path(), ec);
+  ofstream out(p, ios::binary);
+  uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), 8);
+  out.write(header.data(), (streamsize)header.size());
+}
+
+// The `config` blob Comfy-Org stamps into a repacked DiT: a JSON STRING
+// holding JSON, whose `transformer.image_model` is the architecture tag.
+string
+comfy_dit_meta_(const string& image_model)
+{
+  return "{\"config\":\"{\\\"transformer\\\":{\\\"image_model\\\":"
+         "\\\"" + image_model + "\\\"}}\"}";
 }
 
 bool
@@ -684,4 +712,245 @@ TEST(model_registry, the_vdn_catalogue_entries_pin_distinct_subtrees)
     }
   }
   std::printf("[registry] %d catalogue entries pin a subtree\n", n);
+}
+
+// ---- MiniMax-H3: two publishers, two partitions ----------------------
+
+// FOUR CHECKPOINTS, not two. MiniMaxAI ships FL2VA/ and Ref2VA/ as
+// complete diffusers pipelines under one repo; Comfy-Org repacks each
+// as a single .safetensors under diffusion_models/. All four are
+// catalogued, so all four have to register as what they are -- and the
+// two partitions are byte-identical apart from the manifest, so a wrong
+// answer here loads, runs, conditions on nothing and produces a
+// perfectly plausible video.
+TEST(model_register_stage, minimax_h3_diffusers_partitions)
+{
+  TempDir tdir;
+  error_code ec;
+  for (const char* part : {"fl2va", "ref2va"}) {
+    const string up = string(part) == "fl2va" ? "FL2VA" : "Ref2VA";
+    const auto dir =
+        filesystem::path(tdir.path) / "MiniMaxAI" / "MiniMax-H3" / up;
+    filesystem::create_directories(dir, ec);
+    write_file_(dir, "transformer/config.json",
+                R"({"_class_name":"MiniMaxH3DiTModel"})");
+    write_file_(dir, "model_index.json",
+                string(R"({"_minimax_h3":{"partition":")") + part + R"("}})");
+    const DetectedModel d = detect_model_dir(dir.string());
+    EXPECT_TRUE(d.detected_by == "diffusers");
+    EXPECT_TRUE(d.model_type == string("minimax-h3-") + part);
+  }
+  // The manifest is the ONLY signal: without it the two configs are
+  // indistinguishable, and the answer must be no answer rather than a
+  // coin flip.
+  const auto bare = filesystem::path(tdir.path) / "local" / "h3-no-manifest";
+  filesystem::create_directories(bare, ec);
+  write_file_(bare, "transformer/config.json",
+              R"({"_class_name":"MiniMaxH3DiTModel"})");
+  EXPECT_TRUE(detect_model_dir(bare.string()).model_type.empty());
+
+  // A THIRD packing: model-quantize's output is repack-SHAPED but every
+  // component is a directory of shards, so neither probe above finds
+  // it. The producer writes the partition into the config it emits,
+  // because the filename that carried it is gone.
+  for (const char* part : {"fl2va", "ref2va"}) {
+    const auto q =
+        filesystem::path(tdir.path) / "local" / (string("h3-w8-") + part);
+    filesystem::create_directories(q, ec);
+    write_file_(q, "diffusion_models/config.json",
+                string(R"({"_class_name":"MiniMaxH3DiTModel",")")
+                    + genai::MetalMiniMaxH3Transformer::kPartitionKey
+                    + R"(":")" + part + R"("})");
+    const DetectedModel d = detect_model_dir(q.string());
+    EXPECT_TRUE(d.detected_by == "quantized-repack");
+    EXPECT_TRUE(d.model_type == string("minimax-h3-") + part);
+  }
+}
+
+TEST(model_register_stage, minimax_h3_comfy_repack_partitions)
+{
+  TempDir tdir;
+  error_code ec;
+  for (const char* part : {"fl2va", "ref2va"}) {
+    // Under a NON-catalogued path, so this exercises the repack probe
+    // rather than the catalogue shortcut.
+    const auto dir =
+        filesystem::path(tdir.path) / "local" / (string("h3-") + part);
+    filesystem::create_directories(dir, ec);
+    write_safetensors_(dir,
+                       string("diffusion_models/minimax_h3_") + part
+                           + "_bf16.safetensors",
+                       comfy_dit_meta_("minimax_h3"));
+    const DetectedModel d = detect_model_dir(dir.string());
+    EXPECT_TRUE(d.detected_by == "comfyui");
+    EXPECT_TRUE(d.model_type == string("minimax-h3-") + part);
+    EXPECT_TRUE(d.weight_format == "comfyui");
+  }
+  // BOTH partitions in one directory is what Comfy-Org's repo actually
+  // holds, and it is the case with no right answer: one directory
+  // registers under one key as one model. The alphabetically first file
+  // is not that answer.
+  const auto both = filesystem::path(tdir.path) / "local" / "h3-both";
+  filesystem::create_directories(both, ec);
+  for (const char* part : {"fl2va", "ref2va"}) {
+    write_safetensors_(both,
+                       string("diffusion_models/minimax_h3_") + part
+                           + "_bf16.safetensors",
+                       comfy_dit_meta_("minimax_h3"));
+  }
+  EXPECT_TRUE(detect_model_dir(both.string()).model_type.empty());
+}
+
+// EVERY catalogued MiniMax-H3 supplement, laid out as its own repo and
+// detected back.
+//
+// Three repos publish thirteen adapters and two VDN branches between
+// them, so `hf_path` alone identifies none of them -- and the pickers
+// filter on `parent_model_type`, which differs WITHIN a repo: lightx2v
+// publishes FL2VA and Ref2VA turbos side by side. Taking the first
+// entry for the path offers a Ref2VA adapter to an FL2VA graph.
+TEST(model_register_stage, minimax_h3_supplements_detect_as_themselves)
+{
+  TempDir tdir;
+  int checked = 0;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type != "minimax-h3-lora"
+        && e.model_type != "minimax-h3-vdn") {
+      continue;
+    }
+    // One repo directory per ENTRY, holding exactly that entry's pinned
+    // files -- which is what a hand-copied checkout of it looks like.
+    const auto dir = filesystem::path(tdir.path) / to_string(checked)
+                     / filesystem::path(e.hf_path).parent_path()
+                     / filesystem::path(e.hf_path).filename();
+    error_code ec;
+    filesystem::create_directories(dir, ec);
+    for (const string& f : e.files) { write_file_(dir, f, "x"); }
+    const DetectedModel d = detect_model_dir(dir.string(), e.hf_path);
+    const bool ok = d.model_type == e.model_type
+                    && d.parent_model_type == e.parent_model_type
+                    && d.variant == e.variant;
+    if (!ok) {
+      std::printf("[h3_supp] %-46s -> type %-18s parent %-18s variant %s\n",
+                  e.name.c_str(), d.model_type.c_str(),
+                  d.parent_model_type.c_str(), d.variant.c_str());
+    }
+    EXPECT_TRUE(ok);
+    ++checked;
+  }
+  std::printf("[h3_supp] %d catalogued MiniMax-H3 supplements checked\n",
+              checked);
+  EXPECT_TRUE(checked >= 13);
+}
+
+// The same question for the four BASE checkpoints, which share two
+// hf_paths between them for the same reason.
+TEST(model_register_stage, minimax_h3_base_checkouts_detect_as_themselves)
+{
+  TempDir tdir;
+  int checked = 0;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type != "minimax-h3-fl2va"
+        && e.model_type != "minimax-h3-ref2va") {
+      continue;
+    }
+    const auto dir = filesystem::path(tdir.path) / to_string(checked)
+                     / filesystem::path(e.hf_path).parent_path()
+                     / filesystem::path(e.hf_path).filename();
+    error_code ec;
+    filesystem::create_directories(dir, ec);
+    for (const string& f : e.files) { write_file_(dir, f, "x"); }
+    const DetectedModel d = detect_model_dir(dir.string(), e.hf_path);
+    const bool ok = d.model_type == e.model_type && d.variant == e.variant;
+    if (!ok) {
+      std::printf("[h3_base] %-34s -> type %-20s variant %s\n",
+                  e.name.c_str(), d.model_type.c_str(), d.variant.c_str());
+    }
+    EXPECT_TRUE(ok);
+    ++checked;
+  }
+  std::printf("[h3_base] %d catalogued MiniMax-H3 checkpoints checked\n",
+              checked);
+  EXPECT_TRUE(checked == 4);
+}
+
+// Registering the REPO of a partitioned model has to leave a record
+// that resolves to the partition.
+//
+// `MiniMaxAI/MiniMax-H3` is one directory holding FL2VA/ and Ref2VA/ as
+// complete pipelines, and the catalogue entry pins one of them -- so
+// the model root is `<dir>/FL2VA`, and a record that does not carry the
+// pinned files resolves to `<dir>`, where there is no transformer/ at
+// all. That registration succeeds, reads correctly in the browser and
+// then fails to load, which is the worst of the three outcomes.
+TEST(model_register_stage, a_partitioned_repo_registers_its_subtree)
+{
+  TempDir tdir;
+  Session sess(db_cfg_(tdir.path));
+  ASSERT_TRUE(sess.lmdb_env() != nullptr);
+  const ModelCatalogEntry* e = catalog_by_name("MiniMaxAI/MiniMax-H3-FL2VA");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+
+  const auto dir = filesystem::path(tdir.path) / "MiniMaxAI" / "MiniMax-H3";
+  error_code ec;
+  filesystem::create_directories(dir, ec);
+  for (const string& f : e->files) { write_file_(dir, f, "x"); }
+
+  ModelRegisterStage s(&sess, "reg", vector<InEdge>{}, cfg_(dir.string()));
+  const auto r = s.register_once();
+  ASSERT_TRUE(r.ok);
+  if (!r.ok) { return; }
+  EXPECT_TRUE(r.key == "MiniMaxAI/MiniMax-H3");
+  EXPECT_TRUE(r.detected.model_type == "minimax-h3-fl2va");
+
+  // The record pins the files, so the key resolves to the PARTITION.
+  const ResolvedModel rm = resolve_model(&sess, r.key);
+  EXPECT_TRUE(rm.dir == r.local_path);
+  EXPECT_TRUE(resolved_subtree_dir(rm) == (dir / "FL2VA").string());
+}
+
+// THE SAME QUESTION FOR THE WHOLE CATALOGUE, because the ambiguity that
+// bit MiniMax-H3 is not H3's: any repo publishing more than one entry
+// has it, and the catalogue has several.
+//
+// Every entry is laid out as a checkout of itself -- its pinned files
+// at its own hf_path -- and has to detect back as itself. Entries that
+// pin nothing are skipped: there is no checkout to build, and nothing
+// on disk that could tell them apart.
+TEST(model_register_stage, every_pinned_catalogue_entry_detects_as_itself)
+{
+  TempDir tdir;
+  int checked = 0, wrong = 0;
+  int n = 0;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    ++n;
+    if (e.files.empty() || e.hf_path.empty() || !e.dataset_files.empty()) {
+      continue;
+    }
+    const auto dir = filesystem::path(tdir.path) / to_string(n) / e.hf_path;
+    error_code ec;
+    filesystem::create_directories(dir, ec);
+    for (const string& f : e.files) { write_file_(dir, f, "x"); }
+    const DetectedModel d = detect_model_dir(dir.string(), e.hf_path);
+    ++checked;
+    if (d.model_type != e.model_type || d.variant != e.variant
+        || d.parent_model_type != e.parent_model_type) {
+      ++wrong;
+      std::printf("[catalog_detect] %-52s wanted %-22s got %-22s\n",
+                  e.name.c_str(), e.model_type.c_str(), d.model_type.c_str());
+      std::printf("[catalog_detect]     variant wanted '%s' got '%s'\n",
+                  e.variant.c_str(), d.variant.c_str());
+    }
+    // Each entry gets its own tree, and the trees are large; drop it
+    // once detection has read it so a full catalogue pass does not
+    // leave hundreds of them behind.
+    filesystem::remove_all(filesystem::path(tdir.path) / to_string(n), ec);
+  }
+  std::printf("[catalog_detect] %d pinned entries, %d misdetected\n",
+              checked, wrong);
+  // A floor, not the count: the guard is against the loop skipping
+  // everything, not against the catalogue growing.
+  EXPECT_TRUE(checked >= 40);
+  EXPECT_TRUE(wrong == 0);
 }

@@ -266,6 +266,23 @@ ModelRegisterStage::register_once()
   }
   const DetectedModel& d = r.detected;
   record_detected_fields(ro, d);
+  // The catalogue's pinned files, when the directory was identified as a
+  // catalogue entry -- the same field model-fetch writes, and the one
+  // that makes a PARTITIONED repo resolvable.
+  //
+  // `MiniMaxAI/MiniMax-H3` holds FL2VA/ and Ref2VA/ as complete
+  // pipelines and the entry pins one of them, so the model root is
+  // `<dir>/FL2VA`, which is what resolved_subtree_dir() works out FROM
+  // THESE FILES. Without them the record resolves to the repo
+  // directory, which has no transformer/ in it -- a registration that
+  // succeeds, reads correctly in the browser, and fails to load. Same
+  // for the two VDN branches, which pin distinct subtrees of one repo.
+  if (!d.files.empty()) {
+    FlexData fl = FlexData::make_array();
+    auto fa = fl.as_array();
+    for (const string& f : d.files) { fa.push_back(FlexData::make_string(f)); }
+    ro.insert_or_assign("files", std::move(fl));
+  }
   ro.insert_or_assign("file_count", FlexData::make_uint(d.file_count));
   ro.insert_or_assign("total_bytes", FlexData::make_uint(d.total_bytes));
   // Provenance: this model was NOT downloaded by model-fetch. A reader

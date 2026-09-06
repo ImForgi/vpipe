@@ -654,9 +654,17 @@ class MetalMiniMaxH3Transformer {
   // have fit costs a smaller canvas, and under-estimating one that does
   // not costs the machine. ff_scratch_narrow() answers it once a model
   // exists.
+  // `arena_floor` raises the attention arena to at least that many
+  // bytes, which is how the VDN branch's scratch is paid for: it does
+  // not get an allocation of its own, it is carved out of the arena
+  // (see vdn_scratch_bytes and MetalVdnBranch::set_arena), so the
+  // branch costs this model the amount by which its need exceeds an
+  // arena the attention was going to hold anyway -- nothing at all at
+  // both geometries measured.
   static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
                                    int n_t, bool with_dequant,
-                                   bool narrow_ff = false);
+                                   bool narrow_ff = false,
+                                   std::size_t arena_floor = 0);
 
   // What the per-forward scratch buffers ACTUALLY hold right now, and
   // what the matrix-core dequant scratch holds, kept apart because they
@@ -667,6 +675,39 @@ class MetalMiniMaxH3Transformer {
   // definition.
   std::size_t scratch_resident_bytes() const;
   std::size_t dequant_scratch_bytes() const;
+
+  // What the VDN branch will ALSO want, for this geometry, or 0 when no
+  // branch is attached.
+  //
+  // Kept apart from scratch_bytes() above because it is a SECOND
+  // allocation with a different shape: that one is sized by the packed
+  // sequence, this one mostly by [frames, heads, d, d] banks that grow
+  // with the clip -- 1.0 GB at the docs pipeline's 37 latent frames and
+  // 2.2 GB at 92. It is spent at the branch's first reserve(), which is
+  // inside the first forward and therefore AFTER every planning
+  // decision, so a caller that preflights the transformer's scratch and
+  // not this one sizes the box against half of what it is about to use.
+  // That was the gap: the DiT would keep blocks resident against a
+  // budget that had not heard of the branch, and the machine swapped.
+  //
+  // SPLIT THE WAY THE MEMORY ACTUALLY FALLS OUT, which is why there is
+  // an out-parameter. `*arena_floor` is the part the ATTENTION ARENA
+  // absorbs -- the branch runs in the gap between the previous block's
+  // FF and this block's attention, when nothing in that arena is live,
+  // so it carves its scratch there and the arena is merely sized to the
+  // wider of its two users. The RETURN VALUE is what is left over: the
+  // branch's two host-written constants, plus the readout, which is the
+  // one buffer that cannot share because it spans the attention it is
+  // waiting to be added to.
+  //
+  // Pass the floor to scratch_bytes() / the forward and add the return
+  // value on top; the sum is the same shape of answer as before, and
+  // smaller by however much the arena covers.
+  //
+  // `grid_h`/`grid_w` are the PATCH grid, the same numbers Step carries.
+  std::size_t vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
+                                int grid_h, int grid_w, int n_text,
+                                std::size_t* arena_floor = nullptr) const;
 
   // Which kernel one block projection dispatches on.
   //
@@ -1023,7 +1064,8 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
   };
-  bool ensure_scratch_(int seq, int n_text, int n_t);
+  bool ensure_scratch_(int seq, int n_text, int n_t,
+                       std::size_t arena_floor);
   Scratch _s;
 
   // ---- VDN-H3's hybrid attention -------------------------------------
@@ -1036,6 +1078,19 @@ class MetalMiniMaxH3Transformer {
   // The readout, bf16 [video_rows, inner], and its projection into the
   // residual stream, bf16 [video_rows, hidden]. Both are per forward
   // and reused across the 50 blocks.
+  //
+  // `_vdn_proj` IS A WINDOW INTO THE ATTENTION ARENA, over `ob` -- the
+  // attention output, which the out projection has already consumed by
+  // the time the branch's own projection is encoded, and which `proj`
+  // aliases for the final layer on the same argument. It fits by
+  // construction: video rows are at most the sequence and hidden is
+  // narrower than inner, so it is never wider than the window it sits
+  // in.
+  //
+  // `_vdn_ro` IS NOT, and it is the one buffer in the whole path that
+  // cannot be: it is written before qk_norm and read after the out
+  // projection, so it is live across the attention -- which is exactly
+  // when the arena belongs to somebody else.
   metal_compute::SharedBuffer _vdn_ro, _vdn_proj;
   // The window as CSR spans for sdpa_spans: group 0 is the global rows
   // (prompt and soundtrack, dense in both directions) and group 1+f is

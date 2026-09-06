@@ -100,8 +100,9 @@ you want to see the model work before spending the hours and the 115 GB.
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
-  **FL2VA only**, and worth more the longer the clip **and the larger the
-  frame** (see [Faster attention](#faster-attention--the-vdn-linear-branch)).
+  **FL2VA partition, and text-to-video only** — no keyframes, no references —
+  and worth more the longer the clip **and the larger the frame** (see
+  [Faster attention](#faster-attention--the-vdn-linear-branch)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
 from `docs/pipelines/` in your clone. Either can be run from the terminal with
@@ -875,8 +876,8 @@ better still at 6–8. Past 8 it stops helping and starts to over-sharpen, so
 4–8 is the range. Keep `scale` at **1.0** — the adapter is tuned for it.
 
 Most of these adapt the **FL2VA** partition (text-to-video and
-image-to-video), and lightx2v's line also covers **Ref2VA**. Six adapters are
-catalogued rather than one — eight entries, because lightx2v publishes two of
+image-to-video), and lightx2v's line also covers **Ref2VA**. Eight adapters are
+catalogued rather than one — twelve entries, because lightx2v publishes four of
 them twice — since the choices between them are real rather than version
 bumps: a different training resolution, a different sigma grid, a different
 partition, a different decomposition of the same file.
@@ -886,9 +887,25 @@ partition, a different decomposition of the same file.
 | `Turbo few-step v4-600 EMA` (larryvrh) | FL2VA | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
 | `Turbo few-step v1-850 EMA` (larryvrh) | FL2VA | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
 | `Turbo 4-step v1.0 768p` (lightx2v) | FL2VA | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
+| `Turbo 4-step v1.2 768p` (lightx2v) | FL2VA | 4 | **6** / 3 | 1344×768 | the newest of that line, and the one to try first at 4 steps. Published **split** and fused; take the split. |
 | `Turbo 8-step v1.0 544p` (lightx2v) | FL2VA | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
 | `Turbo 8-step v1.0 768p` (lightx2v) | FL2VA | 8 | **6** / 3 | 1344×768 | upstream's own default — LightX2V Studio serves this one. Also published **split**, which is the copy to prefer; see below. |
-| `Turbo 4-step v0.1` (lightx2v) | **Ref2VA** | 4 | 12 / 3 | 544p | the only adapter for the reference partition. Also published **split**. |
+| `Turbo 4-step v0.1` (lightx2v) | **Ref2VA** | 4 | 12 / 3 | 544p | the cheaper of the two for the reference partition, and the one on the checkpoint's own shifts. Also published **split**. |
+| `Turbo 8-step v1.0 768p` (lightx2v) | **Ref2VA** | 8 | **6** / 3 | 1344×768 | the other one, and the only Ref2VA adapter that needs `video_shift: 6.0`. Published **split** and fused; take the split. |
+
+> **The version numbers are upstream's and are not documented.** lightx2v's
+> model card describes only the 8-step v1.0 it deploys, so what separates
+> v1.0, v1.1 and v1.2 of the 4-step 768p line is not stated anywhere. Of the
+> two newer ones only **v1.2** is catalogued — a version number is for taking
+> the latest — but that means "newest", not "measured better here". Compare it
+> against v1.0 on a seed you know before switching a habit to it.
+>
+> The same goes for what the catalogue *records*. For **v1.2** and for the
+> **Ref2VA 8-step 768p**, every field is read off the filename (partition,
+> steps, resolution, dtype) except the shift, which is inherited from the rest
+> of the 768p line. That inheritance is the assumption worth re-checking if
+> upstream ever documents these: a wrong shift is a wrong sigma grid, and
+> nothing reports it.
 
 **The shifts are part of the adapter, not a preference.** lightx2v's 768p
 checkpoints were distilled on a video shift of **6** where this model's
@@ -930,8 +947,12 @@ ComfyUI and split for diffusers, and vpipe loads either. The full set of
 | `lightx2v/Minimax-h3-Turbo-8step` | FL2VA 8-step, 544p, shift 12 |
 | `lightx2v/Minimax-h3-Turbo-8step-768p` | FL2VA 8-step, shift 6 |
 | `lightx2v/Minimax-h3-Turbo-8step-768p-split` | the same, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-4step-768p-v1.2` | FL2VA 4-step **v1.2**, shift 6, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-4step-768p-v1.2-comfyui` | the same, fused |
 | `lightx2v/Minimax-h3-Turbo-ref2va-4step` | Ref2VA 4-step, 544p, shift 12 |
 | `lightx2v/Minimax-h3-Turbo-ref2va-4step-split` | the same, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | Ref2VA 8-step, shift 6, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui` | the same, fused |
 
 `model_variant` is not optional here and its value is the catalogue **name**,
 not a word from the title. Every Turbo checkpoint of a repo is published from
@@ -1253,13 +1274,32 @@ large size is where dense attention is worst and this is worth most. Read the
 right-hand column above as about 22 s at 544p **or roughly half that at
 768p** — the same rows either way.
 
-**FL2VA only.** Both released stages are trained against the FL2VA partition
-and there is no Ref2VA branch to attach, so this and
+**Text to video and audio only — no keyframes, no references.** There are two
+limits here and one word covers both, so they are easy to run together.
+
+*The partition.* Both released stages are built on the **FL2VA** partition's
+blocks and there is no Ref2VA branch to attach, so this and
 [Conditioning on references](#conditioning-on-references-ref2va) are a choice
-between, not a pair. Nothing checks this for you — the partition is chosen on
-`model-select` and the branch on `minimax-h3-model-config`, two different
-stages — so pointing a Ref2VA graph at a branch gets you weights trained for
-the other partition's blocks.
+between, not a pair.
+
+*The task.* Within that partition the branch is trained on **text in, video
+and audio out** — and nothing else. Not a first frame, not a last frame, not
+a reference. This is a property of the branch, not of the DiT under it: the
+released branch's own sequence layout describes video as **one unbroken run**
+of rows, which is what a text-only request packs, while a keyframe or a
+reference adds a *second* run of conditioning rows before it.
+
+Hand it one anyway and it runs. vpipe reads those conditioning rows as
+**global**: every generated row attends to each keyframe exactly, outside the
+window, and the linear half never sees them at all. That is a defensible
+reading of an anchor — arguably a generous one — but it is not the reading the
+branch was trained under, so treat what comes back as an experiment rather
+than as the model working. `generate-video` says so once per clip.
+
+Nothing refuses any of this. The partition is chosen on `model-select` and the
+branch on `minimax-h3-model-config`, two different stages, and a clip comes
+back looking perfectly ordinary whichever mistake you made — so if you are
+using the branch, use it with a text prompt and nothing else.
 
 #### Get it and run it
 
@@ -1293,6 +1333,19 @@ that is named but cannot be attached **fails the stage** instead of warning,
 because a graph that silently ran without it would produce a perfectly
 plausible video from weights trained for a different attention — there is no
 output anyone could look at and tell.
+
+**What it costs in memory: the weights, and at 544p nothing else.** The branch
+is the ~5 GB of extra weights above, streamed block by block on the same terms
+as the DiT's own. Its *working* memory is larger than that sounds — over a
+gigabyte for a 5-second clip and more than two at 13 — but it is not a second
+allocation. It is carved out of the attention scratch the DiT is already
+holding, which sits idle for exactly the stretch the branch runs in, so at
+960 × 544 and above the branch's scratch is free. The two do not scale
+together, though: that scratch grows with the clip's **rows** and the branch's
+with its **frames**, so a clip of many small frames — under roughly 250 rows
+each, which is below 672 × 384 — crosses over and the branch starts costing
+the difference. `generate-video` sizes the box for whichever it is before the
+run starts.
 
 #### What it saves
 

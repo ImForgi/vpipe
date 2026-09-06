@@ -423,7 +423,13 @@ private:
   // The idle-unload decision, made after the load so it can use the
   // streaming verdict. See the note on its definition.
   void resolve_unload_policy_h3_(bool streamed);
-  bool preflight_h3_scratch_(int seq, int text_rows);
+  // `L` and the PATCH grid are here because the VDN branch's scratch is
+  // sized by the video geometry rather than by the packed sequence, and
+  // it is the half of the forward's memory that used to go unplanned.
+  bool preflight_h3_scratch_(int seq, int text_rows,
+                             const genai::minimax_h3::PackedLayout& L,
+                             int grid_h,
+                             int grid_w);
   // `r2v` is the `ref2va` request when there is one; null is the
   // `t2va` / `fl2va` path, where `ref` carries the keyframe anchors
   // instead. The two are mutually exclusive by construction -- they are

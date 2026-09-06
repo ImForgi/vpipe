@@ -15,6 +15,7 @@
 
 #include "common/flex-data.h"
 #include "common/session.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/vdn-config.h"
 #include "generative-models/weight-set.h"
@@ -356,6 +357,132 @@ TEST(metal_vdn_branch, tile_size_does_not_change_the_answer)
   EXPECT_TRUE(ran == 4);
   if (ran == 4) {
     std::printf("[vdn_component] worst over tiles 1..4: %.3e\n", worst);
+  }
+}
+
+TEST(metal_vdn_branch, a_carved_scratch_is_bit_identical)
+{
+  // The scratch may come out of a lent arena instead of its own
+  // allocations (set_arena), which is how the branch stops costing the
+  // process a gigabyte. Two things could go wrong there and neither
+  // shows up as a plausible-looking answer: a carve could overlap its
+  // neighbour, and a buffer the host writes once could land in memory
+  // the lender goes on to reuse. So the bar is BIT-IDENTICAL and not a
+  // tolerance -- both arms run the same kernels over the same numbers,
+  // and any difference at all is aliasing.
+  //
+  // Both feature dtypes, because the matrix-core route makes four
+  // carves the fp32 one never does (two landing buffers and the two
+  // block-diagonal conv weights).
+  //
+  // NO GOLDEN NEEDED, for the reason the mma A/B gives: both arms are
+  // this GPU driven from the released checkpoint, so it runs wherever
+  // the branch weights are.
+  const std::string stage = stage_();
+  Session s;
+  MetalCompute* mc = s.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  vdn::Config cfg;
+  std::string err;
+  if (!vdn::load_config(stage, &cfg, &err)) { return; }
+  std::shared_ptr<WeightSet> ws =
+      WeightSet::open(stage + "/linear_branch", nullptr);
+  if (!ws) { return; }
+
+  const int F = 12, gh = 6, gw = 8, Lt = 9;
+  const int S = gh * gw, H = 56, d = 128, C = H * d, hidden = 5376;
+  const int RS = 3 * C;
+  const std::size_t rows = (std::size_t)Lt + (std::size_t)F * S;
+  SharedBuffer qkv = mc->make_shared_buffer(rows * (std::size_t)RS * 2);
+  SharedBuffer xb  = mc->make_shared_buffer(rows * (std::size_t)hidden * 2);
+  ASSERT_TRUE(!qkv.empty() && !xb.empty());
+  if (qkv.empty() || xb.empty()) { return; }
+  auto fill = [](SharedBuffer& b, std::uint32_t seed) {
+    auto* o = static_cast<std::uint16_t*>(b.contents());
+    const std::size_t n = b.byte_size() / 2;
+    std::uint32_t st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = (float)(st >> 8) / 8388608.0f - 1.0f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      o[i] = (std::uint16_t)(u >> 16);
+    }
+  };
+  fill(qkv, 12345u);
+  fill(xb, 999u);
+
+  MetalVdnBranch::Geometry geo;
+  geo.frames = F; geo.grid_h = gh; geo.grid_w = gw; geo.text_len = Lt;
+  const std::vector<vdn::Bound> bounds =
+      vdn::window_bounds(F, cfg.radius, cfg.chunk);
+  MetalVdnBranch::Inputs in;
+  in.x = &xb;
+  in.q_raw = in.k_raw = in.v_raw = &qkv;
+  in.text_x = &xb; in.text_k = in.text_v = &qkv;
+  in.qkv_row_stride = RS;
+  in.qkv_head_stride = 3 * d;
+  in.qkv_bf16 = true; in.x_bf16 = true;
+  const std::size_t v0 = (std::size_t)Lt * RS;
+  in.q_off = v0 * 2;
+  in.k_off = (v0 + d) * 2;
+  in.v_off = (v0 + 2 * d) * 2;
+  in.text_k_off = (std::size_t)d * 2;
+  in.text_v_off = (std::size_t)(2 * d) * 2;
+  in.x_off = (std::size_t)Lt * hidden * 2;
+  const std::size_t obytes = (std::size_t)F * S * C * sizeof(float);
+
+  for (int narrow = 0; narrow < 2; ++narrow) {
+    MetalVdnBranch::Dims dims;
+    dims.heads = H; dims.head_dim = d; dims.hidden = hidden;
+    dims.n_layers = 50;
+    dims.bf16_features = narrow != 0;
+    std::unique_ptr<MetalVdnBranch> br =
+        MetalVdnBranch::load(ws, mc, cfg, dims, &err);
+    if (!br || !br->ensure_block(0, &err)) {
+      std::printf("[vdn_mem] load: %s\n", err.c_str());
+      return;
+    }
+    auto run = [&](SharedBuffer* ob) {
+      *ob = mc->make_shared_buffer(obytes);
+      if (ob->empty()) { return false; }
+      std::memset(ob->contents(), 0, obytes);
+      CommandStream stream = mc->make_command_stream();
+      ComputeEncoder enc = stream.begin_compute();
+      const bool ok = br->encode(enc, 0, geo, bounds, in, *ob, &err);
+      enc.end();
+      std::string gerr;
+      return ok && stream.commit().wait_ok(&gerr);
+    };
+
+    SharedBuffer bare, carved;
+    ASSERT_TRUE(run(&bare));
+    if (bare.empty()) { return; }
+    EXPECT_TRUE(br->solve_failures() == 0u);
+    const std::size_t owned_bare = br->scratch_resident_bytes();
+
+    const std::size_t floor = MetalVdnBranch::arena_bytes(dims, cfg, geo);
+    SharedBuffer arena = mc->make_shared_buffer(floor);
+    ASSERT_TRUE(!arena.empty());
+    if (arena.empty()) { return; }
+    // POISONED, so nothing the branch was supposed to write is
+    // accidentally right because the allocator handed over zeros.
+    std::memset(arena.contents(), 0x5a, floor);
+    br->set_arena(arena);
+    ASSERT_TRUE(run(&carved));
+    if (carved.empty()) { return; }
+    EXPECT_TRUE(br->solve_failures() == 0u);
+
+    const bool same =
+        std::memcmp(bare.contents(), carved.contents(), obytes) == 0;
+    const std::size_t owned = br->scratch_resident_bytes();
+    std::printf("[vdn_mem] %s features: owns %6.1f MB bare -> %5.2f MB "
+                "carved, outputs %s\n", narrow ? "bf16" : "fp32",
+                (double)owned_bare / 1048576.0, (double)owned / 1048576.0,
+                same ? "IDENTICAL" : "DIFFER");
+    EXPECT_TRUE(same);
+    EXPECT_TRUE(owned == MetalVdnBranch::pinned_bytes(dims, cfg));
+    br->set_arena(SharedBuffer{});
   }
 }
 
@@ -1069,6 +1196,162 @@ TEST(metal_vdn_branch, the_matrix_core_route_tracks_the_wide_one)
     std::printf("[vdn_mma] frame_tile %d vs %d: %zu of %zu differ\n", t,
                 MetalVdnBranch::kFrameTile, diff, mma.size());
     EXPECT_TRUE(diff == 0);
+  }
+}
+
+TEST(metal_vdn_branch, the_scratch_estimate_matches_the_allocation)
+{
+  // reserve() runs at the FIRST FORWARD, long after anything that plans
+  // memory has had its say, so scratch_bytes() is what a planner asks
+  // instead. An estimate never compared with the allocation it predicts
+  // drifts the first time a buffer is added -- and the buffer that gets
+  // added is never the small one, as the four this file has grown since
+  // it was written attest.
+  //
+  // Checked at several geometries because the terms scale differently:
+  // seven of the eight largest buffers are [frames, heads, d, d] and
+  // grow with the clip, while the per-token half is pinned by the frame
+  // tile and does not.
+  const std::string stage = stage_();
+  Session s;
+  MetalCompute* mc = s.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  vdn::Config cfg;
+  std::string err;
+  if (!vdn::load_config(stage, &cfg, &err)) { return; }
+  std::shared_ptr<WeightSet> ws =
+      WeightSet::open(stage + "/linear_branch", nullptr);
+  if (!ws) { return; }
+  MetalVdnBranch::Dims dims;
+  dims.heads = 56; dims.head_dim = 128; dims.hidden = 5376;
+  dims.n_layers = 50;
+  std::unique_ptr<MetalVdnBranch> br =
+      MetalVdnBranch::load(ws, mc, cfg, dims, &err);
+  ASSERT_TRUE(br != nullptr);
+  if (!br) { return; }
+
+  struct Case { int frames; int gh; int gw; int text; };
+  const Case cases[] = {
+      {12, 6, 8, 9},        // the arithmetic tests' shape
+      {37, 17, 30, 17},     // 960x544, ~5 s -- the docs pipeline
+      {37, 17, 30, 0},      // and with no text state
+      {92, 17, 30, 17},     // ~13 s
+  };
+  for (const Case& c : cases) {
+    MetalVdnBranch::Geometry g;
+    g.frames = c.frames; g.grid_h = c.gh; g.grid_w = c.gw;
+    g.text_len = c.text;
+    const std::size_t want = MetalVdnBranch::scratch_bytes(dims, cfg, g);
+    if (!br->reserve(g, &err)) {
+      std::printf("[vdn_mem] %d frames: reserve failed (%s)\n", c.frames,
+                  err.c_str());
+      continue;
+    }
+    const std::size_t got = br->scratch_resident_bytes();
+    std::printf("[vdn_mem] %3d frames %2dx%-3d text %2d: estimate %7.1f MB, "
+                "allocated %7.1f MB%s\n", c.frames, c.gh, c.gw, c.text,
+                (double)want / 1048576.0, (double)got / 1048576.0,
+                want == got ? "" : "   MISMATCH");
+    // EXACT, not a bound. The estimate mirrors reserve()'s own
+    // arithmetic, so any difference is a buffer one of them knows about
+    // and the other does not -- which is the whole failure this catches.
+    EXPECT_TRUE(want == got);
+
+    // AND THE SAME RESERVATION OUT OF A LENT ARENA. arena_bytes() is
+    // what the DiT raises its attention arena to, so an underestimate
+    // does not fail -- it strands the tail of the carve in private
+    // allocations, which is the quiet half of the bug this whole change
+    // is about. What proves the whole carve landed is that the branch
+    // owns nothing afterwards but the two pinned constants.
+    const std::size_t floor = MetalVdnBranch::arena_bytes(dims, cfg, g);
+    const std::size_t pin = MetalVdnBranch::pinned_bytes(dims, cfg);
+    EXPECT_TRUE(floor > 0);
+    SharedBuffer arena = mc->make_shared_buffer(floor);
+    ASSERT_TRUE(!arena.empty());
+    if (arena.empty()) { continue; }
+    br->set_arena(arena);
+    if (!br->reserve(g, &err)) {
+      std::printf("[vdn_mem] %d frames: arena reserve failed (%s)\n",
+                  c.frames, err.c_str());
+      br->set_arena(SharedBuffer{});
+      continue;
+    }
+    const std::size_t own = br->scratch_resident_bytes();
+    std::printf("[vdn_mem]      arena floor %7.1f MB, carved %7.1f MB, "
+                "still its own %5.2f MB (pinned %5.2f)%s\n",
+                (double)floor / 1048576.0,
+                (double)br->arena_used() / 1048576.0,
+                (double)own / 1048576.0, (double)pin / 1048576.0,
+                own == pin ? "" : "   MISMATCH");
+    EXPECT_TRUE(br->arena_used() <= floor);
+    EXPECT_TRUE(own == pin);
+    // Give it back before the next case, so the two legs never hold two
+    // reservations at once on a 16 GB box.
+    br->set_arena(SharedBuffer{});
+  }
+}
+
+TEST(metal_vdn_branch, the_attention_arena_swallows_the_branch)
+{
+  // THE POINT OF THE CARVE, as arithmetic: what does the branch cost
+  // the process once the DiT's attention arena is sized to hold it?
+  //
+  // That arena is five [seq, inner] windows -- 70 KB a row at the
+  // released config -- with the FF intermediate aliased over the whole
+  // of it, and it is dead for exactly the stretch the branch runs in.
+  // The branch is mostly [frames, heads, d, d] banks, which scale with
+  // the CLIP and not with the row count, so whether one fits inside the
+  // other is a property of the geometry and not a general truth. It
+  // holds comfortably at both production shapes and this records by how
+  // much; a grid small enough to invert it would show up here as a
+  // nonzero overshoot rather than as swap on someone's machine.
+  vdn::Config cfg;
+  cfg.linear_head_dim = 128;
+  cfg.anchors = vdn::AnchorFrames::kBoth;
+  MetalVdnBranch::Dims dims;
+  dims.heads = 56; dims.head_dim = 128; dims.hidden = 5376;
+  dims.n_layers = 50;
+  genai::MetalMiniMaxH3Transformer::Config tc;
+  tc.hidden = 5376; tc.n_heads = 56; tc.head_dim = 128; tc.ffn = 14336;
+  tc.n_layers = 50;
+
+  // `free` is whether the arena swallows the branch WHOLE. It is not a
+  // constant: the arena is 70 KB per ROW and the branch is mostly per
+  // FRAME, so the two cross when a clip has many frames of few tokens.
+  // The third case is on the far side of that line and is here for
+  // exactly that reason -- it is the shape at which the branch starts
+  // costing something again, and it costs the DIFFERENCE rather than
+  // its whole size.
+  struct Case {
+    int frames; int gh; int gw; int text; bool free; const char* what;
+  };
+  const Case cases[] = {
+      {37, 17, 30, 512, true,  "960x544, ~5 s -- the docs pipeline"},
+      {92, 17, 30, 512, true,  "960x544, ~13 s"},
+      {37, 12, 21, 512, false, "672x384, ~5 s -- past the crossover"},
+  };
+  for (const Case& c : cases) {
+    MetalVdnBranch::Geometry g;
+    g.frames = c.frames; g.grid_h = c.gh; g.grid_w = c.gw;
+    g.text_len = c.text;
+    const int seq = c.frames * c.gh * c.gw + c.text;
+    const std::size_t floor = MetalVdnBranch::arena_bytes(dims, cfg, g);
+    const std::size_t alone =
+        genai::MetalMiniMaxH3Transformer::scratch_bytes(tc, seq, c.text, 4,
+                                                        false);
+    const std::size_t with =
+        genai::MetalMiniMaxH3Transformer::scratch_bytes(tc, seq, c.text, 4,
+                                                        false, false, floor);
+    std::printf("[vdn_mem] %-34s seq %6d: DiT scratch %7.1f MB, branch "
+                "wants %7.1f, together %7.1f (+%.1f)\n",
+                c.what, seq, (double)alone / 1048576.0,
+                (double)floor / 1048576.0, (double)with / 1048576.0,
+                (double)(with - alone) / 1048576.0);
+    // Sharing is never worse than not sharing, and never claims more
+    // than the branch actually wants.
+    EXPECT_TRUE(with >= alone && with <= alone + floor);
+    if (c.free) { EXPECT_TRUE(with == alone); }
+    else        { EXPECT_TRUE(with > alone && with < alone + floor); }
   }
 }
 

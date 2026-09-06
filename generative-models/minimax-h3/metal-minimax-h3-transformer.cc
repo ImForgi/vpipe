@@ -3426,7 +3426,8 @@ scratch_plan_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
 std::size_t
 MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
                                          int n_t, bool with_dequant,
-                                         bool narrow_ff)
+                                         bool narrow_ff,
+                                         std::size_t arena_floor)
 {
   if (seq <= 0) { return 0; }
   const std::size_t S = (std::size_t)seq;
@@ -3436,6 +3437,14 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
   for (const ScratchItem& it : scratch_plan_(c, narrow_ff)) {
     total += (S * it.mul_seq + T * it.mul_text + N * it.mul_t) * it.esz;
   }
+  // The arena is grown to hold the VDN branch's scratch when there is
+  // one, so what the branch costs is the OVERSHOOT and not its size.
+  // Zero at both geometries measured -- the attention's five [seq,
+  // inner] windows are wider per row than the branch's whole scratch --
+  // and this term is what says so when a geometry comes along where
+  // they are not.
+  const std::size_t arena = S * attn_arena_elems_(c, narrow_ff) * 2;
+  if (arena_floor > arena) { total += arena_floor - arena; }
   if (with_dequant) {
     // _w_deq is grown to the WIDEST projection that actually reaches
     // gemm_mma_, and kept.
@@ -3712,9 +3721,24 @@ MetalMiniMaxH3Transformer::release_resident_blocks(std::size_t bytes)
 }
 
 bool
-MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
+MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
+                                           std::size_t arena_floor)
 {
-  if (_s.seq == seq && _s.n_text == n_text && _s.n_t == n_t) { return true; }
+  // The floor is a MINIMUM, so an arena that already clears it is not a
+  // reason to reallocate -- which matters because the branch's need
+  // moves with the clip while the sequence does not have to.
+  if (_s.seq == seq && _s.n_text == n_text && _s.n_t == n_t
+      && _s.attn.byte_size() >= arena_floor) {
+    return true;
+  }
+  // TAKE THE ARENA BACK BEFORE ALLOCATING THE NEXT ONE. The branch
+  // holds a window over it, which keeps it alive -- so a geometry
+  // change that allocated first would have two arenas resident at once,
+  // which is the peak this whole scheme exists to avoid.
+  // `_vdn_proj` is a window over the same arena and holds it alive for
+  // exactly the same reason; ensure_vdn_ rebuilds it every forward.
+  if (_vdn) { _vdn->set_arena(metal_compute::SharedBuffer{}); }
+  _vdn_proj = metal_compute::SharedBuffer{};
   const Config& c = _cfg;
   const std::size_t S = (std::size_t)seq, H = (std::size_t)c.hidden;
   const std::size_t I = (std::size_t)c.inner();
@@ -3733,7 +3757,13 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
   // MTL::Buffer and carries the offset, so binding a window addresses
   // its slice with no copy -- and each window is CONTIGUOUS, which the
   // [rows, I] shapes require.
-  s.attn = mk(S * attn_arena_elems_(c, !_ff_needs_wide));
+  // ...and a THIRD user, when the hybrid is on: the VDN branch carves
+  // its whole scratch out of this, because the stretch it runs in --
+  // after the qkv projection, before qk_norm -- is a stretch in which
+  // neither the attention windows nor the FF intermediate is live. See
+  // MetalVdnBranch::set_arena.
+  s.attn = _mc->make_shared_buffer(
+      std::max(S * attn_arena_elems_(c, !_ff_needs_wide) * 2, arena_floor));
   if (s.attn.empty()) { return false; }
   const std::size_t win = S * I * 2;            // bytes per window
   s.qh   = s.attn.subview(0 * win, win);
@@ -3867,6 +3897,71 @@ MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
 // Rebuilt only when the geometry moves. The spans are a few hundred
 // kilobytes but building them walks every (query frame, key frame)
 // pair, and a denoise loop asks the same question 50 times a step.
+namespace {
+
+// The A/B for the arena carve. Set VPIPE_H3_NO_VDN_ARENA and the branch
+// allocates its own scratch and the readout projection gets its own
+// buffer again -- which is the same run costing a gigabyte more, and
+// the way to check that the sharing changed nothing but the footprint.
+bool
+vdn_arena_enabled_()
+{
+  static const bool on = std::getenv("VPIPE_H3_NO_VDN_ARENA") == nullptr;
+  return on;
+}
+
+}  // namespace
+
+std::size_t
+MetalMiniMaxH3Transformer::vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
+                                             int grid_h, int grid_w,
+                                             int n_text,
+                                             std::size_t* arena_floor) const
+{
+  if (arena_floor != nullptr) { *arena_floor = 0; }
+  if (!_vdn || grid_h <= 0 || grid_w <= 0) { return 0; }
+  const int tpf = grid_h * grid_w;
+  if (L.num_video_rows <= 0 || L.num_video_rows % tpf != 0) { return 0; }
+  minimax_h3::MetalVdnBranch::Dims dims;
+  dims.heads    = _cfg.n_heads;
+  dims.head_dim = _cfg.head_dim;
+  dims.hidden   = _cfg.hidden;
+  dims.n_layers = _cfg.n_layers;
+  minimax_h3::MetalVdnBranch::Geometry g;
+  g.frames   = L.num_video_rows / tpf;
+  g.grid_h   = grid_h;
+  g.grid_w   = grid_w;
+  g.text_len = n_text;
+  // A window that covers the clip turns the linear half off entirely,
+  // and then reserve() allocates nothing -- so neither should this.
+  // Asked BEFORE ensure_vdn_ has run, though, so the cover has to be
+  // recomputed rather than read off _vdn_full_cover.
+  const std::vector<minimax_h3::vdn::Bound> bounds =
+      minimax_h3::vdn::window_bounds(g.frames, _vdn_cfg.radius,
+                                     _vdn_cfg.chunk);
+  bool covers = true;
+  for (const minimax_h3::vdn::Bound& b : bounds) {
+    if (b.lo > 0 || b.hi < g.frames - 1) { covers = false; break; }
+  }
+  // THE READOUT IS OWED WHETHER OR NOT THE LINEAR HALF RUNS: the gate
+  // needs the branch attached, so ensure_vdn_ allocates it under full
+  // cover too. [video_rows, inner], bf16 -- 270 MB at 37 frames and
+  // 673 at 92, and until now nothing counted it either.
+  const std::size_t I = (std::size_t)(_cfg.n_heads * _cfg.head_dim);
+  const std::size_t ro = (std::size_t)L.num_video_rows * I * 2;
+  if (covers) { return ro; }
+  if (!vdn_arena_enabled_()) {
+    // The A/B leg: nothing is shared, so the branch's whole scratch is
+    // a second allocation again and the projection is its own buffer.
+    return ro + (std::size_t)L.num_video_rows * (std::size_t)_cfg.hidden * 2
+           + minimax_h3::MetalVdnBranch::scratch_bytes(dims, _vdn_cfg, g);
+  }
+  if (arena_floor != nullptr) {
+    *arena_floor = minimax_h3::MetalVdnBranch::arena_bytes(dims, _vdn_cfg, g);
+  }
+  return ro + minimax_h3::MetalVdnBranch::pinned_bytes(dims, _vdn_cfg);
+}
+
 bool
 MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
                                        const minimax_h3::PackedLayout& L,
@@ -3995,6 +4090,33 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     // correct, and indistinguishable from the outside -- so without a
     // report a short clip looks like a VDN generation and is not one.
     // Once per geometry, not per forward.
+    // A KEYFRAME ANCHOR IS OUTSIDE THE WINDOW, and the released weights
+    // never saw one. VDN is a t2va model: its layout builder refuses a
+    // video block that is not contiguous, and H3's fl2va packs video as
+    // two runs -- the conditioning block and the target. Both places the
+    // reference builds a sequence, training and rendering, pass
+    // keyframe_anchors=() explicitly.
+    //
+    // What happens here follows from the packed order and is coherent:
+    // the conditioning rows sit below video_start, so the mask keeps
+    // them GLOBAL -- every generated row attends to every keyframe
+    // exactly -- and the linear branch, sized from num_video_rows, never
+    // sees them. Same for a ref2va reference, which is packed the same
+    // way. It is not refused, because it is a reasonable reading of an
+    // anchor and the graph may well want it; it is SAID, because it is
+    // the weights being used outside what they were trained on and the
+    // output is a perfectly plausible video either way.
+    if (_mc->session() != nullptr && L.num_condition_rows > 0) {
+      _mc->session()->warn(fmt(
+          "MetalMiniMaxH3Transformer: VDN is a t2va model and this "
+          "request carries {} conditioning rows ({} keyframe {}). They "
+          "are attended DENSELY, outside the window, and the linear "
+          "branch does not see them -- coherent, but a layout the "
+          "released branch was not trained on",
+          L.num_condition_rows,
+          tpf > 0 ? L.num_condition_rows / tpf : 0,
+          (tpf > 0 && L.num_condition_rows / tpf == 1) ? "frame" : "frames"));
+    }
     if (_mc->session() != nullptr && _vdn_kb_dense > 0) {
       _mc->session()->info(fmt(
           "MetalMiniMaxH3Transformer: VDN window over {} frames of {} "
@@ -4021,12 +4143,36 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     // not a crash and not a NaN, just two frames of noise.
     std::memset(_vdn_ro.contents(), 0, _vdn_ro.byte_size());
   }
-  if (_vdn_proj.byte_size() < vrows * (std::size_t)_cfg.hidden * 2) {
-    _vdn_proj = _mc->make_shared_buffer(vrows * (std::size_t)_cfg.hidden * 2);
-    if (_vdn_proj.empty()) {
-      return fail("cannot allocate the VDN projection");
+  // THE PROJECTION IS A WINDOW OVER `ob`, not an allocation. It is
+  // written by the branch's out projection, which is encoded after the
+  // model's own -- and the model's own is the last reader of `ob`. The
+  // residual add consumes it on the next dispatch, long before the FF
+  // writes over the front of the arena.
+  //
+  // It fits the window by construction: video rows are a run inside the
+  // packed sequence, so vrows <= seq, and hidden < inner. Asserted
+  // rather than assumed, because the two shapes come from different
+  // places and a config where they crossed would corrupt the residual
+  // stream quietly.
+  const std::size_t projb = vrows * (std::size_t)_cfg.hidden * 2;
+  const std::size_t win = (std::size_t)_s.seq * (std::size_t)I * 2;
+  if (!vdn_arena_enabled_()) {
+    if (_vdn_proj.byte_size() < projb) {
+      _vdn_proj = _mc->make_shared_buffer(projb);
+      if (_vdn_proj.empty()) {
+        return fail("cannot allocate the VDN projection");
+      }
     }
+    return true;
   }
+  if (_s.attn.byte_size() < 4 * win + projb) {
+    return fail("the attention arena cannot hold the VDN projection");
+  }
+  _vdn_proj = _s.attn.subview(4 * win, projb);
+  // And the branch's own scratch out of the same arena, ahead of that
+  // window -- see MetalVdnBranch::set_arena for why nothing in it is
+  // live while the branch runs.
+  _vdn->set_arena(_s.attn);
   return true;
 }
 
@@ -4096,7 +4242,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   auto p_ms = [](PClock::time_point a, PClock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
-  if (!ensure_scratch_(seq, n_text, n_t)) {
+  // The VDN branch carves its scratch out of the attention arena, so
+  // the arena has to be sized for it -- and HERE is the only place that
+  // can still happen, since the next line allocates it. Zero with no
+  // branch, with no video grid, and when the window covers the clip and
+  // the linear half does not run.
+  std::size_t vdn_arena = 0;
+  (void)vdn_scratch_bytes(L, in.video_grid_h, in.video_grid_w, n_text,
+                          &vdn_arena);
+  if (!ensure_scratch_(seq, n_text, n_t, vdn_arena)) {
     return fail("activation allocation failed (out of GPU memory)");
   }
   const auto p_scratch = PClock::now();

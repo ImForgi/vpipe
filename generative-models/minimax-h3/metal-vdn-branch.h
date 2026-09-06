@@ -87,6 +87,21 @@ public:
   // disproves: same padded count as 6 at gh 17, and 60% slower.
   static constexpr int kDwHeights[3] = {4, 6, 8};
 
+  // Alignment of one carve out of a lent arena (see set_arena), and the
+  // slack arena_bytes() adds for it -- a page each, over more carves
+  // than reserve() makes.
+  //
+  // A PAGE AND NOT A CACHE LINE, deliberately. A private allocation is
+  // page-rounded, so every buffer below used to have most of a page of
+  // unused bytes behind it, and a kernel that writes a padded tile past
+  // its destination's exact size landed in them. Packed tight, that
+  // same write lands in the next buffer instead -- silently, and only
+  // for the geometries whose tail is ragged. The carve keeps the slack
+  // the allocator was providing rather than betting that no kernel
+  // needs it.
+  static constexpr std::size_t kCarveAlign = 16384;
+  static constexpr std::size_t kCarveSlack = 48 * kCarveAlign;
+
   struct Dims {
     // Frames of per-token work held live at once. A TUNING knob and
     // nothing else: the answer must not depend on it, which is what
@@ -222,6 +237,109 @@ public:
   // changed geometry reallocates.
   bool reserve(const Geometry& g, std::string* err);
 
+  // WHAT THAT WILL COST, before it is spent.
+  //
+  // reserve() runs at the first forward, which is long after anything
+  // that plans memory has had its say -- so a caller that does not ask
+  // this sizes a box against the DiT alone and then meets a second
+  // allocation of gigabytes. At production geometry the answer is over
+  // a gigabyte and it grows LINEARLY with the clip, because seven of
+  // the eight largest buffers are [frames, heads, d, d].
+  //
+  // Static, so it can be asked with no branch built and no weights
+  // loaded: it is a function of the geometry and the config, which is
+  // everything reserve() consults.
+  // WHAT SHARES AND WHAT DOES NOT, since the answer is not obvious and
+  // the buffers that matter are the ones that scale.
+  //
+  // MEASURED (37 latent frames of 510 tokens, the docs pipeline): 1056
+  // MB, of which the [Fi, H, d, d] banks are 735 and the per-token half
+  // is 304. At 92 frames it is 2220 / 1916 / 304 -- the banks grow with
+  // the clip and the per-token half does not, being pinned by the frame
+  // tile. So sharing a bank is worth Fi x 3.5 MiB and sharing a
+  // per-token buffer is worth 29 MB flat, whatever the clip.
+  //
+  // Shared today, all of them banks:
+  //   L, Li, inv  -> prefix, suffix, state   (the solve's three)
+  //   tr          -> A                       (dead after the Cholesky)
+  //
+  // SIX BANKS IS THE FLOOR without restructuring the solve: after it,
+  // tr, inj, prefix, suffix and state are all live into the scan, and
+  // `inj` cannot take B because the GEMM that writes inj reads B a whole
+  // row at a time -- in place, that is a read-after-write on a row the
+  // kernel has already clobbered.
+  //
+  // NOT SHARED, deliberately: the per-token buffers. `_qf` could take
+  // `_kf` (pass 1 ends before pass 2 begins), `_roraw` and `_mmac` could
+  // take the two conv rings for the same reason -- about 87 MB, 8% of
+  // the total at 37 frames and 4% at 92, i.e. it does not help the case
+  // that runs out of memory. Each would also be a lifetime argument
+  // spanning half the encode, where the four above are each a few
+  // dispatches apart and can be checked by reading them. If the
+  // per-token half ever stops being pinned by the tile, revisit.
+  static std::size_t scratch_bytes(const Dims& dims, const vdn::Config& cfg,
+                                   const Geometry& g);
+
+  // And what the scratch ACTUALLY holds right now -- zero before the
+  // first reserve(). Kept beside the estimate for the reason the
+  // transformer keeps its pair: an estimate that is never compared with
+  // the allocation it predicts drifts silently the first time a buffer
+  // is added, and the buffer that gets added is never the small one.
+  // See metal_vdn_branch.the_scratch_estimate_matches_the_allocation.
+  std::size_t scratch_resident_bytes() const;
+
+  // LEND THE BRANCH SOMEONE ELSE'S MEMORY, and reserve() stops
+  // allocating almost all of the above.
+  //
+  // Every scratch buffer bar the two host-initialised constants is
+  // carved from `arena` when one is set and it has the room, and falls
+  // back to its own allocation when it does not -- so a bare branch,
+  // which is what the goldens and the tests build, is unchanged.
+  //
+  // THE LENDER IS THE DiT AND THE BUFFER IS ITS ATTENTION ARENA: the
+  // one allocation behind qh|kh|vh|oh|ob with the FF intermediate
+  // aliased over the whole of it. That arena is dead for exactly the
+  // stretch this branch runs in. A block is
+  //
+  //     norm -> qkv projection -> THE BRANCH -> qk_norm, rope ->
+  //     attention -> out projection -> FF
+  //
+  // and the arena's first writer is the attention, its last reader the
+  // FF two steps later. From the previous block's FF to this block's
+  // attention nothing in it is live, and the branch runs entirely
+  // inside that gap: it reads the fused qkv projection and the normed
+  // hidden, which are other buffers, and writes its readout into a
+  // third.
+  //
+  // So it is the DENSE HALF'S memory in the most literal sense. The
+  // hybrid replaces full attention with a window plus this branch, and
+  // the window wants the arena at an instant the branch does not.
+  //
+  // Set it BEFORE the first reserve(). A geometry change reallocates
+  // the DiT's scratch, which would leave this holding windows into a
+  // buffer nothing else uses any more -- valid memory, silently
+  // unshared -- so the arena's identity is compared here and a change
+  // forces the next reserve() to redo the carve.
+  void set_arena(const metal_compute::SharedBuffer& arena);
+
+  // How big that arena has to be for the whole carve to land in it,
+  // and what stays this object's own however big it is.
+  //
+  // pinned_bytes() is `_ones` and `_tState`: both are written by the
+  // HOST at reserve() and read by every one of the 50 encodes after
+  // it, so they are the two buffers whose contents have to survive the
+  // stretch the arena is someone else's. 3.5 MB at the released
+  // config, against a gigabyte and up for the rest.
+  static std::size_t arena_bytes(const Dims& dims, const vdn::Config& cfg,
+                                 const Geometry& g);
+  static std::size_t pinned_bytes(const Dims& dims, const vdn::Config& cfg);
+
+  // What the last reserve() actually took out of the arena. Zero with
+  // no arena lent, and the check that arena_bytes() is not an
+  // underestimate -- see
+  // metal_vdn_branch.the_arena_absorbs_the_whole_scratch.
+  std::size_t arena_used() const { return _arena_used; }
+
   // Encode the whole branch for `layer` into `enc`. `bounds` are the
   // UNREBASED per-frame windows -- the anchor skip is applied here,
   // because whether the two frames leave the input is a property of the
@@ -326,6 +444,14 @@ private:
     bool ready = false;
   };
 
+  // Every buffer reserve() hands out (plus the softmax gate's two,
+  // which grow lazily elsewhere), in ONE list -- so that counting them
+  // and giving them back cannot disagree about which they are. That
+  // disagreement is not hypothetical: a geometry with no prompt used to
+  // leave the previous one's text banks allocated because the release
+  // was written out by hand and missed them.
+  std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+
   metal_compute::SharedBuffer f32_(const std::string& name,
                                    std::string* err);
   metal_compute::SharedBuffer bf16_(const std::string& name,
@@ -416,6 +542,10 @@ private:
 
   Geometry _geom;
   int      _reserved_tile = 0;
+  // The lent arena and how much of it the last carve took. See
+  // set_arena(); empty is the ordinary standalone-allocation case.
+  metal_compute::SharedBuffer _arena;
+  std::size_t                 _arena_used = 0;
   metal_compute::SharedBuffer _qf, _kf, _vf, _beta, _A, _B, _mean_b;
   // The spatial conv's output, as a RING over frames -- one per
   // convolved tensor, because both must survive the other's pass.
