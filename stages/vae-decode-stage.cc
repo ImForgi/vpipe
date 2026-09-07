@@ -77,9 +77,15 @@ const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the model root whose VAE this decodes; the resident family "
           "locates the VAE within it (conventionally <hf_dir>/vae). "
-          "OPTIONAL: a model-select source on the model iport overrides it",
+          "OPTIONAL: a model-select source on the model iport overrides it. "
+          "May name a STANDALONE VAE (krea2-vae) rather than a whole "
+          "model: that is how a latent is decoded through a VAE other "
+          "than the one its own model ships. Give the VAE its own "
+          "model-select source, or set this key directly, so the DiT "
+          "stages keep pointing at the model",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image-edit,mage-flow,"
+       "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va",
    .model_channel = "diffusion-model"},
@@ -510,7 +516,15 @@ VaeDecodeStage::vae_dir_for_release_() const
   const std::string h3 = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
   if (h3 != root) { return h3; }
 #endif
-  return generic;
+  // A STANDALONE VAE degenerates the same way and for the same reason,
+  // but the answer is one level further down: the checkpoint is not a
+  // directory at all, it is the single freely-named safetensors inside
+  // one. This MUST be the same resolver ensure_loaded_ opens the
+  // WeightSet through -- a claim, a phase release and a pool_weights
+  // that name the directory while the set is keyed on the file are three
+  // no-ops the manager cannot report, because it has never heard of the
+  // name being released.
+  return resolve_vae_weights_path(generic);
 }
 
 void
@@ -705,11 +719,13 @@ VaeDecodeStage::ensure_loaded_()
   // open_weight_set().
   // MiniMax-H3 keeps the WEIGHTS one level below the config that named
   // the family, so the set is opened on the resolved leaf. Every other
-  // family's resolver returns what it was handed.
+  // family's resolver returns what it was handed -- and a STANDALONE VAE
+  // is one freely-named safetensors in a directory nothing globs, so
+  // that one is opened on the FILE. See resolve_vae_weights_path.
   const std::string ws_dir =
       (_family == "minimax-h3")
           ? genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(vae_dir)
-          : vae_dir;
+          : resolve_vae_weights_path(vae_dir);
   std::shared_ptr<genai::WeightSet> ws =
       genai::open_weight_set(ws_dir, session());
   if (!ws) {
@@ -819,8 +835,26 @@ VaeDecodeStage::ensure_loaded_()
   genai::MetalKrea2Vae::Config cfg;   // Qwen-Image VAE defaults
   // Read the per-channel latent statistics (and z_dim / base_dim) from the
   // vae config.json; the un-whiten needs latents_mean / latents_std.
+  //
+  // NOT NECESSARILY THIS DIRECTORY'S. A standalone VAE ships weights and
+  // nothing else, and when the model it serves is already installed, its
+  // config is the authority and is already on disk -- so borrow it
+  // rather than ask for a copy. resolve_vae_config_path owns that
+  // choice; the checkpoint's own file still wins when it has one.
+  const std::string cfg_path = resolve_vae_config_path(
+      session(), _hf_dir, vae_dir, "AutoencoderKLQwenImage");
+  if (!cfg_path.empty() &&
+      cfg_path != (fs::path(vae_dir) / "config.json").string()) {
+    // Said out loud, every time. Which sixteen numbers un-whitened a
+    // latent is not something to infer silently: borrowed from the
+    // wrong parent it is a colour grade nobody can trace back.
+    load_note_(fmt(
+        "VaeDecodeStage('{}'): '{}' carries no config.json; taking the "
+        "latent statistics from '{}'", this->id(), vae_dir, cfg_path));
+  }
+  const bool have_config = !cfg_path.empty();
   {
-    std::ifstream in(fs::path(vae_dir) / "config.json");
+    std::ifstream in(cfg_path);
     if (in) {
       FlexData fd = FlexData::from_json(in);
       if (fd.is_object()) {
@@ -848,9 +882,29 @@ VaeDecodeStage::ensure_loaded_()
   }
   if ((int)cfg.latents_mean.size() != cfg.z_dim ||
       (int)cfg.latents_std.size() != cfg.z_dim) {
+    // TWO DIFFERENT FAULTS, and the old message named neither. It
+    // reported "0/0 of z_dim 16", which is what an ABSENT config.json
+    // produces -- and a reader with no config at all looks for the
+    // statistics inside a file that is not there. A STANDALONE VAE
+    // checkpoint is exactly the case where the file can be missing on
+    // its own (the weights are one safetensors and the config is
+    // fetched beside them), so say which of the two happened and name
+    // the path, because the fix for the first is to put a file there.
+    if (!have_config) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): no config.json at '{}' and no installed "
+          "parent model to take one from, so the per-channel "
+          "latents_mean / latents_std that un-whiten a latent are unknown "
+          "and the stage is inert. Either register the model this VAE "
+          "serves (a Krea-2 or Qwen-Image checkpoint, whose vae/config."
+          "json is then used in place), or copy that file to "
+          "'{}/config.json'", this->id(), vae_dir, vae_dir));
+      return;
+    }
     session()->error(fmt(
-        "VaeDecodeStage('{}'): vae config.json is missing latents_mean/"
-        "latents_std ({}/{} of z_dim {}); the stage is inert", this->id(),
+        "VaeDecodeStage('{}'): the config at '{}' carries {}/{} of the "
+        "{} latents_mean / latents_std entries the un-whiten needs; the "
+        "stage is inert", this->id(), cfg_path,
         cfg.latents_mean.size(), cfg.latents_std.size(), cfg.z_dim));
     return;
   }

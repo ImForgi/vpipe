@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "stages/model-catalog.h"
+#include "stages/model-registry.h"
 
 #include <algorithm>
 #include <cctype>
@@ -920,6 +921,98 @@ resolve_vae_dir(const std::string& root)
     }
   }
   return root;
+}
+
+std::string
+resolve_vae_weights_path(const std::string& vae_dir)
+{
+  std::error_code ec;
+  if (vae_dir.empty() || !fs::is_directory(fs::path(vae_dir), ec) || ec) {
+    return vae_dir;
+  }
+  const fs::path dir(vae_dir);
+  // Every layout MetalLlamaWeights::open_model globs for itself. Probed
+  // first so a diffusers or sharded checkpoint keeps taking the path it
+  // always did, whatever else happens to sit beside it.
+  for (const char* known : {"model.safetensors.index.json",
+                            "diffusion_pytorch_model.safetensors.index.json",
+                            "model.safetensors",
+                            "diffusion_pytorch_model.safetensors"}) {
+    if (fs::exists(dir / known, ec) && !ec) { return vae_dir; }
+  }
+  std::string only;
+  std::size_t n = 0;
+  std::error_code lec;
+  for (const auto& de : fs::directory_iterator(dir, lec)) {
+    const fs::path& p = de.path();
+    if (p.extension() != ".safetensors") { continue; }
+    const std::string fn = p.filename().string();
+    // A numbered shard is the index-less sharded layout, which
+    // open_model globs on its own.
+    if (fn.rfind("model-", 0) == 0 ||
+        fn.rfind("diffusion_pytorch_model-", 0) == 0) {
+      return vae_dir;
+    }
+    ++n;
+    if (n == 1) { only = p.string(); }
+  }
+  return (n == 1) ? only : vae_dir;
+}
+
+std::string
+resolve_vae_config_path(const SessionContextIntf* session,
+                        const std::string&        model_ref,
+                        const std::string&        vae_dir,
+                        std::string_view          expect_class)
+{
+  std::error_code ec;
+  // 1. The checkpoint's own. Probed first and unconditionally, so a file
+  //    someone put there beats anything inferred below -- including a
+  //    parent that disagrees with it.
+  const fs::path own = fs::path(vae_dir) / "config.json";
+  if (fs::exists(own, ec) && !ec) { return own.string(); }
+  if (session == nullptr || model_ref.empty()) { return {}; }
+
+  // 2. An installed model this VAE attaches to. The catalogue is what
+  //    says which those are -- `parent_model_type` on the supplement,
+  //    matched against the model_type of entries that are not
+  //    themselves supplements -- so this is not a search of the disk for
+  //    something plausible; it is the link the catalogue already
+  //    records, followed.
+  const std::string mt = resolve_model(session, model_ref).model_type;
+  if (mt.empty()) { return {}; }
+  std::string parent;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type == mt && !e.parent_model_type.empty()) {
+      parent = e.parent_model_type;
+      break;
+    }
+  }
+  if (parent.empty()) { return {}; }
+
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    // A supplement is not a parent: a LoRA also carries model_type
+    // "krea2-lora" and parent "krea2", and it has no vae/ at all.
+    if (e.model_type != parent || !e.parent_model_type.empty()) { continue; }
+    const ResolvedModel rm = resolve_model(session, e.hf_path);
+    if (!rm.from_registry) { continue; }        // not installed here
+    const fs::path p = fs::path(rm.dir) / "vae" / "config.json";
+    if (!fs::exists(p, ec) || ec) { continue; }
+    if (!expect_class.empty()) {
+      // SAME FAMILY IS NOT SAME LATENT SPACE. Wan and Qwen-Image share
+      // this VAE's architecture and shapes and have entirely different
+      // latents_mean / latents_std, so a parent whose config names
+      // another class is skipped rather than borrowed -- that is the one
+      // way this fallback could produce a confident wrong answer.
+      const FlexData cfg = read_json_(p);
+      if (!cfg.is_object() ||
+          str_field_(cfg, "_class_name") != expect_class) {
+        continue;
+      }
+    }
+    return p.string();
+  }
+  return {};
 }
 
 }

@@ -157,6 +157,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-encoder.cc
         krea2-dit.cc
         krea2-vae.cc
+        krea2-hd-vae.cc
         wan-vae.cc
         wan-umt5.cc
         wan-unipc.cc

@@ -332,7 +332,11 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
   // The set must still contain every diffusion family the flow supports,
   // so a family dropped from the last consumer that had it shows up here
   // rather than silently nowhere.
-  for (const char* fam : {"krea2", "flux2", "qwen-image-edit", "mage-flow",
+  // krea2-vae is here on purpose: it is a STANDALONE VAE rather than a
+  // whole model, so it reaches the source through the VAE stages alone
+  // and nothing else in this graph would notice it going missing.
+  for (const char* fam : {"krea2", "krea2-vae", "flux2", "qwen-image-edit",
+                          "mage-flow",
                           "mage-flow-edit", "boogu-image", "boogu-image-edit",
                           "wan-t2v", "wan-i2v", "minimax-h3-fl2va"}) {
     const bool present =

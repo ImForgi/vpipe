@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace vpipe {
@@ -138,6 +139,20 @@ class MetalKrea2Vae {
   bool load_resblock_(WeightSet& ws, const std::string& pre,
                       ResBlock& rb, int cin, int cout);
 
+  // The checkpoint's own spelling of a diffusers tensor name.
+  //
+  // The Qwen-Image VAE is also published NATIVELY named (ComfyUI's
+  // single-file VAEs, and wikeeyang's Krea2-HD fine-tune of this exact
+  // model) -- same architecture, same shapes, different names. EVERY
+  // read of `ws.src()` goes through here so the loaders below keep
+  // reading one spelling; `_names` is empty for a diffusers checkpoint
+  // and wname_ is then the identity. See shared/wan-vae-names.h.
+  //
+  // Note what does NOT go through it: the `derived()` cache keys stay in
+  // the diffusers spelling, because they name a TRANSFORM of a tensor
+  // and the transform does not change with the file's naming.
+  const std::string& wname_(const std::string& diffusers_name) const;
+
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
 
@@ -193,6 +208,9 @@ class MetalKrea2Vae {
   // life: the cached tensors are aliases into buffers it owns (and
   // mapped ones alias its mmap), so it has to outlive them.
   std::shared_ptr<WeightSet> _ws;
+  // Diffusers name -> this checkpoint's name; EMPTY when the checkpoint
+  // is diffusers-named, which is every krea/, Qwen/ and quantized pack.
+  std::unordered_map<std::string, std::string> _names;
   // Part the loaders currently attribute their tensors to; "" is the
   // always-resident trunk, "encoder" the half release_part() can drop.
   std::string _part;

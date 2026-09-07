@@ -5,9 +5,12 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
+
+class SessionContextIntf;
 
 // What a model directory on disk turns out to BE. Produced by
 // detect_model_dir() for the model-register stage, so registering a
@@ -133,6 +136,58 @@ std::string hf_path_from_local(const std::string& dir);
 // Returns `root` unchanged when neither layout is present, so the
 // caller's existing "no checkpoint here" error still fires.
 std::string resolve_vae_dir(const std::string& root);
+
+// WHAT TO OPEN A WeightSet ON, given a VAE directory.
+//
+// Usually the directory: MetalLlamaWeights globs a model dir for the
+// layouts a publisher uses -- an index.json, `model.safetensors`, the
+// diffusers `diffusion_pytorch_model*` spellings, numbered shards.
+//
+// A STANDALONE VAE checkpoint is none of those. It is one freely-named
+// safetensors (wikeeyang's `Krea2-HD-vae.safetensors`; ComfyUI's
+// `qwen_image_vae.safetensors`) sitting in a directory, so the glob
+// finds nothing and the dir reports "no readable checkpoint" -- and
+// MetalLlamaWeights already opens a checkpoint named by FILE, which is
+// how the Comfy-Org repacks are read. So: name the file.
+//
+// EXACTLY ONE, or the directory unchanged. Two freely-named safetensors
+// is a directory holding two things, and choosing between them by sort
+// order would load one VAE while the config beside it describes the
+// other -- which decodes, and is wrong. The caller's existing error is
+// the better answer.
+std::string resolve_vae_weights_path(const std::string& vae_dir);
+
+// WHERE THE LATENT STATISTICS COME FROM, when the VAE checkpoint does
+// not carry them itself.
+//
+// A VAE's per-channel `latents_mean` / `latents_std` are not in the
+// weights -- they live in a `config.json` beside them, and a STANDALONE
+// VAE is published without one. They cannot be defaulted: they describe
+// a specific latent space, and the wrong sixteen numbers decode a
+// plausible, wrongly-graded picture rather than failing.
+//
+// So they are BORROWED, in this order:
+//
+//   1. `<vae_dir>/config.json` -- the checkpoint's own, which always
+//      wins. A file someone put there is a statement; everything below
+//      is an inference.
+//   2. the `vae/config.json` of an installed model this VAE is
+//      catalogued as a SUPPLEMENT of. If the box already holds the model
+//      whose latent space this VAE serves, that model's config is the
+//      authority, and asking for a copy of a file already on disk is
+//      asking for a download nobody needs.
+//
+// `expect_class` (optional) is checked against the borrowed config's
+// `_class_name`, so a parent whose VAE is a DIFFERENT architecture --
+// same family, different latent statistics -- is skipped rather than
+// read. Empty accepts any.
+//
+// Returns "" when neither source answers, which is the caller's cue to
+// refuse: there is no third option that is not a guess.
+std::string resolve_vae_config_path(const SessionContextIntf* session,
+                                    const std::string&        model_ref,
+                                    const std::string&        vae_dir,
+                                    std::string_view          expect_class);
 
 }
 

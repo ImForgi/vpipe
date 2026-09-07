@@ -32,6 +32,7 @@ set(LOCAL_SOURCES
   shared/i8-gemm.cc
   shared/lora-names.cc
   shared/runtime-lora.cc
+  shared/wan-vae-names.cc
   shared/wired-pool.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc

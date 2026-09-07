@@ -691,6 +691,64 @@ builtin_catalog_()
                "krea2_identity_edit_v1_2_r128.safetensors",
                "krea2_identity_edit_v1_2_r64.safetensors"},
      .needs_tokenizer_json = false},
+    // Krea2-HD VAE (wikeeyang): the Qwen-Image VAE fine-tuned alongside a
+    // Krea-2-Turbo HD fine-tune of the DiT, and published as a
+    // STANDALONE VAE -- one 507 MB safetensors carrying the full
+    // autoencoder (decoder, encoder and both quant convs). It is a drop-in
+    // for the stock `vae/` of any model on this latent space (the
+    // publisher names Qwen-Image and Wan 2.1); the DiT beside it in the
+    // repo is a separate model and is NOT pinned here.
+    //
+    // MEASURED against krea/Krea-2-Turbo's own VAE, tensor for tensor:
+    // the DECODER is heavily retrained (median rel-L2 0.83) while the
+    // ENCODER is barely touched (median 0.010, cosine 0.999999 on all 84
+    // tensors). So it is a decoder fine-tune that ships its encoder along
+    // -- worth selecting for vae-decode, ~neutral for vae-encode.
+    //
+    // TWO THINGS THIS ENTRY HAS TO CARRY. The weights are NATIVELY named
+    // (decoder.upsamples.4.residual.2 rather than
+    // decoder.up_blocks.1.resnets.0.conv1); the VAE loader maps them,
+    // see generative-models/shared/wan-vae-names.h. And the repo ships no
+    // config.json at all, so the per-channel `latents_mean`/`latents_std`
+    // that un-whiten a latent come from a companion -- which is the right
+    // source rather than a convenience: a drop-in replacement is a claim
+    // about a LATENT SPACE, and guessing those numbers here would decode
+    // plausible, wrongly-graded pixels.
+    //
+    // THE COMPANION IS THE FALLBACK, NOT THE PRIMARY ROUTE. A box that
+    // already holds the model this VAE serves already holds the file:
+    // resolve_vae_config_path borrows that model's vae/config.json in
+    // place, and nothing is downloaded or copied. The companion is for
+    // the other case -- somebody fetching the VAE on its own.
+    //
+    // AND IT COMES FROM Qwen/Qwen-Image, NOT FROM KREA-2, BECAUSE OF THE
+    // GATE. This VAE is ungated, so nobody fetching it has
+    // any reason to hold a Krea-2 licence token -- and krea/Krea-2-Turbo
+    // answers an anonymous request with 401. Pointing an ungated 507 MB
+    // download at a gated repo makes it fail for everyone who has not
+    // separately accepted a licence for a model they are not fetching,
+    // and it fails LATE: the weights land, the companion warns, and the
+    // decode stage goes inert with a message about latents_mean.
+    //
+    // Qwen-Image is also the better authority on its own terms. The
+    // publisher's claim is that this VAE serves "any model that used
+    // Qwen-Image / Wan 2.1 VAE", so the latent space is Qwen-Image's;
+    // Krea-2's own vae/config.json records `_name_or_path:
+    // "Qwen/Qwen-Image"` and is a copy of it. VERIFIED byte for byte on
+    // every field this tree reads -- _class_name, z_dim, base_dim,
+    // num_res_blocks and all 16 entries of latents_mean / latents_std
+    // are identical; the two differ only in _diffusers_version, an
+    // unread `input_channels`, and that _name_or_path.
+    {.family = "Krea", .version = "2", .param_class = "VAE",
+     .variant = "HD fine-tuned VAE (wikeeyang)",
+     .hf_path = "wikeeyang/Krea2-Turbo-HD-V1",
+     .model_type = "krea2-vae",
+     .parent_model_type = "krea2",   // any model on the Qwen-Image latent
+     .files = {"Krea2-HD-vae.safetensors"},
+     .companion_files = {{.repo = "Qwen/Qwen-Image",
+                          .file = "vae/config.json",
+                          .dest = "config.json"}},
+     .needs_tokenizer_json = false},
     // ---- Qwen-Image (text+image -> image editing diffusion) -----------
     // Qwen-Image-Edit-2511 (Qwen): a flow-matching multi-reference IMAGE
     // EDIT model, model_type "qwen-image-edit". Same diffusers split-stage

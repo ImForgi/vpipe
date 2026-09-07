@@ -851,6 +851,66 @@ TEST(model_catalog, comfy_org_minimax_h3_fetches_a_runnable_set) {
   EXPECT_TRUE(tok);
 }
 
+// The standalone Krea2-HD VAE, and the three things about it that a
+// wrong catalogue entry gets silently wrong.
+//
+// It lives in a repo that also publishes ten DiT quantizations totalling
+// ~100 GB, ships no config.json of its own, and is offered to a stage
+// that filters on model_type. Miss the first and a `vae` selection
+// downloads a hundred gigabytes; miss the second and the decode has no
+// latents_mean/std to un-whiten with; miss the third and the entry
+// exists but nothing can pick it.
+TEST(model_catalog, krea2_hd_vae_is_a_standalone_vae) {
+  const ModelCatalogEntry* e = nullptr;
+  for (const ModelCatalogEntry& c : model_catalog()) {
+    if (c.hf_path == "wikeeyang/Krea2-Turbo-HD-V1") { e = &c; }
+  }
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+
+  EXPECT_TRUE(e->model_type == "krea2-vae");
+  // A supplement to Krea-2, not a Krea-2: catalog_category reads the
+  // parent link, and the pickers that offer a WHOLE model must not offer
+  // this one.
+  EXPECT_TRUE(e->parent_model_type == "krea2");
+  EXPECT_TRUE(catalog_category(*e) == "supplement");
+
+  // ONE file, and it is the VAE. The repo's other members are DiT
+  // quantizations of 7-15 GB each; an unpinned entry fetches the lot.
+  EXPECT_TRUE(e->files.size() == 1);
+  bool vae_only = !e->files.empty();
+  for (const std::string& f : e->files) {
+    if (f.find("vae") == std::string::npos ||
+        f.find(".gguf") != std::string::npos) {
+      vae_only = false;
+    }
+  }
+  EXPECT_TRUE(vae_only);
+
+  // The config it does not ship, landing at the checkpoint's own root --
+  // there is no `vae/` subdirectory here for it to sit in, because the
+  // checkpoint IS the root.
+  //
+  // FROM AN UNGATED REPO, and that is the assertion with teeth. This VAE
+  // needs no licence, so nobody fetching it has a reason to hold a
+  // Krea-2 token -- and krea/Krea-2-Turbo answers an anonymous request
+  // with 401. Sourcing a companion from a gated repo makes an ungated
+  // download fail for everyone who has not separately accepted someone
+  // else's licence, and it fails late: the weights land, the companion
+  // warns, and the decode stage goes inert about latents_mean.
+  bool cfg = false;
+  for (const auto& c : e->companion_files) {
+    EXPECT_TRUE(!c.repo.empty() && !c.file.empty() && !c.dest.empty());
+    if (c.dest == "config.json") {
+      cfg = true;
+      EXPECT_TRUE(c.repo == "Qwen/Qwen-Image");
+      EXPECT_TRUE(c.repo != "krea/Krea-2-Turbo");   // gated; see above
+      EXPECT_TRUE(c.file == "vae/config.json");
+    }
+  }
+  EXPECT_TRUE(cfg);
+}
+
 // Both MiniMax-H3 partitions, and that they are two ENTRIES rather than
 // one. They share a repo, an encoder and both VAEs, and their DiTs are
 // byte-identical in every respect but the weights -- so nothing about a

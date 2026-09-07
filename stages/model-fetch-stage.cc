@@ -1008,12 +1008,31 @@ ModelFetchStage::process(RuntimeContext& ctx)
                       &cancel)) {
         // WARN, not error: error() throws, and discarding a finished
         // multi-GB fetch over a few MB is the worse outcome. Name the
-        // consequence and the file, so this reads as "top this up"
-        // rather than as a failed download of the model itself.
+        // file and where it goes, so this reads as "top this up" rather
+        // than as a failed download of the model itself.
+        //
+        // NOT the consequence, though it used to be. This warning said
+        // "without it this copy cannot encode a prompt", which is true
+        // of the tokenizer companion it was written for and of nothing
+        // else -- a missing VAE config.json does not stop a prompt being
+        // encoded, it stops a latent being decoded. A message that names
+        // the wrong symptom is worse than one that names none: the
+        // reader looks for a failure that never happens, and the one
+        // that does arrives later from another stage.
+        //
+        // A 401 is called out by name because it is the one cause a user
+        // can act on and the one this list makes easy to create: a
+        // companion may live in a GATED repo the fetch of the main model
+        // never needed a token for.
         s->warn(fmt(
-            "ModelFetchStage('{}'): companion '{}' from '{}' failed ({}); "
-            "without it this copy cannot encode a prompt -- copy it to "
-            "'{}'", this->id(), c.file, c.repo, cerr, dest.string()));
+            "ModelFetchStage('{}'): companion '{}' from '{}' failed ({}){}; "
+            "the rest of '{}' is complete -- copy that one file to '{}'",
+            this->id(), c.file, c.repo, cerr,
+            cstatus == 401
+                ? " -- '" + c.repo + "' is gated, so this needs a token "
+                  "that has accepted ITS licence, not the one fetched here"
+                : std::string(),
+            hf_path, dest.string()));
         continue;
       }
       files_arr.as_array().push_back(FlexData::make_string(c.dest));

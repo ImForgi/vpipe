@@ -317,6 +317,99 @@ including the shift, which is a property of the schedule and not of the
 adapter. The `krea2-model-config` stage can stay: with no keys set it emits
 the defaults.
 
+## Swapping the VAE
+
+The VAE is a separate stage from the DiT, so it can be pointed at a different
+checkpoint from the model that produced the latent. The catalogue carries one
+such VAE:
+
+| entry | what it is |
+|---|---|
+| `wikeeyang/Krea2-Turbo-HD-V1` — *HD fine-tuned VAE* | the Qwen-Image VAE retrained alongside an HD fine-tune of Krea-2-Turbo, published on its own as a 507 MB safetensors |
+
+Fetch it like any other model — it pins the one VAE file, not the ten DiT
+quantizations that share its repository — and give it its **own**
+`model-select` source wired to `vae-decode`'s model iport, leaving the
+model-select that feeds the conditioner and `generate-image` on
+`krea/Krea-2-Turbo`:
+
+```json
+{
+  "id": "vae-select",
+  "type": "model-select",
+  "iports": [],
+  "config": { "hf_dir": "wikeeyang/Krea2-Turbo-HD-V1" }
+}
+```
+
+```json
+{
+  "id": "vae-decode",
+  "type": "vae-decode",
+  "iports": [
+    { "src": "generate-image", "oport": 0 },
+    { "src": "vae-select",     "oport": 0 }
+  ],
+  "config": {}
+}
+```
+
+Setting `vae-decode`'s own `hf_dir` config does the same thing with one stage
+fewer; the iport exists so the choice can be made in the UI alongside the
+model.
+
+**What it changes.** Same DiT, same seed, same latent — only the decoder
+differs. Measured over the shipped 1024x1024 text-to-image pipeline:
+
+| | stock VAE | HD VAE |
+|---|---:|---:|
+| contrast (pixel std) | 80.0 | **88.1** |
+| detail (gradient energy) | 8.61 | **9.87** |
+| mean level, per channel | 120.2 / 109.3 / 92.8 | 117.2 / 106.4 / 90.1 |
+
+So ~10% more contrast and ~15% more high-frequency detail, with the colour
+balance essentially where it was — which is what the publisher claims for it.
+The two images are otherwise the same picture (28.2 dB PSNR between them).
+
+**It is a decoder fine-tune.** Tensor for tensor against Krea-2-Turbo's own
+VAE, the decoder has moved a long way (median rel-L2 0.83) and the encoder
+barely at all (0.010). The file does carry a full encoder, so `vae-encode`
+accepts it too, but there is little reason to prefer it there.
+
+**It also works for the other models on this latent space** — Qwen-Image and
+Qwen-Image-Edit use the same VAE — though the catalogue lists it under Krea-2,
+which is what it was trained beside.
+
+**Under the hood**, two things about this checkpoint are unusual and are
+handled at load. Its tensors use the *native* Wan/Qwen-Image names
+(`decoder.upsamples.4.residual.2`) rather than the diffusers ones
+(`decoder.up_blocks.1.resnets.0.conv1`); the loader maps them and refuses the
+checkpoint rather than mapping it partially.
+
+And it ships no `config.json`, so the per-channel `latents_mean` /
+`latents_std` that un-whiten a latent have to come from somewhere. They are
+never defaulted — the wrong sixteen numbers give a plausible, wrongly-graded
+picture rather than an error — so they are borrowed, in this order:
+
+1. `config.json` in the VAE's own directory, if you put one there;
+2. the `vae/config.json` of an **installed** model this VAE attaches to. If
+   you already have Krea-2 registered, that file is already on disk and is
+   used in place. Nothing is downloaded and nothing is copied; the log names
+   the file it read.
+
+Only when neither answers does the fetch matter: the catalogue entry pulls
+`vae/config.json` from `Qwen/Qwen-Image` as a companion. That repo and not
+`krea/Krea-2-Turbo`, which is gated — this VAE is not, so requiring a Krea-2
+token to complete an ungated download would fail for anyone who has not
+separately accepted that licence. Every field the code reads is identical
+between the two files; Krea-2's own copy records `"_name_or_path":
+"Qwen/Qwen-Image"`.
+
+If you see `companion 'vae/config.json' … failed (401)`, that is the
+gated-repo case on an older build. Either register a Krea-2 checkpoint
+(which is then used directly) or drop `Qwen/Qwen-Image`'s `vae/config.json`
+into the VAE directory by hand.
+
 ## Troubleshooting
 
 **`model-fetch` reports an authorization failure.** The licence is not

@@ -3,6 +3,7 @@
 
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/wan-vae-names.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -76,6 +77,12 @@ f16_buf_(MetalCompute* mc, const float* src, std::size_t n)
 
 }  // namespace
 
+const std::string&
+MetalKrea2Vae::wname_(const std::string& diffusers_name) const
+{
+  return wan_vae::resolve(_names, diffusers_name);
+}
+
 // Load a 3x3 conv as a dense-gemm weight [Cout, 9*Cin], flattened (ky,kx,cin)
 // to pair with im2col_hwc_3x3. `from3d` sources a [Cout,Cin,3,3,3] causal
 // conv3d and keeps only the kt=2 temporal slice (single-frame decode); else a
@@ -85,7 +92,7 @@ MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
                              bool from3d)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.empty()) { return c; }
   const auto& sh = info->shape;
   const int Cout = (int)sh[0];
@@ -103,7 +110,7 @@ MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
   std::vector<float> flat;
   auto build_flat = [&]() {
     std::size_t n = 0;
-    std::vector<float> w = read_f32_(ws.src(), _mc, nm + ".weight", n);
+    std::vector<float> w = read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
     if (w.empty()) { return; }
     flat.assign((std::size_t)Cout * 9 * Cin, 0.0f);
     for (int o = 0; o < Cout; ++o) {
@@ -300,7 +307,7 @@ MetalKrea2Vae::Conv
 MetalKrea2Vae::load_conv1x1_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.size() < 2) { return c; }
   const auto& sh = info->shape;
   c.cout = (int)sh[0]; c.cin = (int)sh[1]; c.k = c.cin;
@@ -318,7 +325,7 @@ MetalKrea2Vae::load_vec_(WeightSet& ws, const std::string& nm)
 {
   return ws.derived(std::string(kKey) + "f16|" + nm, [&]() -> SharedBuffer {
     std::size_t n = 0;
-    std::vector<float> v = read_f32_(ws.src(), _mc, nm, n);
+    std::vector<float> v = read_f32_(ws.src(), _mc, wname_(nm), n);
     if (v.empty()) { return {}; }
     return f16_buf_(_mc, v.data(), n);
   }, _part);
@@ -358,6 +365,32 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_ws = std::move(ws_in);
   m->_mc = mc;
   m->_cfg = cfg;
+
+  // WHICH SPELLING this checkpoint uses, before a single tensor is read.
+  // Empty for the diffusers layout every krea/ and Qwen/ pack ships, so
+  // that path is unchanged by construction; a NATIVE one (ComfyUI's
+  // single-file VAEs, wikeeyang's Krea2-HD fine-tune) gets a map and the
+  // loaders below go on naming tensors one way. REFUSED rather than
+  // partially mapped: the tensors at one level all share a shape, so a
+  // name the rule cannot place would load some other level's weights and
+  // decode a plausible, wrong image.
+  {
+    std::string nerr;
+    if (!wan_vae::build_name_map(wts.src().tensor_names(), m->_names,
+                                 &nerr)) {
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(
+            fmt("MetalKrea2Vae: {}", nerr));
+      }
+      return nullptr;
+    }
+    if (!m->_names.empty() && mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "MetalKrea2Vae: natively-named Qwen-Image VAE checkpoint; {} "
+          "tensor names mapped to the diffusers spelling",
+          m->_names.size()));
+    }
+  }
 
   m->_lib_gemm = mc->load_library("dense_gemm");
   m->_lib_elt  = mc->load_library("llm_elementwise");
@@ -491,8 +524,8 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     const std::string qbase = "decoder.mid_block.attentions.0.to_qkv";
     auto read_qkv = [&]() {
       if (!qkv.empty()) { return; }
-      qkv  = read_f32_(wts.src(), mc, qbase + ".weight", n);
-      qkvb = read_f32_(wts.src(), mc, qbase + ".bias", nb);
+      qkv  = read_f32_(wts.src(), mc, m->wname_(qbase + ".weight"), n);
+      qkvb = read_f32_(wts.src(), mc, m->wname_(qbase + ".bias"), nb);
     };
     const int C = dims0;
     {
@@ -1548,8 +1581,8 @@ MetalKrea2Vae::load_encoder_(WeightSet& ws)
     const std::string base = "encoder.mid_block.attentions.0.to_qkv";
     auto read_qkv = [&]() {
       if (!qkv.empty()) { return; }
-      qkv  = read_f32_(wts.src(), mc, base + ".weight", n);
-      qkvb = read_f32_(wts.src(), mc, base + ".bias", nb);
+      qkv  = read_f32_(wts.src(), mc, wname_(base + ".weight"), n);
+      qkvb = read_f32_(wts.src(), mc, wname_(base + ".bias"), nb);
     };
     const int C = dtop;
     {

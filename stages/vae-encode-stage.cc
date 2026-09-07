@@ -204,9 +204,11 @@ const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
           "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
-          "model iport overrides it",
+          "model iport overrides it. May also name a STANDALONE VAE "
+          "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image-edit,mage-flow,"
+       "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va",
    .model_channel = "diffusion-model"},
@@ -396,6 +398,12 @@ VaeEncodeStage::vae_dir_for_release_() const
     if (!p.empty()) { return p; }
   }
 #endif
+  // A STANDALONE VAE checkpoint: not a directory with a component in it,
+  // but the single freely-named safetensors that IS the component. Named
+  // through the same resolver ensure_loaded_ opens the WeightSet with,
+  // so the claim, the release and the set cannot name different things.
+  const std::string only = resolve_vae_weights_path(vae_dir);
+  if (only != vae_dir) { return only; }
   return {};
 }
 
@@ -420,7 +428,11 @@ VaeEncodeStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  return model_memory::weight_claims({resolve_vae_dir(root)});
+  // resolve_vae_weights_path is the identity for every layout that has a
+  // directory to claim; it only bites on a standalone VAE, where the
+  // claim has to name the file the set is opened on.
+  return model_memory::weight_claims(
+      {resolve_vae_weights_path(resolve_vae_dir(root))});
 }
 
 Job
@@ -605,11 +617,13 @@ VaeEncodeStage::ensure_loaded_()
   // open_weight_set().
   // MiniMax-H3 keeps the WEIGHTS one level below the config that named
   // the family, so the set is opened on the resolved leaf. Every other
-  // family's resolver returns what it was handed.
+  // family's resolver returns what it was handed -- and a STANDALONE VAE
+  // is one freely-named safetensors in a directory nothing globs, so
+  // that one is opened on the FILE. See resolve_vae_weights_path.
   const std::string ws_dir =
       (_family == "minimax-h3")
           ? genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(vae_dir)
-          : vae_dir;
+          : resolve_vae_weights_path(vae_dir);
   std::shared_ptr<genai::WeightSet> ws =
       genai::open_weight_set(ws_dir, session());
   if (!ws) {

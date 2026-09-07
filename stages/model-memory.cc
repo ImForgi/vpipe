@@ -343,6 +343,12 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
   namespace fs = std::filesystem;
   if (root.empty() || width <= 0 || height <= 0) { return 0; }
   std::ifstream in(fs::path(root) / "vae" / "config.json");
+  // A STANDALONE VAE checkpoint IS its own root -- there is no model
+  // around it to hold a `vae/` subdirectory. Without this fallback the
+  // read returns 0, the decode arena goes undeclared, and the
+  // idle-unload decision silently falls back to the flat kHeadroom
+  // guess the declared arena exists to replace.
+  if (!in) { in = std::ifstream(fs::path(root) / "config.json"); }
   if (!in) { return 0; }
   FlexData fd = FlexData::from_json(in);
   if (!fd.is_object()) { return 0; }
