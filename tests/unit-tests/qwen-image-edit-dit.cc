@@ -586,3 +586,83 @@ TEST(qwen_image_edit_dit, vec4_elementwise_matches_scalar)
   std::printf("[qwen_image_edit_dit] vec4 vs scalar elementwise: %zu/%zu "
               "values differ\n", diff, a.size());
 }
+
+// THE MATRIX-CORE FLASH KERNEL AGAINST THE ALU ONE.
+//
+// Qwen-Image was the last DiT here still on the ALU steel attention
+// everywhere; it now takes the NAX entry by default wherever the GPU has
+// matrix cores, as krea2, flux2 and boogu already did. That moves this
+// family's DEFAULT output, so the move needs a guard.
+//
+// The two are not bit-identical and are not meant to be: they tile
+// differently (64x32 against 32x16) and accumulate the online softmax in
+// a different order. What has to hold is that they are the same
+// attention -- the same bound the sibling families' mma-vs-steel A/Bs
+// use, on the same staged single-block output, which is the clean
+// discriminator before 60 blocks of residual compounding.
+//
+// VPIPE_QIE_NO_ATTN_NAX is the switch, and uses_attn_nax() is what stops
+// this passing vacuously on a box that has no matrix cores to force off.
+TEST(qwen_image_edit_dit, forward_nax_matches_alu)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH");
+  const char* dd   = std::getenv("VPIPE_QWEN_IMAGE_EDIT_DIT_DIR");
+  const std::string dit_dir =
+      (dd != nullptr && *dd != '\0') ? std::string(dd)
+      : (root != nullptr && *root != '\0') ? std::string(root) + "/transformer"
+      : std::string();
+  if (dit_dir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[qwen_image_edit_dit] no matrix cores -- NAX A/B is "
+                "vacuous, SKIPPED\n");
+    return;
+  }
+
+  const int gh = 16, gw = 16, gen_seq = gh * gw, txt_seq = 96;
+  const int IC = 64, TXTD = 3584;
+  auto rnd = [](std::uint32_t& s) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (float)((s >> 8) & 0xffffff) / 16777216.0f - 0.5f;
+  };
+  std::uint32_t s1 = 0x51a6e00u, s2 = 0xc0ffee11u;
+  std::vector<float> hidden((std::size_t)gen_seq * IC),
+                     txt((std::size_t)txt_seq * TXTD);
+  for (auto& v : hidden) { v = rnd(s1); }
+  for (auto& v : txt)    { v = rnd(s2); }
+  const SharedBuffer h = upload_(mc, hidden);
+  const SharedBuffer t = upload_(mc, txt);
+  const float sigma = 0.7f;
+
+  // Free each DiT before the twin loads: only one ~10GB model resident.
+  auto run = [&](std::vector<float>& blk0, bool* nax) -> bool {
+    auto m = MetalQwenImageTransformer::load(dit_dir, mc, {});
+    if (m == nullptr) { return false; }
+    *nax = m->uses_attn_nax();
+    SharedBuffer b0 = m->forward(h, gen_seq, t, txt_seq, gh, gw, sigma, {}, 0);
+    if (b0.empty()) { return false; }
+    blk0 = readback_(b0, (std::size_t)gen_seq * 3072);
+    return true;
+  };
+
+  std::vector<float> blk0_nax, blk0_alu;
+  bool nax_on = false, alu_on = true;
+  ASSERT_TRUE(run(blk0_nax, &nax_on));
+  ::setenv("VPIPE_QIE_NO_ATTN_NAX", "1", 1);
+  const bool ok_alu = run(blk0_alu, &alu_on);
+  ::unsetenv("VPIPE_QIE_NO_ATTN_NAX");
+  ASSERT_TRUE(ok_alu);
+  if (blk0_nax.empty() || blk0_alu.empty()) { return; }
+
+  // The arms are the arms. Without this the test can compare the ALU
+  // kernel with itself and report agreement.
+  EXPECT_TRUE(nax_on);
+  EXPECT_TRUE(!alu_on);
+
+  const double r = rel_l2_(blk0_nax, blk0_alu.data(), blk0_nax.size());
+  std::printf("[qwen_image_edit_dit] attention NAX vs ALU: block0 rel-L2 = "
+              "%.6f (nax %s)\n", r, nax_on ? "engaged" : "OFF");
+  EXPECT_TRUE(std::isfinite(r) && r < 0.01);
+}

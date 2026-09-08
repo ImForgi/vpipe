@@ -95,6 +95,27 @@ const ConfigKey kAttrs[] = {
           "a negative prompt on iport1 runs a 2nd DiT pass per step"},
   {.key = "init_latents", .type = ConfigType::String, .required = false,
    .doc = "debug: raw f32 packed initial latents [img_seq, 64] (repro/golden)"},
+  {.key = "sage_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): SageAttention runs the QK^T "
+          "product of the flash kernel in INT8, one scale per attention "
+          "block, with K quantized as K - mean(K) over tokens -- which is "
+          "EXACT rather than approximate, since a per-channel shift moves "
+          "every score in a row equally and softmax does not see it. P*V "
+          "stays in the tensor dtype. MEASURED on an M5, 8 heads x 20036 "
+          "rows x 128: 156.6 -> 130.6 ms including the quantization "
+          "prologue (1.20x), at cosine 0.99992 against a double-precision "
+          "reference where the f16 kernel is also 0.99992. MATRIX CORES "
+          "ONLY -- the int8 fragment MMA is an M5 instruction with no ALU "
+          "fallback, so a box without them says so once and runs dense. "
+          "Taken by flux2, krea2 and qwen-image; INDEPENDENT of i8_gemm "
+          "and settable with it. Off by default: it is an approximation, "
+          "and which images it is safe on is a judgement about the "
+          "model, not about the kernel",
+   .def_bool = false},
+  {.key = "sage_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left in the tensor dtype, untouched "
+          "by SageAttention. 0 -- the default -- quantizes every block",
+   .def_int = 0},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
@@ -302,6 +323,8 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // faster. klein_kv chooses a RECIPE, so on the wrong checkpoint it
   // does not run slower, it runs wrong.
   _i8_gemm = attr_bool("i8_gemm");
+  _sage.enabled      = attr_bool("sage_attn");
+  _sage.dense_layers = (int)attr_int("sage_dense_layers");
   _lora[0].path  = attr_str("lora");
   _lora[0].scale = attr_real("lora_scale");
   _lora[1].path  = attr_str("lora2");
@@ -916,6 +939,7 @@ GenerateImageStage::ensure_loaded_()
     }
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
+    fcfg.sage = _sage;
     _flux2_params.apply_to(fcfg);
     // Nothing in the checkpoint says which recipe it wants, and getting it
     // backwards costs plausible-looking wrong images rather than an error --
@@ -980,6 +1004,8 @@ GenerateImageStage::ensure_loaded_()
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     genai::MetalQwenImageTransformer::Config qcfg;
+  qcfg.sage = _sage;
+    qcfg.sage = _sage;
     _qie_dit = genai::MetalQwenImageTransformer::load(
         weight_set_(dit_dir), mc, qcfg, stream_blocks);
     if (!_qie_dit) {
@@ -1131,6 +1157,7 @@ GenerateImageStage::ensure_loaded_()
     }
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
+    kcfg.sage = _sage;
     _dit = genai::MetalKrea2Transformer::load(
         weight_set_(dit_dir), mc, kcfg, stream_blocks,
         lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
@@ -1215,6 +1242,7 @@ GenerateImageStage::load_flux2_dit_()
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
+  fcfg.sage = _sage;
   _flux2_params.apply_to(fcfg);
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or
@@ -1330,6 +1358,13 @@ GenerateImageStage::load_boogu_dit_()
   if (mc == nullptr || _boogu_dit_dir.empty()) { return false; }
   genai::MetalBooguTransformer::Config bcfg;
   bcfg.i8_gemm = _i8_gemm;
+  // NOT boogu, deliberately. Its attention pads head_dim 120 to the
+  // bd128 kernel and memoizes a specialised function per DISTINCT
+  // sequence length -- the refiners, the image self-attention and the
+  // joint attention all run at different ones -- so Sage there is an
+  // int8 twin per length and a prologue per (length, block), against
+  // padded operands. That is a different piece of work from the three
+  // families above, not a fifth copy of it.
   _boogu_dit = genai::MetalBooguTransformer::load(weight_set_(_boogu_dit_dir),
                                                  mc, bcfg, _boogu_stream);
   if (_boogu_dit && _boogu_stream) {
@@ -1479,6 +1514,7 @@ GenerateImageStage::load_krea2_dit_()
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
+  kcfg.sage = _sage;
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or un-adapted,
   // on the graph that asked for both.

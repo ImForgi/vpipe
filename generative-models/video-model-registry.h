@@ -1,6 +1,7 @@
 #ifndef VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 #define VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 
+#include "generative-models/shared/sage-attention.h"
 #include "common/flex-data.h"
 #include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
@@ -142,6 +143,14 @@ struct VideoGenRequest {
   // ABORTS, so a family that calls this also gets cancellation inside a
   // step rather than only between steps.
   std::function<bool(int done, int total)> block_progress;
+
+  // The same acceleration settings VideoModelCreateArgs carries, repeated
+  // per generation. A family that decides at LOAD (building a kernel
+  // variant, sizing int8 scratch) reads them there; one that decides per
+  // forward reads them here, and the two are the same values -- the stage
+  // fills both from one config.
+  sage::Config sage;
+  bool         i8_gemm = false;
 };
 
 // What a generation produced. A family that generates no audio simply
@@ -219,6 +228,28 @@ struct VideoModelCreateArgs {
   // Borrowed, and only for the duration of the call: the stage owns the
   // FlexData. A family that wants it later must copy it.
   const FlexData*              model_config = nullptr;
+
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, as the graph asked for them.
+  //
+  // These are not built-in knobs the host applies on a family's behalf --
+  // nothing outside the family touches its forward. They are here
+  // because every DiT in this tree, in-tree or not, runs the same steel
+  // flash kernel and the same GEMM kernels, so a plugin family that
+  // wants them has the same three decisions to make and no way to learn
+  // what the graph asked without being told.
+  //
+  // A family that implements none of this ignores them, which is what
+  // the defaults mean. A family that implements SOME should say which
+  // in its own log line: silence is indistinguishable from a knob that
+  // did nothing, and the numbers get believed either way.
+  //
+  // `sage` is driveable directly -- MetalSageAttention is public and its
+  // three-step contract (build the function with constant 306, prepare()
+  // into the encoder, bind() on the dispatch) asks nothing of the caller
+  // beyond the strides it already has. `i8_gemm` likewise goes through
+  // I8GemmContext.
+  sage::Config                 sage;
+  bool                         i8_gemm = false;
 
   // The clip the graph INTENDS to generate, already through the family's
   // own align_frames / size_grid. 0 when the stage could not settle it.

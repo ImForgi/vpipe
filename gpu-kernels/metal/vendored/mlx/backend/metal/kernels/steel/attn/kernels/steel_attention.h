@@ -31,6 +31,22 @@ constant bool has_spans_set [[function_constant(303)]];
 constant bool has_spans =
     is_function_constant_defined(has_spans_set) ? has_spans_set : false;
 
+// vpipe: export this pass's online-softmax statistics, so a SECOND
+// partial attention over a disjoint key set can be merged with it.
+//
+// Sol-Attn needs exactly that: the exact blocks run here at full steel
+// throughput while the approximate ones are summarised elsewhere, and
+// the two halves combine only if both report their running maximum and
+// denominator. O is stored ALREADY divided by sum_score, so the merge
+// multiplies it back -- nothing about the store changes.
+//
+// Read through is_function_constant_defined, like has_spans: every
+// existing caller sets 200/201/301..303 and stops there, and unset must
+// mean false EXPLICITLY rather than by luck.
+constant bool export_ml_set [[function_constant(304)]];
+constant bool export_ml =
+    is_function_constant_defined(export_ml_set) ? export_ml_set : false;
+
 struct MaxOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
@@ -102,6 +118,9 @@ template <
     // hi >= num_frames are how "nothing outside on that side" is said.
     const device int2* span_bounds
         [[buffer(11), function_constant(has_spans)]],
+    // vpipe: [B, H, qL] each, this pass's per-row max and denominator.
+    device float* ml_max [[buffer(12), function_constant(export_ml)]],
+    device float* ml_sum [[buffer(13), function_constant(export_ml)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -280,8 +299,11 @@ template <
   int vis_base = 0;
   int kb_prev = 0;
   if (has_spans) {
-    vis_base = qb_off[tid.x];
-    nvis = qb_off[tid.x + 1] - vis_base;
+    // qb_stride == 0 is one list shared by every head; anything else
+    // lays qb_off out as [H][NQ + 1]. See AttnSpanParams.
+    const int qbi = int(tid.y) * span_params->qb_stride + int(tid.x);
+    vis_base = qb_off[qbi];
+    nvis = qb_off[qbi + 1] - vis_base;
   }
 
   // Loop over KV seq length
@@ -554,6 +576,26 @@ template <
     if (!has_spans) {
       loader_k.next();
       loader_v.next();
+    }
+  }
+
+  // vpipe: the statistics, BEFORE the normalize consumes them.
+  //
+  // Four lanes share a row after row_reduce and all four hold the same
+  // reduced value, so one of them writes: sn is the fragment COLUMN and
+  // is 0 for exactly one lane of each row.
+  if (export_ml) {
+    if (sn == 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        const int row = int(tid.x) * BQ + tm + sm + i * kFragSize;
+        if (row < params->qL) {
+          const size_t o =
+              (size_t(tid.z) * params->H + size_t(tid.y)) * params->qL + row;
+          ml_max[o] = float(max_score[i]);
+          ml_sum[o] = float(sum_score[i]);
+        }
+      }
     }
   }
 

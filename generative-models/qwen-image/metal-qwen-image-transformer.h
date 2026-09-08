@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
@@ -64,6 +66,12 @@ class MetalQwenImageTransformer {
     // where a 0.4% frequency error is radians of phase -- leaving it fp32
     // knocked temb 7.6% off and cascaded into every block's modulation.
     bool  bf16_time_freqs = false;
+    // SageAttention: the QK^T product in int8. It rides on the
+    // matrix-core flash entry, which this family takes by default
+    // wherever the GPU has matrix cores -- so on such a box this is the
+    // only switch, and on an M4 it says so once and runs dense.
+    // VPIPE_QIE_NO_ATTN_NAX turns both off together.
+    sage::Config sage;
     // Round the TIMESTEP itself to bf16 before forming the sinusoid angle --
     // what `timesteps.to(img.dtype)` does when the model runs bf16. Separate
     // from bf16_time_freqs (that is the frequency TABLE) because they are
@@ -167,6 +175,12 @@ class MetalQwenImageTransformer {
   // GEMMs (supports_matrix_cores() + kernels loaded + VPIPE_QIE_NO_MMA2 unset).
   // For the mma-vs-steel A/B test to assert the path actually engaged.
   bool uses_mma2() const { return _use_mma2; }
+  // Which flash kernel the attention runs. Exposed so an A/B can assert
+  // the arm it thinks it measured: without it a forced-ALU run on a box
+  // that has no matrix cores compares the same kernel with itself and
+  // passes.
+  bool uses_attn_nax() const { return _use_attn_nax; }
+  bool uses_sage_attn() const { return (bool)_sage; }
 
   // One denoiser step. `hidden` is the packed [gen_seq, in_channels] noisy
   // image (gen_seq = grid_h*grid_w); `txt` the [txt_seq, txt_dim] encoder
@@ -357,7 +371,7 @@ class MetalQwenImageTransformer {
   // Libraries + kernel functions. The whole DiT runs in bf16 (the residual
   // stream reaches ~1e7, far past f16's 65504) -> the *_bf16 metallib variants.
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa,
-      _lib_rope, _lib_qmm, _lib_attn;
+      _lib_rope, _lib_qmm, _lib_attn, _lib_attn_nax;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_layernorm,
       _fn_silu, _fn_gelu, _fn_residual, _fn_transpose, _fn_sdpa, _fn_rope_table,
       _fn_adaln, _fn_gated,
@@ -379,6 +393,11 @@ class MetalQwenImageTransformer {
   // kernel is unavailable (VPIPE_QIE_NO_STEEL_ATTN forces the scalar path).
   metal_compute::SharedBuffer _attn_params;
   bool _steel_attn_ok = false;
+  // The matrix-core flash entry: on by default where the GPU has matrix
+  // cores, as in every sibling DiT. VPIPE_QIE_NO_ATTN_NAX forces the ALU
+  // steel kernel.
+  bool _use_attn_nax = false;
+  std::unique_ptr<MetalSageAttention> _sage;
   // Affine qmm (loaded only when quantized): w4g64 / w8g64 (bf16 variant) +
   // the row-broadcast bias add applied after the (bias-less) qmm.
   metal_compute::ComputeFunction _fn_qmm4, _fn_qmm8, _fn_bias_add;

@@ -328,6 +328,79 @@ look like a hang.
 Ship the family's knobs as a `ModelConfigSourceStage` (above), not as keys
 on `generate-video`.
 
+### The acceleration settings, and what they are not
+
+`VideoModelCreateArgs` and `VideoGenRequest` both carry `sage` and
+`i8_gemm`. These are the cross-family settings the graph asked for, and
+the host applies **none** of them on your behalf — nothing outside your
+family touches your forward. They are there because every DiT in this
+tree runs the same steel flash kernel and the same GEMM kernels, so a
+family that wants them has the same decisions to make and no other way
+to learn what was asked.
+
+Implement none and they are ignored, which is what their defaults mean.
+Implement **some** and say which in your own log line: silence is
+indistinguishable from a knob that did nothing, and the numbers get
+believed either way.
+
+`sage` is [**SageAttention**](https://arxiv.org/abs/2410.02367) — the
+QK^T product of the flash attention in int8, with one scale per
+attention block and the key side quantized as `K - mean(K)` over tokens.
+That smoothing is exact rather than approximate: a per-channel shift
+moves every score in a row by the same amount and softmax does not see
+it. `P*V` stays in the tensor dtype. Measured on an M5 at 8 heads ×
+20036 rows × 128: 156.6 → 130.6 ms including the quantization prologue,
+at cosine 0.99992 against a double-precision reference where the f16
+kernel is also 0.99992.
+
+Driving it is three steps and asks nothing beyond the strides you
+already pass to the attention:
+
+```cpp
+#include "generative-models/shared/metal-sage-attention.h"
+
+// 1. At load. Returns null when the config did not ask OR the GPU has no
+//    matrix cores -- neither is a failure. `fatal` is set only when it
+//    was asked for and the kernels would not load, and you should refuse
+//    the model then: running dense under a config that asked for Sage
+//    reports a Sage run and its numbers get believed.
+bool fatal = false;
+_sage = MetalSageAttention::load_for_model(mc, /*bf16=*/true, args.sage,
+                                           "AcmeVideo", &fatal);
+if (fatal) { return nullptr; }
+
+// 2. Build an int8 TWIN of your attention function. Both, not one:
+//    sage.dense_layers leaves the leading blocks on the f16 kernel.
+fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+
+// 3. Per block, into the SAME encoder, immediately before the dispatch.
+//    The encoder is serial, so the ordering is the encoder's.
+//    Operand is {buffer, element offset, row stride, HEAD stride} --
+//    the head stride is its own number, not L * row, because q/k are
+//    usually read in place inside a fused [rows, 3*I] projection.
+MetalSageAttention::Operand q{&qt, 0, head_dim, seq * head_dim};
+MetalSageAttention::Operand k{&kt, 0, head_dim, seq * head_dim};
+if (_sage->prepare(enc, q, k, n_heads, n_kv_heads, qL, kL, head_dim,
+                   bq, bk, args.sage, &err)) {
+  enc.set_function(fn_attn_i8);
+  /* ...your usual binds... */
+  _sage->bind(enc);          // buffers 15..18
+}
+enc.dispatch(/* unchanged */);
+```
+
+`bq` / `bk` are your attention kernel's own query and key block sizes —
+`MetalSageAttention::nax_query_block()` / `nax_key_block()` for the
+matrix-core steel entry at head_dim 128, which is what the in-tree
+families run. The scales are one per those tiles, so a caller that
+guessed them differently would size the scale arrays wrong.
+
+`scratch_bytes()` tells you what one call needs, and `set_arena()` lends
+it two regions to carve from — the same lending the in-tree DiTs do out
+of their forward arena, so Sage costs the process nothing it was not
+already holding. If you lend, **take the loan back before you replace
+it**: the carved buffers are windows that hold your allocation alive.
+
 ## Extension point 4b — VAE families
 
 A family that generates latents needs something to turn them into frames,

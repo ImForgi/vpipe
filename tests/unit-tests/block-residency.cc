@@ -587,3 +587,59 @@ TEST(block_residency, a_shedding_forward_does_not_double_the_cap)
   r.note_healthy_forward();          // same forward: must be ignored
   EXPECT_TRUE(r.per_forward_cap() == 4);
 }
+
+// THE REFUSAL'S ARITHMETIC, because the message that reports it has to
+// compare the same quantities the decision does.
+//
+// Both gates keep a margin -- 5% of the GPU working set, 10% of the
+// reclaimable RAM -- and those live inside the predicates. A caller that
+// prints the RAW budget beside the RAW need therefore reports a refusal
+// whose numbers say it should have fitted. That happened: a 109320-row
+// MiniMax-H3 forward wanting 14537 MB was refused against "15733 MB of
+// GPU working set / 14806 MB reclaimable", both larger, and the
+// decision was right the whole time -- 14537 is over 90% of 14806.
+//
+// So the number a caller should quote is the need GROSSED UP by the
+// margin, and this pins that identity at the boundary in both
+// directions.
+TEST(block_residency, a_budget_gate_is_the_need_grossed_up_by_its_margin)
+{
+  vpipe::metal_compute::MetalCompute::MemoryBudget mb;
+  mb.headroom = 15733ull << 20;
+  mb.available_physical = 14806ull << 20;
+  const std::size_t need = 14537ull << 20;
+
+  // The case as it happened: the working set has room, the physical
+  // budget does not, and only the second is why it was refused.
+  EXPECT_TRUE(mb.fits(need, 0.05));
+  EXPECT_FALSE(mb.fits_physical(need, 0.10));
+
+  auto grossed_up = [](std::size_t n, double m) {
+    return (std::size_t)((double)n / (1.0 - m));
+  };
+  // 14537 / 0.95 = 15302, which the 15733 on hand covers; 14537 / 0.90 =
+  // 16152, which the 14806 does not.
+  EXPECT_TRUE((grossed_up(need, 0.05) >> 20) == 15302u);
+  EXPECT_TRUE((grossed_up(need, 0.10) >> 20) == 16152u);
+
+  // AND THE IDENTITY ITSELF, at the boundary from both sides: a budget
+  // exactly equal to the grossed-up need passes, one byte less fails.
+  for (const double m : {0.0, 0.05, 0.10, 0.25}) {
+    const std::size_t want = grossed_up(need, m);
+    vpipe::metal_compute::MetalCompute::MemoryBudget b;
+    b.headroom = want + 1;            // rounding is downward; +1 covers it
+    b.available_physical = want + 1;
+    EXPECT_TRUE(b.fits(need, m));
+    EXPECT_TRUE(b.fits_physical(need, m));
+    b.headroom = (std::size_t)((double)need / (1.0 - m)) - (need >> 8);
+    b.available_physical = b.headroom;
+    EXPECT_FALSE(b.fits(need, m));
+    EXPECT_FALSE(b.fits_physical(need, m));
+  }
+
+  // An unavailable physical query is vacuously true, which is what lets
+  // the gate exist on a platform that cannot answer it.
+  vpipe::metal_compute::MetalCompute::MemoryBudget none;
+  none.available_physical = 0;
+  EXPECT_TRUE(none.fits_physical(need, 0.10));
+}

@@ -81,7 +81,10 @@ const ConfigKey kAttrs[] = {
    .doc = "initial-noise RNG seed (default 0)"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
-          "block matmuls instead of bf16, at int8 quality. Taken only by a "
+          "block matmuls instead of bf16, at int8 quality. Independent of "
+          "`sol_attn` below and settable with it -- this chooses how the "
+          "GEMMs are computed, that one how the attention between them "
+          "is.  Taken only by a "
           "family whose forward materializes a dense weight for the matrix "
           "cores; a steel-only family IGNORES it, as does any box without "
           "NAX matmul2d. It also self-gates on ROWS "
@@ -101,6 +104,107 @@ const ConfigKey kAttrs[] = {
           "regardless, being a Gram matrix whatever noise its input carries. "
           "Default false; env VPIPE_I8_GEMM overrides",
    .def_bool = false},
+  // ---- SageAttention (thu-ml, arXiv:2410.02367) ---------------------
+  {.key = "sage_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): SageAttention runs the QK^T "
+          "product of the flash kernel in INT8, with one scale per "
+          "attention block -- per query block for Q, per key block for K, "
+          "which is the granularity the kernel already tiles at, so "
+          "dequantizing a score tile is a single scalar. P*V stays in the "
+          "tensor dtype: P is a probability, already well-conditioned, and "
+          "quantizing it buys the same again for a much worse error. K is "
+          "quantized as K - mean(K) over tokens, which is EXACT rather "
+          "than approximate -- a per-channel shift moves every score in a "
+          "row equally and softmax does not see it. MEASURED on an M5, 8 "
+          "heads x 20036 rows x 128: 156.6 -> 130.6 ms including the "
+          "quantization prologue (1.20x), at cosine 0.99992 against a "
+          "double-precision reference where the f16 kernel is also "
+          "0.99992. MATRIX CORES ONLY -- the int8 fragment MMA is an M5 "
+          "instruction and there is no ALU fallback, so a box without them "
+          "says so once and runs dense rather than refusing. INDEPENDENT "
+          "of i8_gemm and of sol_attn and settable with either: i8_gemm "
+          "chooses how the block's GEMMs are computed, sol_attn which key "
+          "blocks are attended, and this one how the attended ones are "
+          "multiplied. Off by default -- it is an approximation, and which "
+          "clips it is safe on is a judgement about the model",
+   .def_bool = false},
+  {.key = "sage_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left in the tensor dtype, untouched "
+          "by SageAttention. 0 -- the default -- quantizes every block. "
+          "Zero rather than sol_dense_layers' one because the two "
+          "approximate differently: Sol DROPS keys, so an early block's "
+          "less redundant residual stream is an argument for leaving it "
+          "alone, while Sage computes every key and every query and only "
+          "computes them in int8. No published profile needs a dense "
+          "prefix here; the key exists so a measurement can act on one",
+   .def_int = 0},
+  // ---- Sol-Attn (NVlabs, arXiv:2607.24027) --------------------------
+  // Family-agnostic like `i8_gemm` beside it, and here for the same
+  // reason: it approximates ATTENTION, which every DiT in this tree has,
+  // rather than anything one family does. A family that has not taken it
+  // ignores these keys.
+  {.key = "sol_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): Sol-Attn routes whole 64-key "
+          "blocks during the online softmax, attending the ones a proxy "
+          "score keeps and standing in for the rest with each block's key "
+          "centroid and value sum. Cost falls with the fraction of blocks "
+          "kept, which is a property of the DATA and is reported per run. "
+          "Taken by minimax-h3; other families ignore it. NOT combinable "
+          "with a VDN linear branch -- VDN's windowed softmax and its "
+          "linear complement partition the keys between them, so "
+          "approximating one half would drop what the other assumed it "
+          "covered; Sol turns itself off for those blocks and says so. "
+          "The blocks the routing KEEPS are run by the same matrix-core "
+          "steel flash kernel the dense path uses, walking only the "
+          "listed blocks; only the summaries, the routing and the "
+          "approximate half are Sol's own code. MEASURED IN THE MODEL on "
+          "an M4 Pro, minimax-h3 at 20036 rows: a routed block's "
+          "attention goes 3480 -> 1348 ms (2.58x) keeping 26.1% of key "
+          "blocks, which projects to ~2.1x on the whole DiT once every "
+          "block but the first is routed. INDEPENDENT OF i8_gemm and "
+          "settable with it: that one chooses how the block's GEMMs are "
+          "computed and this one how the attention between them is, and "
+          "neither reads the other. Still OFF by default -- it is an "
+          "approximation, and which clips it is safe on is a judgement "
+          "about the model, not about the kernel",
+   .def_bool = false},
+  {.key = "sol_tau", .type = ConfigType::Real, .required = false,
+   .doc = "Sol-Attn routing threshold, in STANDARD DEVIATIONS of a query "
+          "block's own proxy-score distribution -- which is what lets one "
+          "number serve every head, layer and clip length where a fixed "
+          "block count would not. HIGHER keeps fewer blocks: quality falls "
+          "and speed rises, monotonically in both. The published profile "
+          "runs 1.0 / 1.25 / 1.5 over its three steps; 1.0 is the default "
+          "here because a single value has to be the conservative one",
+   .def_real = 1.0},
+  {.key = "sol_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left DENSE, untouched by Sol-Attn. "
+          "The first blocks are where the residual stream is least "
+          "redundant; the published profile keeps 1 of 48. 0 routes every "
+          "block",
+   .def_int = 1},
+  {.key = "sol_key_block", .type = ConfigType::Int, .required = false,
+   .doc = "keys summarised by one centroid, and the unit the routing "
+          "decides on. 32 or 64 only; 0 (default) takes 64, which is the "
+          "published value. THE TWO TRADE AGAINST EACH OTHER RATHER THAN "
+          "ONE DOMINATING, which is why both are offered. MEASURED on an "
+          "M4 Pro, 56 heads x 20036 rows against dense steel: 64 keeps "
+          "19.1% of key blocks and runs 3.54x, 32 keeps 22.9-26.0% and "
+          "runs 2.79x -- so 32 does MORE exact work and is slower, and is "
+          "also the more accurate of the two (rel-L2 0.0070-0.0077 "
+          "against 0.0082-0.0091 over three sequence lengths), because a "
+          "centroid over 32 keys stands in for them better. 64 is the "
+          "speed choice, 32 the fidelity one. Larger blocks were measured "
+          "and are worse on both counts (128 -> 3.33x, 256 -> 2.47x, both "
+          "keeping more), so they are not offered",
+   .def_int = 0},
+  {.key = "sol_local_radius", .type = ConfigType::Int, .required = false,
+   .doc = "key blocks either side of a query's own block that are always "
+          "exact, never routed. A block centroid is least representative "
+          "exactly where a query discriminates most, so the near diagonal "
+          "is not put to the vote. -1 routes even the query's own block, "
+          "which is an ablation rather than a setting",
+   .def_int = 1},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
@@ -256,6 +360,38 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _fps    = attr_real("fps");
   _steps  = (int)attr_int("steps");
   _i8_gemm = attr_bool("i8_gemm");
+  _sage.enabled      = attr_bool("sage_attn");
+  _sage.dense_layers = (int)attr_int("sage_dense_layers");
+  _sol.enabled      = attr_bool("sol_attn");
+  _sol.tau          = (float)attr_real("sol_tau");
+  _sol.dense_layers = (int)attr_int("sol_dense_layers");
+  _sol.local_radius = (int)attr_int("sol_local_radius");
+  // 32 or 64, and 0 means the default. WARN AND FALL BACK rather than
+  // refuse the stage, which is what `unload_when_idle` beside it does
+  // for the same class of key: a perf knob spelled wrong should not take
+  // a graph down. Named in the warning, because silently running a
+  // different block size than was asked for is how a benchmark comes to
+  // report the wrong number.
+  {
+    const std::int64_t kb = attr_int("sol_key_block");
+    if (kb == 0 || kb == 32 || kb == 64) {
+      _sol.key_block = (int)kb;
+    } else {
+      _sol.key_block = 0;
+      // The message distinguishes the two rejects, because they are not
+      // the same fact: 128 and 256 RUN and are simply worse on both
+      // speed and accuracy, so declining them is a policy; anything not
+      // a multiple of the steel kernel's 16-key block cannot run at all.
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): sol_key_block {} is not 32 or 64; "
+          "using 64. {}", this->id(), (long long)kb,
+          kb > 64
+              ? "Larger blocks were measured and are slower AND less "
+                "accurate, so they are not offered"
+              : "The routing block is also the unit the exact half walks, "
+                "so it cannot be smaller than 32"));
+    }
+  }
   _seed   = (std::uint64_t)attr_int("seed");
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
@@ -1178,6 +1314,9 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   req.steps  = _steps;
   req.seed   = _seed;
 
+  req.sage    = _sage;
+  req.i8_gemm = _i8_gemm;
+
   req.cond          = cond;
   req.cond_rows     = cond_rows;
   req.cond_dim      = cond_dim;
@@ -1298,6 +1437,11 @@ GenerateVideoStage::ensure_expert_(int which)
     // by iport0's conditioning -- so a config source that emitted once at
     // launch has already landed. Null when nothing was wired.
     args.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    // What the graph asked for, so a plugin family can build the same
+    // kernel variants the in-tree ones do. Nothing here is applied on
+    // the family's behalf: these are what it was ASKED, not what it got.
+    args.sage    = _sage;
+    args.i8_gemm = _i8_gemm;
     // The clip this graph intends to make, through the family's own
     // rounding, so a load-time decision that scales with the beat has the
     // right order of magnitude instead of a constant. Left at 0 when the
@@ -1430,6 +1574,8 @@ GenerateVideoStage::ensure_expert_(int which)
         plan.retires >> 30, model_memory::kStreamHeadroom >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     _h3_cfg.i8_gemm = _i8_gemm;
+    _h3_cfg.sol     = _sol;
+    _h3_cfg.sage    = _sage;
     // The runtime LoRA, when the model_config beat named one. It is a
     // LOAD-time argument and not a per-step knob: an adapted mlp.fc1
     // rules out the fused-SwiGLU kernel, which is decided before the
@@ -1748,7 +1894,12 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // buffers are sub-MB at any plausible value (mod is n_t x adaln_out),
   // so an upper bound costs nothing and keeps this callable before the
   // schedule exists.
-  constexpr int kTimestepsUpperBound = 4;
+  // THE MODEL'S OWN SLOT COUNT, not a second guess at it. The scratch is
+  // sized for this many distinct timesteps whatever a single forward
+  // presents, so a preflight against a smaller number would under-size
+  // the box and one against a larger would refuse runs that fit.
+  constexpr int kTimestepsUpperBound =
+      genai::MetalMiniMaxH3Transformer::kTimestepSlots;
   const bool dq = _h3_dit && _h3_dit->uses_matrix_cores();
   // AND THE BRANCH'S, which is a second allocation of the same order and
   // is spent inside the first forward -- after this. Left out, the
@@ -1773,7 +1924,39 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   const std::size_t dit = genai::MetalMiniMaxH3Transformer::scratch_bytes(
       _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq, /*narrow_ff=*/false,
       vdn_arena);
-  const std::size_t need = dit + vdn;
+  // AND SOL'S, which is the same story again: a second allocation of
+  // the same order, spent at the first routed block and therefore after
+  // this. Almost all of it is lent rather than allocated -- the fused
+  // qkv projection and the arena's last attention window are both dead
+  // while Sol runs -- so what comes back is the remainder, and it is
+  // the real carve rather than a subtraction. Zero when Sol is off, and
+  // zero before the DiT exists to be asked.
+  const std::size_t sol = _h3_dit ? _h3_dit->sol_scratch_bytes(seq) : 0;
+  const std::size_t need = dit + vdn + sol;
+
+  // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
+  // inside the predicates.
+  //
+  // fits() keeps 5% of the GPU working set in hand and fits_physical()
+  // 10% of the reclaimable RAM, and the refusal below used to report the
+  // RAW budget beside the RAW need -- so a forward wanting 14537 MB was
+  // refused against "15733 MB of GPU working set / 14806 MB
+  // reclaimable", both of them larger. Neither number was wrong and the
+  // decision was right (14537 is over 90% of 14806); the message simply
+  // compared quantities that the test does not.
+  //
+  // So the requirement is stated in the same units the test applies, and
+  // the two gates are reported apart, because they fail for different
+  // reasons and have different answers: the working set is about what
+  // this process has already allocated, the physical budget about what
+  // the machine has left.
+  constexpr double kWorkingSetMargin = 0.05;
+  constexpr double kPhysicalMargin   = 0.10;
+  auto grossed_up = [](std::size_t n, double margin) -> std::size_t {
+    return (std::size_t)((double)n / (1.0 - margin));
+  };
+  const std::size_t need_ws   = grossed_up(need, kWorkingSetMargin);
+  const std::size_t need_phys = grossed_up(need, kPhysicalMargin);
 
   // Tell the DiT how much room to leave clear when it decides whether to
   // keep a streamed block resident. Its growth must not eat the scratch
@@ -1787,7 +1970,10 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // Both budgets, for the reason generate-image gives: fits() is our Metal
   // working set and misses other processes' resident memory; fits_physical
   // is host-wide reclaimable RAM and catches it.
-  if (mb.fits(need) && mb.fits_physical(need)) { return true; }
+  if (mb.fits(need, kWorkingSetMargin) &&
+      mb.fits_physical(need, kPhysicalMargin)) {
+    return true;
+  }
 
   // Make room. Parking hands weight pages to the kernel as purgeable --
   // reversible, and free unless something actually takes them.
@@ -1796,31 +1982,52 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     parked = gm->reclaim_at_least(need);
   }
   mb = mc->memory_budget();
-  if (mb.fits(need) && mb.fits_physical(need)) {
+  if (mb.fits(need, kWorkingSetMargin) &&
+      mb.fits_physical(need, kPhysicalMargin)) {
     session()->info(fmt(
         "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
         "~{} MB of scratch{}", this->id(), parked >> 20, seq, need >> 20,
         vdn > 0 ? fmt(" ({} MB of it the VDN branch's, plus {} MB of arena "
                       "it shares with the attention)", vdn >> 20,
                       vdn_arena >> 20)()
-                : std::string()));
+        : _sol.enabled ? std::string(" (Sol-Attn's own scratch is "
+                                     "borrowed, not added)")
+                       : std::string()));
     return true;
   }
+  // WHICH GATE FAILED, and by how much, in the units the gate uses.
+  const bool ws_ok = mb.fits(need, kWorkingSetMargin);
+  const bool ph_ok = mb.fits_physical(need, kPhysicalMargin);
+  auto gate = [](const char* what, bool ok, std::size_t want,
+                 std::size_t have) {
+    return ok ? fmt("{} needs ~{} MB, has ~{} MB -- ok", what, want >> 20,
+                    have >> 20)()
+              : fmt("{} needs ~{} MB, has ~{} MB -- SHORT BY {} MB", what,
+                    want >> 20, have >> 20,
+                    want > have ? (want - have) >> 20 : 0u)();
+  };
   session()->error(fmt(
-      "GenerateVideoStage('{}'): not enough memory for a {}-row forward -- "
-      "it needs ~{} MB of scratch{} and there is ~{} MB of GPU working set "
-      "/ ~{} MB reclaimable{}. Refusing rather than thrashing: wired Metal "
-      "buffers cannot be paged out, so overcommitting here takes the whole "
-      "machine down rather than failing this stage. Use a smaller "
+      "GenerateVideoStage('{}'): not enough memory for a {}-row forward. "
+      "It wants ~{} MB of scratch{}, which with the safety margins the "
+      "budget keeps ({:.0f}% of the working set, {:.0f}% of reclaimable "
+      "RAM) means: {}; {}{}. Refusing rather than thrashing: wired Metal "
+      "buffers cannot be paged out, so overcommitting here takes the "
+      "whole machine down rather than failing this stage. Use a smaller "
       "height/width/frames, or free another model first",
       this->id(), seq, need >> 20,
       vdn > 0 ? fmt(" ({} MB of it the VDN branch's own, and {} MB of "
                     "arena it shares with the attention -- a shorter clip "
                     "or no `linear_branch` would need neither)", vdn >> 20,
                     vdn_arena >> 20)()
-              : std::string(),
-      mb.headroom >> 20, mb.available_physical >> 20,
-      parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
+      : _sol.enabled
+          ? std::string(" (Sol-Attn borrows its scratch from buffers this "
+                        "forward already holds, so turning `sol_attn` off "
+                        "would not free any of this)")
+          : std::string(),
+      100.0 * kWorkingSetMargin, 100.0 * kPhysicalMargin,
+      gate("GPU working set", ws_ok, need_ws, mb.headroom),
+      gate("reclaimable RAM", ph_ok, need_phys, mb.available_physical),
+      parked > 0 ? fmt(" (after parking ~{} MB)", parked >> 20)()
                  : std::string()));
   return false;
 }

@@ -158,6 +158,11 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-dit.cc
         krea2-vae.cc
         krea2-hd-vae.cc
+        sage-attention.cc
+        metal-sage-attention.cc
+        sol-attention.cc
+        sol-attention-h3.cc
+        sol-attention-mma.cc
         wan-vae.cc
         wan-umt5.cc
         wan-unipc.cc

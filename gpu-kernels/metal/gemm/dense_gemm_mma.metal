@@ -735,6 +735,131 @@ kernel void gemm_i8i8_sc_f16_n64(
 // Same tile/dispatch contract as gemm_i8i8_sc_f16_n64; K % 512 == 0.
 #define GI8_KC 512
 
+// THE CHUNK DEPTH AS A PARAMETER, which is the question attention asks.
+//
+// A flash attention's QK product contracts over head_dim -- 128, and not
+// a number a kernel chooses -- and one threadgroup issues one such
+// product per key block, back to back into a live accumulator. That is
+// this loop's shape exactly, with KC = 128. Whether the matrix pipe
+// sustains its int8 rate at that depth, or needs a longer reduction per
+// call, is not something a standalone K=128 GEMM can answer: that one
+// pays a threadgroup's setup and store for every 128 of contraction,
+// where both this and attention pay it once for the whole loop.
+template <int KC>
+static inline void gemm_i8i8_kacc_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device half* as, const device half* ws, device half* y,
+    threadgroup int* Ys, int K, int N, int M, uint3 tgid, uint lid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  for (int e = (int)lid; e < BM * BN; e += SG * 32) { Ys[e] = 0; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  using TY = tensor<threadgroup int, dextents<int32_t, 2>, tensor_inline>;
+  TY tY(Ys, dextents<int32_t, 2>(BN, BM));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, tY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (int e = (int)lid; e < BM * BN; e += SG * 32) {
+    const int i = e / BN, j = e % BN;
+    const int gm = m0 + i, gn = n0 + j;
+    if (gm < M && gn < N) {
+      const float v = (float)Ys[e] * (float)as[gm] * (float)ws[gn];
+      y[(int64_t)gm * N + gn] = (half)v;
+    }
+  }
+}
+
+#define GI8_KACC(NAME, KC)                                               \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device half* as [[buffer(2)]],                               \
+      const device half* ws [[buffer(3)]],                               \
+      device half* y [[buffer(4)]],                                      \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ys[64 * 64];                                         \
+    gemm_i8i8_kacc_impl<KC>(xq, wq, as, ws, y, Ys, K, N, M, tgid, lid);  \
+  }
+
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k128, 128)
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k256, 256)
+
+// THE f16 TWIN OF THE ABOVE, so the chunk-depth sweep measures the DTYPE
+// and not the structure. Same 64x64 tile, same K chunking, same
+// multiply_accumulate mode (which carries its own per-call tax -- see
+// conv2d_mma's bias-fused note -- and both arms pay it), one store for
+// the whole loop.
+template <int KC>
+static inline void dense_gemm_mma_kacc_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M, uint3 tgid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), VPIPE_ELT>();
+  for (auto it = cT.begin(); it != cT.end(); ++it) { *it = (VPIPE_ELT)0; }
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cT);
+  }
+  auto mY = tY.slice(n0, m0);
+  cT.store(mY);
+}
+
+#define DGKACC(NAME, KC)                                                 \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_kacc_impl<KC>(x, W, y, K, N, M, tgid);                \
+  }
+
+DGKACC(dense_gemm_mma_kacc_k128_f16, 128)
+DGKACC(dense_gemm_mma_kacc_k512_f16, 512)
+
 kernel void gemm_i8i8_sc_f16_n64_kacc(
     const device int8_t* xq [[buffer(0)]],
     const device int8_t* wq [[buffer(1)]],

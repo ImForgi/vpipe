@@ -1809,6 +1809,16 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // memory itself. The dequant is one pass over the weight against M rows
   // of GEMM, so it amortizes at exactly the M where the tile does.
   //
+  // THE TUNE CEILING IS NOT A MATRIX-CORE FACT, and it used to be set as
+  // if it were -- inside the block below, so a box without matrix units
+  // kept the member's default while tune_qmm_(), which runs on EVERY
+  // box, read it. Two consequences, and the second is the one that
+  // matters: VPIPE_H3_TUNE_ROWS silently did nothing there, and the
+  // ceiling differed between an M4 and an M5 without anybody asking it
+  // to -- so the same geometry shared a tuned route on one box and
+  // re-measured on the other. Hoisted; the split's bucket below stays
+  // inside, because THAT is matrix-core only.
+  m->_tune_ceiling = tune_ceiling_();
   // Gated on the capability, never on a model name: supports_matrix_cores()
   // is supportsFamily(Apple10), i.e. "M5 or newer". VPIPE_H3_NO_MMA2 forces
   // steel for the A/B.
@@ -1867,12 +1877,51 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (i8->enabled()) { m->_i8 = std::move(i8); }
     // Deep-K split for the FF down projection. bf16 libraries: the fold
     // writes this DiT's element type.
-    m->_tune_ceiling = tune_ceiling_();
     m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
     // The split is tuned at the same ceiling the route is, so two
     // geometries above it share one answer instead of re-measuring it.
     m->_splitk.m_bucket = m->_tune_ceiling;
   }
+  // Sol-Attn (opt-in, LOSSY): approximate attention by routing whole KV
+  // blocks. Loaded here rather than inside the matrix-core block above
+  // because it has nothing to do with matmul2d -- the kernels are plain
+  // simdgroup code and run on any box.
+  //
+  // A FAILED LOAD REFUSES THE MODEL rather than falling back to dense.
+  // Dense attention under a config that asked for Sol is not a slower
+  // answer, it is a different one at a different memory cost, and a run
+  // that silently produced it would be reported as a Sol run.
+  if (cfg.sol.enabled) {
+    std::string serr;
+    m->_sol = MetalSolAttention::load(mc, /*bf16=*/true, &serr);
+    if (!m->_sol) {
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt(
+            "MetalMiniMaxH3Transformer: sol_attn requested but {}", serr));
+      }
+      return nullptr;
+    }
+    if (mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "MetalMiniMaxH3Transformer: Sol-Attn ON -- tau {:.2f}, {} "
+          "threshold, layers {}+, local radius {}",
+          (double)cfg.sol.tau, sol::threshold_name(cfg.sol.thresh),
+          cfg.sol.dense_layers, cfg.sol.local_radius));
+    }
+  }
+
+  // SAGE, on the same terms as Sol above: a run that asked for it and
+  // quietly got dense attention would be reported as a Sage run and its
+  // numbers believed. The three-way answer (and the one case that is
+  // NOT a failure) lives in load_for_model.
+  {
+    bool sage_fatal = false;
+    m->_sage = MetalSageAttention::load_for_model(
+        mc, /*bf16=*/true, cfg.sage, "MetalMiniMaxH3Transformer",
+        &sage_fatal);
+    if (sage_fatal) { return nullptr; }
+  }
+
   // The matrix-core path takes precedence and keeps the FF it has. See
   // the _fuse_ff comment in the header for why this is a refusal rather
   // than a second arm: folding the epilogue is exactly what matmul2d
@@ -2686,9 +2735,13 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   }
   // Nothing to choose: no wide steel twins built AND no matrix cores.
   if (_qmm_tile < 1 && !_use_mma2) { return; }
-  static const bool kOff =
-      std::getenv("VPIPE_H3_NO_QMM_AUTOTUNE") != nullptr;
-  if (kOff) { return; }
+  // READ HERE, not once per process. A static latches whichever value
+  // was set when the FIRST model in the process tuned -- so a test
+  // binary that pins the tuner for one case and not another gets
+  // whichever ran first, and the pinned case then autotunes anyway.
+  // This runs once per (model, sequence length); a getenv is nothing
+  // beside the sweep it guards.
+  if (std::getenv("VPIPE_H3_NO_QMM_AUTOTUNE") != nullptr) { return; }
 
   // A resident block to borrow weights from. With streaming and no
   // pinned prefix the main stack is not in memory here, but the token
@@ -3432,7 +3485,18 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
   if (seq <= 0) { return 0; }
   const std::size_t S = (std::size_t)seq;
   const std::size_t T = (std::size_t)(n_text > 0 ? n_text : 0);
-  const std::size_t N = (std::size_t)(n_t > 0 ? n_t : 0);
+  // THE SLOT FLOOR, applied HERE and not left to the caller. The scratch
+  // allocates max(n_t, kTimestepSlots) timestep slots so that the key in
+  // ensure_scratch_ settles on the first forward instead of moving on the
+  // second -- and an estimate that took `n_t` at face value would report
+  // less than was allocated for every caller who passes the count it
+  // actually has. generate-video already passes kTimestepSlots, so its
+  // preflight was right by hand; nothing else was, and a preflight that
+  // is right only when the caller knows to lie about its argument is one
+  // rebuild away from being wrong again.
+  const std::size_t N = (std::size_t)(n_t > kTimestepSlots
+                                          ? n_t
+                                          : kTimestepSlots);
   std::size_t total = 0;
   for (const ScratchItem& it : scratch_plan_(c, narrow_ff)) {
     total += (S * it.mul_seq + T * it.mul_text + N * it.mul_t) * it.esz;
@@ -3724,12 +3788,39 @@ bool
 MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
                                            std::size_t arena_floor)
 {
-  // The floor is a MINIMUM, so an arena that already clears it is not a
-  // reason to reallocate -- which matters because the branch's need
-  // moves with the clip while the sequence does not have to.
-  if (_s.seq == seq && _s.n_text == n_text && _s.n_t == n_t
+  // KEPT IF IT IS BIG ENOUGH, not if the geometry is identical.
+  //
+  // `n_t` is the count of DISTINCT timesteps in one forward, and it
+  // moves WITHIN a denoise -- 1 on the first step and 2 on the second,
+  // because the video and audio schedules only coincide at the start.
+  // Nothing about the layout depends on it: three small buffers are
+  // sized by it (temb, mod, fmod -- a few hundred KB between 1 and 2)
+  // and every kernel dispatches over the forward's own count. So a
+  // rebuild for a larger n_t rebuilt every activation buffer in the
+  // model to grow three of them.
+  //
+  // THAT IS AN OUT-OF-MEMORY AND NOT A SLOW PATH. The new set is built
+  // in full before the old one is dropped, so the peak is both at once
+  // -- at 99128 rows, 13 GB twice on a 24 GB box, which is exactly how
+  // a 1344x768 328-frame run died at step 1 with
+  // kIOGPUCommandBufferCallbackErrorOutOfMemory five minutes in.
+  //
+  // The floor is a MINIMUM for the same reason: an arena that already
+  // clears it is not a reason to reallocate.
+  if (_s.seq == seq && _s.n_text == n_text && _s.n_t >= n_t
       && _s.attn.byte_size() >= arena_floor) {
     return true;
+  }
+  // WHAT MOVED, and it is worth a line: this reallocates every activation
+  // buffer, and at video geometry that is over 13 GB -- built in full
+  // BEFORE the old set is dropped, so the peak is both at once. A
+  // rebuild in the middle of a denoise is therefore not a slow path, it
+  // is an out-of-memory waiting for a big enough clip.
+  if (_mc != nullptr && _mc->session() != nullptr && _s.seq > 0) {
+    _mc->session()->log_normal(fmt(
+        "MetalMiniMaxH3Transformer: activation scratch REBUILT -- "
+        "(seq {}, n_text {}, n_t {}) -> (seq {}, n_text {}, n_t {})",
+        _s.seq, _s.n_text, _s.n_t, seq, n_text, n_t));
   }
   // TAKE THE ARENA BACK BEFORE ALLOCATING THE NEXT ONE. The branch
   // holds a window over it, which keeps it alive -- so a geometry
@@ -3738,6 +3829,12 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   // `_vdn_proj` is a window over the same arena and holds it alive for
   // exactly the same reason; ensure_vdn_ rebuilds it every forward.
   if (_vdn) { _vdn->set_arena(metal_compute::SharedBuffer{}); }
+  // Sol borrows two of these buffers for the length of each of its
+  // calls, and its windows hold them alive; same rule.
+  if (_sol) {
+    _sol->set_arena(metal_compute::SharedBuffer{},
+                    metal_compute::SharedBuffer{});
+  }
   _vdn_proj = metal_compute::SharedBuffer{};
   const Config& c = _cfg;
   const std::size_t S = (std::size_t)seq, H = (std::size_t)c.hidden;
@@ -3746,7 +3843,14 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   Scratch s;
   s.seq = seq;
   s.n_text = n_text;
-  s.n_t = n_t;
+  // SLOTS, not the count this forward happens to have: sized for the
+  // most a schedule can present so the key above settles on the first
+  // forward instead of moving on the second. Matches the bound
+  // GenerateVideoStage's preflight already sizes the box against
+  // (kTimestepsUpperBound) -- the two are the same claim and a larger
+  // one here would make the preflight an under-estimate.
+  const int nt_alloc = n_t > kTimestepSlots ? n_t : kTimestepSlots;
+  s.n_t = nt_alloc;
   const std::size_t rot_half = (std::size_t)(3 * c.rope_freq_dim);
   s.rcos = _mc->make_shared_buffer(S * rot_half * sizeof(float));
   s.rsin = _mc->make_shared_buffer(S * rot_half * sizeof(float));
@@ -3793,9 +3897,9 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
                                 : SharedBuffer{};
   _lora_scratch_rows = S;
   s.txt  = mk((std::size_t)n_text * H);
-  s.temb = mk((std::size_t)n_t * (std::size_t)c.time_dim);
-  s.mod  = mk((std::size_t)n_t * (std::size_t)c.adaln_out());
-  s.fmod = mk((std::size_t)n_t * 2 * H);
+  s.temb = mk((std::size_t)nt_alloc * (std::size_t)c.time_dim);
+  s.mod  = mk((std::size_t)nt_alloc * (std::size_t)c.adaln_out());
+  s.fmod = mk((std::size_t)nt_alloc * 2 * H);
   s.adaln_idx = _mc->make_shared_buffer(S * sizeof(int));
   if (_nan_report.empty()) {
     _nan_report = _mc->make_shared_buffer(1024 * sizeof(unsigned));
@@ -3829,6 +3933,7 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
     }
   }
   _s = std::move(s);
+  ++_scratch_rebuilds;
   // The new scratch is wired by the forward, which calls wire_fixed_()
   // right after this -- see the note there on why the scratch goes into
   // the pool before any block does.
@@ -3897,6 +4002,20 @@ MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
 // Rebuilt only when the geometry moves. The spans are a few hundred
 // kilobytes but building them walks every (query frame, key frame)
 // pair, and a denoise loop asks the same question 50 times a step.
+std::size_t
+MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq) const
+{
+  if (!_sol || seq <= 0) { return 0; }
+  // The same condition forward() applies: every layer dense means the
+  // routed path is never reached and nothing is allocated for it.
+  if (_cfg.sol.dense_layers >= _cfg.n_layers) { return 0; }
+  const std::size_t I = (std::size_t)_cfg.inner();
+  const std::size_t win = (std::size_t)seq * I * 2;
+  return MetalSolAttention::private_bytes(
+      _cfg.n_heads, seq, _cfg.head_dim, _cfg.sol.key_block,
+      _sol->uses_matrix_cores(), 3 * win, win);
+}
+
 namespace {
 
 // The A/B for the arena carve. Set VPIPE_H3_NO_VDN_ARENA and the branch
@@ -4050,7 +4169,8 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     };
     _vdn_qb_off    = ib(bs.off);
     _vdn_qb_blocks = ib(bs.blocks);
-    _vdn_sp_params = _mc->make_shared_buffer(4 * sizeof(int));
+    // Five ints now: AttnSpanParams gained qb_stride.
+    _vdn_sp_params = _mc->make_shared_buffer(5 * sizeof(int));
     _vdn_sp_bounds =
         _mc->make_shared_buffer((std::size_t)frames * 2 * sizeof(int));
     if (_vdn_qb_off.empty() || _vdn_qb_blocks.empty()
@@ -4071,6 +4191,9 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
               || _vdn_cfg.anchors == minimax_h3::vdn::AnchorFrames::kBoth)
                  ? 2
                  : 0;
+    // qb_stride 0: VDN's window is geometric, so every head walks the
+    // SAME block list. Sol-Attn is the caller that sets this.
+    sp[4] = 0;
     int* bnd = static_cast<int*>(_vdn_sp_bounds.contents());
     for (int f = 0; f < frames; ++f) {
       bnd[2 * f]     = _vdn_bounds[(std::size_t)f].lo;
@@ -4508,7 +4631,76 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const int A_BK = _attn_nax ? 32 : 16;
   if (vdn_on && !ensure_vdn_(in, L, A_BQ, A_BK, err)) { return {}; }
   const bool vdn_linear = vdn_on && !_vdn_full_cover;
+  // SOL-ATTN AND THE VDN LINEAR BRANCH ARE EXCLUSIVE, and it is a
+  // correctness rule rather than a policy. VDN's two halves PARTITION
+  // the keys -- a windowed softmax plus a linear recurrence carrying
+  // exactly its complement -- so approximating the softmax half would
+  // leave the two describing different key sets, and the frames the
+  // routing dropped would be counted by neither.
+  //
+  // ...AND IT MUST BE OFF WHEN IT WOULD ROUTE NOTHING. `sol_on` forces
+  // the unfused head-major path below, so leaving it true with every
+  // layer excluded would move the whole stack off the steel kernel to
+  // run exactly the same dense attention by a slower route and with
+  // different rounding. `dense_layers >= n_layers` is a legitimate
+  // setting (it is the ablation that says the filter works), so it has
+  // to mean "unchanged model", not "same answer, different kernel".
+  const bool sol_on = (bool)_sol && !vdn_linear &&
+                      c.sol.dense_layers < c.n_layers;
+  // SAGE IS A KERNEL VARIANT, not a second attention: it needs the
+  // matrix-core steel entry, because the int8 fragment MMA only exists
+  // there. `_attn_nax` is resolved further down, so this is re-tested at
+  // the point the functions are built rather than assumed here.
+  const bool sage_want = (bool)_sage && c.sage.enabled &&
+                         c.sage.dense_layers < c.n_layers;
+  if (sol_on) {
+    // LEND SOL THE TWO BUFFERS THAT ARE DEAD WHILE IT RUNS, and it
+    // stops allocating a second attention's worth of scratch.
+    //
+    // Sol reads HEAD-MAJOR q/k/v, so with it on the fused spellings are
+    // off and the trope has already copied the projection out by the
+    // time it is called: `s.qkv`, three attention windows wide, is then
+    // dead until the feed-forward writes over it -- which is the same
+    // observation the FF below already makes about it. And the arena's
+    // LAST window is dead too: Sol writes its output into `oh`, and
+    // `ob` is not touched until the transpose that follows.
+    //
+    // MEASURED at 56 heads x 14861 rows: 852 MB lent against 489 MB
+    // wanted, so what Sol costs the process is its pinned few hundred
+    // bytes. See MetalSolAttention::set_arena.
+    const std::size_t win = (std::size_t)seq * (std::size_t)I * 2;
+    _sol->set_arena(_s.qkv,
+                    _s.attn.byte_size() >= 5 * win
+                        ? _s.attn.subview(4 * win, win)
+                        : metal_compute::SharedBuffer{});
+  }
   const bool steel_spans = vdn_linear && _steel_ok && !spans_off;
+  // WHAT THE ROUTING KEPT, reported here and reset here, and both for
+  // the same reason: this is the only point at which the counter is both
+  // COMPLETE and FINISHED. It is written by the GPU and read on the
+  // ENCODE thread, so mid-forward it holds a partial total; and it
+  // accumulates over every routed layer, so it has to be read before it
+  // is cleared. Reading it at the last block instead reported one
+  // layer's total against every layer's count -- 78.4% for three layers
+  // that each kept 26.1%. What is printed is therefore the PREVIOUS
+  // forward, complete; a diagnostic may lag, it may not misattribute.
+  //
+  // Realized sparsity is a property of the ACTIVATIONS, not of tau: a
+  // clustered synthetic fixture routes to 14% where a real H3 block
+  // routes to 26% at the same tau, and that gap is the difference
+  // between a projection and a measurement.
+  if (sol_on && _sol) {
+    const long long layers = c.n_layers - c.sol.dense_layers;
+    const long long tot = _sol->total_blocks() * (layers > 0 ? layers : 1);
+    const long long got = _sol->exact_blocks();
+    if (tot > 0 && got > 0 && _mc->session() != nullptr) {
+      _mc->session()->log_normal(fmt(
+          "[h3-dit] Sol-Attn kept {} of {} key blocks exact ({:.1f}%) over "
+          "{} routed layers of the PREVIOUS forward", got, tot,
+          100.0 * (double)got / (double)tot, layers));
+    }
+    _sol->reset_counts();
+  }
   _vdn_blocks_run = 0;
   bool use_steel = _steel_ok;
   // Without the block-sparse kernel the window falls to sdpa_spans_f16,
@@ -4521,14 +4713,41 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // Read ONCE per forward: the A/B setter can change it between two, and
   // the cached AttnParams below are tagged with the value they were
   // filled for.
-  const int fused_attn = _fused_attn;
+  // SOL AND i8_gemm ARE INDEPENDENT, and this is the line where someone
+  // would expect them to collide. They do not: i8_gemm chooses how the
+  // block's GEMMs are computed -- qkv, the FF pair, the out projection --
+  // and Sol chooses how the ATTENTION between them is computed. Neither
+  // reads the other's state, and `fused_attn` below is an attention-side
+  // LAYOUT, not a GEMM one: the qkv GEMM writes s.qkv the same way
+  // either way, and the trope after it is what Sol needs. So the two can
+  // be enabled together, and the only thing Sol costs is the in-place
+  // fused qkv read, which is an attention optimisation i8_gemm never
+  // used.
+  //
+  // SOL UNFUSES THE PROJECTION; IT DOES NOT TURN STEEL OFF. Sol reads and
+  // writes HEAD-MAJOR, so the trope has to run -- but the layers Sol
+  // does NOT route still want the steel kernel, and steel reads
+  // head-major perfectly well (its strides are a parameter).
+  //
+  // Turning `use_steel` off instead, which is what this did first, sends
+  // every dense layer to the SCALAR sdpa kernel. MEASURED: 3459 ms a
+  // block became 66000, and the cost is entirely in the layers Sol never
+  // touched -- skipping every one of Sol's own dispatches changed
+  // nothing. A knob that makes the layers it excludes 19x slower is not
+  // an accelerator, and it looked exactly like the new kernels being
+  // slow.
+  const int fused_attn = sol_on ? 0 : _fused_attn;
   // The FUNCTIONS depend on the sequence lengths alone; the PARAMS also
   // depend on which layout attention is reading, and the A/B setter
   // flips that between forwards. Kept apart so toggling the layout does
   // not rebuild two pipeline states -- an A/B that pays a rebuild in one
   // arm and not the other is measuring the rebuild.
+  // Resolved HERE and not where sage_want was: the int8 QK exists only
+  // in the matrix-core entry point, and `_attn_nax` is settled above.
+  const bool sage_on = sage_want && _attn_nax;
   const bool attn_dirty = _attn_seq != seq || _attn_text != n_text
-                          || _attn_nax_built != (_attn_nax ? 1 : 0);
+                          || _attn_nax_built != (_attn_nax ? 1 : 0)
+                          || _attn_sage_built != (sage_on ? 1 : 0);
   if (use_steel && (attn_dirty || _attn_fused != fused_attn)) {
     // C++ mirror of mlx::steel::AttnParams, as in the sibling DiTs. Two
     // shapes only, and both are SQUARE: this model has no
@@ -4586,21 +4805,30 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     fill(_attn_p_main, seq);
     fill(_attn_p_text, n_text);
     _attn_fused = fused_attn;
-    auto build = [&](int qL, bool spans) {
+    auto build = [&](int qL, bool spans, bool i8) {
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (qL % A_BK) == 0)
           .set_bool(300, false).set_bool(301, false).set_bool(302, false)
-          .set_bool(303, spans);
+          .set_bool(303, spans)
+          .set_bool(sage::kQkInt8Constant, i8);
       return _attn_nax
                  ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
     };
     if (attn_dirty) {
-      _fn_attn_main = build(seq, false);
-      _fn_attn_text = build(n_text, false);
+      // TWO instantiations of the main entry, not one. The leading
+      // `dense_layers` blocks run the f16 kernel and the rest the int8
+      // one, so both have to exist for the same sequence -- and the
+      // refiner's text attention is never routed to Sage (it is a
+      // prompt, not a video sequence), so it is built dense only.
+      _fn_attn_main = build(seq, false, false);
+      _fn_attn_text = build(n_text, false, false);
+      _fn_attn_main_i8 =
+          sage_on ? build(seq, false, true) : metal_compute::ComputeFunction{};
       _attn_seq = seq;
       _attn_text = n_text;
       _attn_nax_built = _attn_nax ? 1 : 0;
+      _attn_sage_built = sage_on ? 1 : 0;
     }
   }
   // The SAME entry point as the dense pair, specialised on has_spans --
@@ -4651,6 +4879,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // dispatches, and running the stack on top of it would produce a
   // plausible video with one block's attention missing.
   std::string vdn_err;
+  std::string sol_err;
 
   // ---- env-gated streaming split (VPIPE_H3_STREAM_PROFILE) ------------
   // How much of a streamed block's wall time is the DISK read and how
@@ -4888,7 +5117,31 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(8, QKV_HSTRIDE);    // grouping, see below
       enc.dispatch({32, (unsigned)(rows * NH), 1}, {32, 1, 1});
     };
-    auto attn = [&](int rows, bool main) {
+    // `layer` is the block index, because Sol leaves the leading
+    // `dense_layers` alone: the first blocks are where the residual
+    // stream is least redundant, and the published profile keeps one of
+    // 48 exact for that reason.
+    auto attn = [&](int rows, bool main, int layer) {
+      // `main` only: the other two blocks are H3's TOKEN REFINER, which
+      // attends over the prompt alone. There is no video sequence there
+      // to be sparse in, and the published profile likewise leaves
+      // everything but video self-attention dense.
+      if (sol_on && main && layer >= c.sol.dense_layers) {
+        // The SINK is the layout's, not the config's: everything below
+        // video_start is prompt and soundtrack, and those rows have to
+        // be read exactly. Rounded outward to whole blocks inside the
+        // kernel, so a ragged boundary keeps one extra block exact
+        // rather than half a block approximate.
+        sol::Config sc = c.sol;
+        sc.sink_start  = 0;
+        sc.sink_tokens = main ? L.video_start : 0;
+        std::string serr;
+        if (!_sol->encode(enc, s.qh, s.kh, s.vh, s.oh, NH, rows, HD, scale,
+                          sc, &serr)) {
+          sol_err = "sol_attn: " + serr;
+        }
+        return;
+      }
       // The hybrid's softmax half: exact attention, but (video, video)
       // pairs restricted to the query frame's chunk window. Everything
       // touching a global row -- the prompt, the soundtrack -- stays
@@ -4937,7 +5190,40 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         return;
       }
       if (use_steel) {
-        enc.set_function(main ? _fn_attn_main : _fn_attn_text);
+        // SAGE: the int8 QK, on the MAIN blocks past `dense_layers`.
+        //
+        // Not the refiner's text attention -- that is a prompt, not a
+        // video sequence, and it is short enough that the prologue would
+        // cost more than the product it accelerates.
+        //
+        // The prologue goes into the SAME encoder, immediately before
+        // the dispatch that reads it: the encoder orders them, so there
+        // is no barrier to get wrong. It reads q and k exactly where the
+        // attention will -- the fused projection in place, or the
+        // head-major transposes -- so the two cannot disagree about
+        // which head is which.
+        const bool i8 = sage_on && main && _fn_attn_main_i8.valid() &&
+                        layer >= c.sage.dense_layers;
+        bool i8_ok = false;
+        if (i8) {
+          MetalSageAttention::Operand qo, ko;
+          if (fused_qkv) {
+            qo = {&s.qkv, (std::size_t)Q_OFF, 3 * I, QKV_HSTRIDE};
+            ko = {&s.qkv, (std::size_t)K_OFF, 3 * I, QKV_HSTRIDE};
+          } else {
+            qo = {&s.qh, 0, HD, rows * HD};
+            ko = {&s.kh, 0, HD, rows * HD};
+          }
+          std::string gerr;
+          // NH kv heads as well: H3 is MHA, gqa_factor 1.
+          i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, HD, A_BQ,
+                                 A_BK, c.sage, &gerr);
+          if (!i8_ok && sol_err.empty()) {
+            sol_err = "sage_attn: " + gerr;
+          }
+        }
+        enc.set_function(i8_ok ? _fn_attn_main_i8
+                               : (main ? _fn_attn_main : _fn_attn_text));
         if (fused_qkv) {
           enc.set_buffer(0, s.qkv, (std::size_t)Q_OFF * 2);
           enc.set_buffer(1, s.qkv, (std::size_t)K_OFF * 2);
@@ -4948,6 +5234,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         }
         enc.set_buffer(3, fused_out ? s.ob : s.oh);
         enc.set_buffer(4, main ? _attn_p_main : _attn_p_text);
+        if (i8_ok) { _sage->bind(enc); }
         enc.dispatch({32 * (unsigned)((rows + A_BQ - 1) / A_BQ),
                       4 * (unsigned)NH, 1}, {32, 4, 1});
         return;
@@ -5074,7 +5361,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         trope(s.vh, rows, V_OFF, 0);
       }
       psplit(t_prep);
-      attn(rows, modulated);
+      attn(rows, modulated, lora_layer);
       psplit(t_attn);
       if (!fused_out) {
         // Head-major [H, rows, D] back to the row-major [rows, I] the
@@ -5588,6 +5875,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       trip_blk = Lx;
       block(b, s.x, seq, true, Lx);
       if (!vdn_err.empty()) { return fail(vdn_err); }
+      if (!sol_err.empty()) { return fail(sol_err); }
       bprobe = false;
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());

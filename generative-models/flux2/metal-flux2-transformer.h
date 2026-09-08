@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/runtime-lora.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
@@ -77,6 +79,10 @@ class MetalFlux2Transformer {
     // matrix-core GPUs at int8 quality (rel-L2 ~1e-2 per GEMM). Env
     // VPIPE_I8_GEMM=0|1 overrides.
     bool  i8_gemm = false;
+    // SageAttention: the QK^T product in int8. Independent of i8_gemm
+    // beside it -- that one chooses how the block's GEMMs are computed
+    // and this one how the attention between them is.
+    sage::Config sage;
     // The FLUX.2-klein-9b-kv RECIPE. It is a property of the CHECKPOINT, not
     // an optimization: that DiT is distilled with reference tokens isolated
     // from the rest of the sequence, so running it under the plain
@@ -692,6 +698,9 @@ class MetalFlux2Transformer {
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm / VPIPE_I8_GEMM);
   // null when off. Tried first in gemm_mma_ for qualifying shapes.
   std::unique_ptr<I8GemmContext> _i8;
+  // The int8 QK prologue. Null when the box has no matrix cores or the
+  // config did not ask; every use is guarded.
+  std::unique_ptr<MetalSageAttention> _sage;
   bool _use_mma2 = false;
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128 tile
   metal_compute::SharedBuffer _w_deq;   // reusable [N,K] f16 dequant scratch

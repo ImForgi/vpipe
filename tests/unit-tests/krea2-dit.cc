@@ -1080,3 +1080,84 @@ TEST(krea2_dit, vec4_elementwise_matches_scalar)
   std::printf("[krea2_dit] vec4 vs scalar elementwise: %zu/%zu words differ\n",
               diff, a.size());
 }
+
+// SAGE IN THE MODEL, which the driver tests next door cannot show.
+//
+// metal-sage-attention.cc verifies the class against a reference
+// attention. What it cannot verify is that this family HANDS IT THE
+// RIGHT THING: the operands are the head-major transposes, the head
+// counts are HED query and KVH key -- Krea-2 is genuinely grouped -- and
+// the block index gates on `dense_layers`. Every one of those is a
+// number this file passes and that file trusts.
+//
+// So: the same forward twice, differing only in cfg.sage.enabled, and
+// the two required CLOSE but NOT IDENTICAL. Identical would mean the
+// function constant never applied and both arms ran dense, which is the
+// failure a tolerance-only check reads as a pass.
+TEST(krea2_dit, forward_dit_sage_matches_f16)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  const int text_seq = 64, grid = 32;
+  const int img_seq = grid * grid;
+  const int stop = 2;                       // two blocks, both routed
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x5a6e12c0u;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+
+  auto run = [&](bool sage_on) {
+    MetalKrea2Transformer::Config cfg = base;
+    cfg.sage.enabled = sage_on;
+    cfg.sage.dense_layers = 0;
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg,
+                                         /*stream_blocks=*/true);
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_sage = run(true);
+  const std::vector<float> v_f16 = run(false);
+  ASSERT_TRUE(!v_sage.empty());
+  ASSERT_TRUE(v_sage.size() == v_f16.size());
+  const double r = rel_l2_(v_sage.data(), v_f16.data(), v_sage.size());
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < v_sage.size(); ++i) {
+    differ += (v_sage[i] != v_f16[i]) ? 1 : 0;
+  }
+  std::printf("[krea2_dit] forward_dit sage-vs-f16 rel-L2 = %.6g, %zu of "
+              "%zu differ (seq=%d)\n", r, differ, v_sage.size(),
+              text_seq + img_seq);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  // The int8 path RAN. Without this the test passes on two dense arms.
+  EXPECT_TRUE(differ > v_sage.size() / 4);
+}

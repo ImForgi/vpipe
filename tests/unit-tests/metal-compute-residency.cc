@@ -317,3 +317,85 @@ TEST(metal_compute_residency, a_copied_read_does_not_grow_the_file_cache)
   // what was read. A little movement is other processes.
   EXPECT_TRUE(after - before < (long)((read >> 20) / 4));
 }
+
+// THE LIFETIME THE SET IMPOSES, which is the part a caller gets wrong.
+//
+// MTLResidencySet RETAINS every allocation added to it. So a buffer that
+// is added and then dropped is NOT freed -- the set is holding it, and
+// on this tree the set lives on MetalCompute (a session service), so it
+// outlives every model. This is not a detail: it is the difference
+// between a DiT that gives its scratch back when it is destroyed and one
+// that does not.
+TEST(metal_compute_residency, added_allocation_survives_its_handle) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->residency_set_supported()) {
+    return;
+  }
+  constexpr std::size_t kBytes = 256ull << 20;
+  const std::size_t base = mc->memory_budget().allocated;
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    if (b.empty()) { return; }
+    mc->residency_add(b);
+    mc->residency_commit();
+  }
+  // The handle is gone. If the set did not retain, this would be back at
+  // `base`; it is not, and the gap is the whole allocation.
+  const std::size_t held = mc->memory_budget().allocated;
+  EXPECT_TRUE(held >= base + kBytes / 2);
+
+  // ...and the only thing that gives it back is a matching remove. There
+  // is no handle left to pass, which is exactly why a caller has to
+  // remove BEFORE it drops -- or keep the means to.
+  (void)held;
+}
+
+// The same buffer, removed while the handle is still alive: the bytes
+// come back. This is the shape every residency_add caller must have.
+TEST(metal_compute_residency, remove_before_drop_returns_the_bytes) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->residency_set_supported()) {
+    return;
+  }
+  constexpr std::size_t kBytes = 256ull << 20;
+  const std::size_t base = mc->memory_budget().allocated;
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    if (b.empty()) { return; }
+    mc->residency_add(b);
+    mc->residency_commit();
+    mc->residency_remove(b);
+    mc->residency_commit();
+  }
+  const std::size_t after = mc->memory_budget().allocated;
+  EXPECT_TRUE(after < base + kBytes / 2);
+}
+
+// A SUBVIEW ADDS ITS PARENT, and this is the amplification that turns a
+// few hundred megabytes of borrowed scratch into gigabytes.
+//
+// subview() shares the parent's MTL::Buffer -- that is what makes it
+// free -- so residency_add(subview) hands the set the WHOLE parent. A
+// caller that carves its scratch out of a buffer somebody LENT it, and
+// then adds the carvings, has made the lender's allocation immortal.
+TEST(metal_compute_residency, a_subview_adds_the_whole_parent) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->residency_set_supported()) {
+    return;
+  }
+  constexpr std::size_t kBytes = 256ull << 20;
+  const std::size_t base = mc->memory_budget().allocated;
+  {
+    SharedBuffer parent = mc->make_shared_buffer(kBytes);
+    if (parent.empty()) { return; }
+    SharedBuffer win = parent.subview(0, 4096);
+    EXPECT_TRUE(win.mtl_buffer() == parent.mtl_buffer());
+    mc->residency_add(win);      // 4 KB asked for, 256 MB pinned
+    mc->residency_commit();
+  }
+  const std::size_t held = mc->memory_budget().allocated;
+  EXPECT_TRUE(held >= base + kBytes / 2);
+}

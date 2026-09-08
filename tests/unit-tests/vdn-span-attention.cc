@@ -46,6 +46,19 @@ namespace vdn = vpipe::genai::minimax_h3::vdn;
 
 namespace {
 
+// AttnSpanParams as the kernels read it: video_start, tokens_per_frame,
+// num_frames, anchors, qb_stride.
+//
+// FIVE, and the fifth is why this is a named constant. `qb_stride`
+// arrived with Sol-Attn, which routes per head; a window does not, so
+// every caller here passes 0 -- but a buffer sized for the OLD four
+// leaves the kernel reading whatever the allocator put after it. That
+// read is inert exactly when the following bytes happen to be zero,
+// which is how the ALU arm kept passing while the matrix-core arm,
+// whose own allocation landed somewhere else, returned NaN.
+constexpr int kSpanParamInts = 5;
+
+
 // The geometry. Chunk 5 / radius 1 is the released config; 25 frames is
 // past the (radius + 1) * chunk = 10 at which the window covers the clip
 // and the whole hybrid turns itself off.
@@ -146,7 +159,8 @@ time_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq,
   SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
   SharedBuffer off = mc->make_shared_buffer(bs.off.size() * 4);
   SharedBuffer blk = mc->make_shared_buffer(bs.blocks.size() * 4);
-  SharedBuffer spp = mc->make_shared_buffer(4 * sizeof(int));
+  SharedBuffer spp = mc->make_shared_buffer(kSpanParamInts
+                                            * sizeof(int));
   SharedBuffer spb = mc->make_shared_buffer((std::size_t)g.frames * 2 * 4);
   if (pb.empty() || off.empty() || blk.empty() || spp.empty()
       || spb.empty()) {
@@ -173,6 +187,7 @@ time_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq,
     p->O_strides[i] = hm[i];
   }
   int* sp = static_cast<int*>(spp.contents());
+  std::memset(sp, 0, kSpanParamInts * sizeof(int));
   sp[0] = g.text; sp[1] = g.tpf; sp[2] = g.frames; sp[3] = 3;
   int* bn = static_cast<int*>(spb.contents());
   for (int f = 0; f < g.frames; ++f) {
@@ -242,7 +257,8 @@ run_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq, int bk,
   SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
   SharedBuffer off = mc->make_shared_buffer(bs.off.size() * 4);
   SharedBuffer blk = mc->make_shared_buffer(bs.blocks.size() * 4);
-  SharedBuffer spp = mc->make_shared_buffer(4 * sizeof(int));
+  SharedBuffer spp = mc->make_shared_buffer(kSpanParamInts
+                                            * sizeof(int));
   SharedBuffer spb = mc->make_shared_buffer((std::size_t)nframes * 2 * 4);
   if (qb.empty() || kb_.empty() || vb.empty() || ob.empty() || pb.empty()
       || off.empty() || blk.empty() || spp.empty() || spb.empty()) {
@@ -285,6 +301,7 @@ run_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq, int bk,
     p->O_strides[i] = hm[i];
   }
   int* sp = static_cast<int*>(spp.contents());
+  std::memset(sp, 0, kSpanParamInts * sizeof(int));
   sp[0] = text; sp[1] = tpf; sp[2] = nframes;
   sp[3] = 3;                    // anchors BOTH: bit 0 columns, bit 1 rows
   int* bn = static_cast<int*>(spb.contents());
@@ -370,7 +387,8 @@ run_fused_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq,
   SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
   SharedBuffer off = mc->make_shared_buffer(bs.off.size() * 4);
   SharedBuffer blk = mc->make_shared_buffer(bs.blocks.size() * 4);
-  SharedBuffer spp = mc->make_shared_buffer(4 * sizeof(int));
+  SharedBuffer spp = mc->make_shared_buffer(kSpanParamInts
+                                            * sizeof(int));
   SharedBuffer spb = mc->make_shared_buffer((std::size_t)nframes * 2 * 4);
   if (fb.empty() || ob.empty() || pb.empty() || off.empty() || blk.empty()
       || spp.empty() || spb.empty()) {
@@ -414,6 +432,7 @@ run_fused_(MetalCompute* mc, ComputeLibrary& lib, const char* name, int bq,
                               (std::int64_t)seq * dim, dim};
   for (int i = 0; i < 3; ++i) { p->O_strides[i] = hm[i]; }
   int* sp = static_cast<int*>(spp.contents());
+  std::memset(sp, 0, kSpanParamInts * sizeof(int));
   sp[0] = text; sp[1] = tpf; sp[2] = nframes; sp[3] = 3;
   int* bn = static_cast<int*>(spb.contents());
   for (int fr = 0; fr < nframes; ++fr) {

@@ -853,6 +853,12 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
+  {
+    bool sage_fatal = false;
+    m->_sage = MetalSageAttention::load_for_model(
+        mc, /*bf16=*/true, cfg.sage, "MetalKrea2Transformer", &sage_fatal);
+    if (sage_fatal) { return nullptr; }
+  }
 
   // Fused SwiGLU FF: interleave each MAIN block's quantized ff gate/up at load.
   // Steel path (M4): a real win -- one affine_qmm_swiglu GEMM whose register-
@@ -2263,7 +2269,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     const bool nax = _use_attn_nax && _lib_attn_nax.valid();
     const int A_BQ = nax ? 64 : 32;
     const int A_BK = nax ? 32 : 16;
-    metal_compute::ComputeFunction fn_attn;
+    metal_compute::ComputeFunction fn_attn, fn_attn_i8;
     bool use_steel = _steel_attn_ok && KVH > 0 && HED % KVH == 0
                      && !_attn_params.empty();
     if (use_steel) {
@@ -2283,14 +2289,25 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       p->V_strides[1] = p->K_strides[1]; p->V_strides[2] = HD;
       p->O_strides[0] = p->Q_strides[0];
       p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = HD;
-      metal_compute::FunctionConstants fc;
-      fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
-          .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-      // The DiT runs bf16: use the bf16 attention entries (Q/K/V are bf16).
-      fn_attn = nax
-          ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
-          : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      auto build = [&](bool i8) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(sage::kQkInt8Constant, i8);
+        // The DiT runs bf16: the bf16 attention entries (Q/K/V are bf16).
+        return nax
+            ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+            : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      };
+      fn_attn = build(false);
       use_steel = fn_attn.valid();
+      // The int8 twin, on the matrix-core entry only: `dense_layers`
+      // leaves the leading blocks on the f16 kernel, so both exist
+      // within one forward.
+      if (use_steel && nax && (bool)_sage && _cfg.sage.enabled &&
+          _cfg.sage.dense_layers < c.n_layers) {
+        fn_attn_i8 = build(true);
+      }
     }
     const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
     psplit(t_cond);
@@ -2419,9 +2436,22 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if (use_steel) {
         // Register-resident flash attention: Q/O [HED,seq,HD], K/V [KVH,seq,HD],
         // GQA via gqa_factor. Grid (32*NQ, 4*Hq, 1), tg (32,4,1) per MLX steel.
-        enc.set_function(fn_attn);
+        // SAGE: quantize q/k for THIS block, into the same encoder and
+        // immediately before the dispatch that reads them. qt/kt are the
+        // head-major transposes just written above -- the same tensors,
+        // and the same head counts, the attention params describe.
+        bool i8_ok = false;
+        if (fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
+          const MetalSageAttention::Operand qo{&qt, 0, HD, seq * HD};
+          const MetalSageAttention::Operand ko{&kt, 0, HD, seq * HD};
+          std::string gerr;
+          i8_ok = _sage->prepare(enc, qo, ko, HED, KVH, seq, seq, HD, A_BQ,
+                                 A_BK, _cfg.sage, &gerr);
+        }
+        enc.set_function(i8_ok ? fn_attn_i8 : fn_attn);
         enc.set_buffer(0, qt); enc.set_buffer(1, kt); enc.set_buffer(2, vt);
         enc.set_buffer(3, atb); enc.set_buffer(4, _attn_params);
+        if (i8_ok) { _sage->bind(enc); }
         enc.dispatch({32 * a_nqb, 4 * (unsigned)HED, 1}, {32, 4, 1});
       } else {
         sdpa(qt, kt, vt, atb, scale, seq, HD, HED, KVH, seq, seq);

@@ -680,6 +680,41 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
                       cfg.head_dim == 128 &&
                       std::getenv("VPIPE_QIE_NO_STEEL_ATTN") == nullptr;
 
+  // M5 matrix-core NAX steel flash, on by default where the GPU has
+  // matrix cores -- the same rule krea2, flux2 and boogu have always
+  // used, and this family was the last one still on the ALU kernel
+  // everywhere. VPIPE_QIE_NO_ATTN_NAX forces the ALU steel, which is
+  // both the A/B and the way back if a checkpoint ever disagrees.
+  //
+  // The two kernels are not bit-identical -- they tile differently (64x32
+  // against 32x16) and accumulate in a different order -- so this moves
+  // Qwen-Image's dense output by the amount two correct flash kernels
+  // differ by. MEASURED against the ALU arm below the tile band;
+  // qwen_image_edit_dit.forward_nax_matches_alu is the guard.
+  m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+  m->_use_attn_nax = m->_steel_attn_ok && mc->supports_matrix_cores() &&
+                     m->_lib_attn_nax.valid() &&
+                     std::getenv("VPIPE_QIE_NO_ATTN_NAX") == nullptr;
+
+  // SAGE rides on that entry: the int8 QK exists only there, so a box
+  // that fell back to the ALU kernel runs dense and says so rather than
+  // reporting a Sage run that never happened.
+  {
+    bool sage_fatal = false;
+    m->_sage = MetalSageAttention::load_for_model(
+        mc, /*bf16=*/true, cfg.sage, "MetalQwenImageTransformer",
+        &sage_fatal);
+    if (sage_fatal) { return nullptr; }
+    if (m->_sage && !m->_use_attn_nax) {
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt(
+            "MetalQwenImageTransformer: sage_attn is off -- the matrix-core "
+            "flash entry is unavailable here"));
+      }
+      m->_sage.reset();
+    }
+  }
+
   // Affine qmm kernels (bf16 variant) -- only when the checkpoint is quantized.
   if (m->_quant_bits > 0) {
     m->_lib_qmm = mc->load_library("affine_qmm_steel_bf16");
@@ -1462,8 +1497,13 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     // O(JT^2) sdpa at high resolution (mirrors Krea-2 / FLUX.2). Full MHA: NH
     // query heads = NH kv heads (gqa_factor 1); Q/K/V/O are [NH, JT, Hd], exactly
     // what the head-major transposes below produce. Falls back to scalar sdpa.
-    const int A_BQ = 32, A_BK = 16;   // ALU steel bq/bk (bd128)
-    metal_compute::ComputeFunction fn_attn;
+    // The two kernels tile differently, and every NQ/NK below is
+    // computed from these -- so this one line is what makes the params
+    // describe the kernel that will actually run.
+    const bool nax = _use_attn_nax;
+    const int A_BQ = nax ? 64 : 32;   // steel bq/bk (bd128), ALU or NAX
+    const int A_BK = nax ? 32 : 16;
+    metal_compute::ComputeFunction fn_attn, fn_attn_i8;
     bool use_steel = _steel_attn_ok;
     if (use_steel) {
       auto* p = static_cast<SteelAttnParams*>(_attn_params.contents());
@@ -1482,11 +1522,20 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       p->V_strides[1] = p->K_strides[1]; p->V_strides[2] = Hd;
       p->O_strides[0] = p->Q_strides[0];
       p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = Hd;
-      metal_compute::FunctionConstants fc;
-      fc.set_bool(200, (JT % A_BQ) == 0).set_bool(201, (JT % A_BK) == 0)
-          .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-      fn_attn = _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      auto build = [&](bool i8) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(200, (JT % A_BQ) == 0).set_bool(201, (JT % A_BK) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(sage::kQkInt8Constant, i8);
+        return nax
+            ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+            : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      };
+      fn_attn = build(false);
       use_steel = fn_attn.valid();
+      if (use_steel && nax && _cfg.sage.dense_layers < _cfg.n_layers) {
+        fn_attn_i8 = build(true);
+      }
     }
     const unsigned a_nqb = (unsigned)((JT + A_BQ - 1) / A_BQ);
 
@@ -1686,9 +1735,23 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       if (use_steel) {
         // Register-resident flash attention over the joint sequence: Q/K/V/O
         // [NH, JT, Hd]. Grid (32*NQ, 4*NH, 1), tg (32, 4, 1) per MLX steel.
-        enc.set_function(fn_attn);
+        // SAGE: quantize q/k for THIS block, into the same encoder and
+        // immediately before the dispatch that reads them. qt/kt are the
+        // head-major transposes written just above -- the same tensors
+        // the attention params describe. gqa_factor is 1 here, so the
+        // KV head count is NH.
+        bool i8_ok = false;
+        if (fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
+          const MetalSageAttention::Operand qo{&qt, 0, Hd, JT * Hd};
+          const MetalSageAttention::Operand ko{&kt, 0, Hd, JT * Hd};
+          std::string gerr;
+          i8_ok = _sage->prepare(enc, qo, ko, NH, NH, JT, JT, Hd, A_BQ,
+                                 A_BK, _cfg.sage, &gerr);
+        }
+        enc.set_function(i8_ok ? fn_attn_i8 : fn_attn);
         enc.set_buffer(0, qt); enc.set_buffer(1, kt); enc.set_buffer(2, vt);
         enc.set_buffer(3, at); enc.set_buffer(4, _attn_params);
+        if (i8_ok) { _sage->bind(enc); }
         enc.dispatch({32 * a_nqb, 4 * (unsigned)NH, 1}, {32, 4, 1});
       } else {
         sdpa(qt, kt, vt, at);

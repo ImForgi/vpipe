@@ -1836,8 +1836,14 @@ TEST(gemm_i8, ffn_prototype) {
   ComputeFunction f_qr = lib_dq.function("quant_f16_i8_row");
   ComputeFunction f_n128 = lib_mma.function("dense_gemm_mma_t_n128_f16");
   ComputeFunction f_deep = lib_mma.function("dense_gemm_mma_t_n128x256_f16");
+  // THE MATCHED TILE. The i8 kernel is 64x64 over 4 simdgroups and
+  // cannot be wider -- its destination is a THREADGROUP i32 tile, 16 KB
+  // at 64x64 and 64 KB at 128x128, past the budget -- so comparing it
+  // against the 128x128 f16 entry measures the tile and the dtype at
+  // once. This is the same 64x64/4 shape in f16, which separates them.
+  ComputeFunction f_64 = lib_mma.function("dense_gemm_mma_t_f16");
   if (!f_i8.valid() || !f_qr.valid() || !f_n128.valid() ||
-      !f_deep.valid()) {
+      !f_deep.valid() || !f_64.valid()) {
     std::printf("[gemm_i8] kernels unavailable -- skip\n");
     return;
   }
@@ -1920,7 +1926,23 @@ TEST(gemm_i8, ffn_prototype) {
       st.commit().wait();
     };
 
-    launch_i8(1); launch_f16(1);
+    auto launch_f16_64 = [&](int n) {           // the i8 kernel's own tile
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        for (int i = 0; i < n; ++i) {
+          enc.set_function(f_64);
+          enc.set_buffer(0, xb); enc.set_buffer(1, wb);
+          enc.set_buffer(2, wb); enc.set_buffer(3, yb2);
+          enc.set_constant(4, K); enc.set_constant(5, N);
+          enc.set_constant(6, M); enc.set_constant(7, 0);
+          enc.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                        (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+        }
+      }
+      st.commit().wait();
+    };
+
+    launch_i8(1); launch_f16(1); launch_f16_64(1);
     if (check) {
       // Oracle: integer simulation with the GPU's own xq/as (read back)
       // + the CPU wq/ws -- the GPU result must match to f16 store
@@ -1960,16 +1982,84 @@ TEST(gemm_i8, ffn_prototype) {
     auto t1 = std::chrono::steady_clock::now();
     launch_f16(iters);
     auto t2 = std::chrono::steady_clock::now();
-    const double s_i8 = secs_(t0, t1), s_f16 = secs_(t1, t2);
-    std::printf("[gemm_i8] M=%4d N=%5d K=%5d: i8+quant %.0f GF/s (%.2f ms)"
-                "  f16 %.0f GF/s (%.2f ms)  speedup %.2fx\n",
-                M, N, K, gflop / s_i8, s_i8 * 1e3 / iters,
-                gflop / s_f16, s_f16 * 1e3 / iters, s_f16 / s_i8);
+    launch_f16_64(iters);
+    auto t3 = std::chrono::steady_clock::now();
+    const double s_i8 = secs_(t0, t1), s_f16 = secs_(t1, t2),
+                 s_64 = secs_(t2, t3);
+    std::printf("[gemm_i8] M=%4d N=%5d K=%5d: i8 %.0f GF/s  f16-best %.0f"
+                "  f16-same-tile %.0f  |  i8/best %.2fx  i8/same-tile "
+                "%.2fx\n", M, N, K, gflop / s_i8, gflop / s_f16,
+                gflop / s_64, s_f16 / s_i8, s_64 / s_i8);
   };
   run_shape(256, 512, 1024, /*check=*/true, 10);      // oracle + quality
   run_shape(4096, 12288, 4096, /*check=*/false, 5);   // flux2 block proj
   run_shape(4096, 4096, 12288, /*check=*/false, 5);   // flux2 ff-down
   run_shape(4096, 36864, 4096, /*check=*/false, 3);   // flux2 qkv_mlp
+
+  // AND THE CONTRACTION-DEPTH SWEEP, at one output size so that only K
+  // moves. This is the question an int8 ATTENTION turns on:
+  // SageAttention's speedup comes from running QK^T in int8, and that
+  // product contracts over head_dim -- 128 in every image and video
+  // model in this tree, 64 in the vision and audio encoders, and not a
+  // number a kernel can choose. So whether the method can pay here is
+  // exactly whether int8 is faster than f16 at K = 128, which the flux2
+  // rows above (K >= 4096) cannot answer.
+  //
+  // READ THE CHUNK-DEPTH SWEEP IN gemm_i8.k512_chunked BEFORE CONCLUDING
+  // ANYTHING FROM THIS ONE. The rows below are standalone GEMMs, which
+  // pay a threadgroup's setup, epilogue and DRAM store for every K of
+  // contraction -- so at K=128 they are measuring that store, not the
+  // matrix pipe, and they understate int8 by nearly 2x for any caller
+  // whose loop amortises the store. A flash attention is exactly such a
+  // caller.
+  //
+  // MEASURED on an M5 (M=N=4096), TFLOP/s, against f16 at the SAME 64x64
+  // tile so the dtype is the only variable:
+  //
+  //     K      64   128   256   512  1024  2048
+  //   int8    5.3   9.2  12.6  17.1  22.4  23.4
+  //   f16     4.7   7.9  12.3  13.5  13.6  11.2
+  //   ratio  1.14  1.16  1.02  1.26  1.65  2.09
+  //
+  // THE 2x IS REAL AND IT ARRIVES WITH DEPTH -- 17 TFLOP/s at K=512 and
+  // 22+ past 1024, which is where every number anyone quotes for int8 on
+  // this part comes from. Attention has no depth to give it: the QK
+  // product contracts over head_dim, so K is 128, where the ratio is
+  // 1.16.
+  //
+  // AND AT K=128 A STANDALONE GEMM IS BADLY SERVED IN BOTH DTYPES -- 7.9
+  // and 9.2 against their own 13.6 and 23.4 bests. That is a property of
+  // the standalone shape and NOT of the pipe: the same 128-deep int8
+  // product issued back to back into a live accumulator holds 20.8
+  // TFLOP/s, which is 0.92x of what it does at 512. The fixed cost being
+  // amortised is the THREADGROUP's, over how much work that threadgroup
+  // does -- not the matmul2d call's.
+  //
+  // Sage's OTHER lever is not available either: it runs P*V with an f16
+  // accumulator, and matmul2d's relaxed_precision was measured on this
+  // part as rate-neutral (the f32 accumulator stays). See
+  // sage-attention.cc for the method's accuracy, which is not the
+  // problem -- 0.99991 cosine at the kernel's own 64x32 block.
+  for (const int k : {64, 128, 256, 512, 1024, 2048}) {
+    run_shape(4096, 4096, k, /*check=*/false, 5);
+  }
+
+  // AND THE SAME FLOPS AT EVERY DEPTH, which is what separates the two
+  // explanations for the shallow-K shortfall.
+  //
+  // Every row below is 4.29 GFLOP. What changes is how it is divided:
+  // 4096 output tiles each reducing over 128, down to 64 tiles each
+  // reducing over 8192. If the rate is flat, the cost is proportional to
+  // the arithmetic and depth is irrelevant; if it climbs with K, the
+  // per-tile fixed cost -- accumulator setup, the epilogue, the store,
+  // and the matrix pipe's own fill and drain -- is what shallow tiles
+  // cannot amortise. Note the shallow rows move MORE bytes, not fewer
+  // (35.6 MB against 10.5), so a bandwidth answer would point the other
+  // way.
+  for (const auto& [m, k] : std::vector<std::pair<int, int>>{
+           {4096, 128}, {2048, 512}, {1024, 2048}, {512, 8192}}) {
+    run_shape(m, m, k, /*check=*/false, 5);
+  }
 }
 
 // K=512-chunked int8 GEMM variants (see dense_gemm_mma.metal):
@@ -2113,6 +2203,27 @@ TEST(gemm_i8, k512_chunked) {
   ComputeLibrary lib_dq = mc->load_library("affine_dequant");
   ComputeFunction f_one = lib_mma.function("gemm_i8i8_sc_f16_n64");
   ComputeFunction f_ka = lib_mma.function("gemm_i8i8_sc_f16_n64_kacc");
+  // THE CHUNK DEPTH SWEPT DOWN TO ATTENTION'S, AND THIS IS THE ROW THAT
+  // MATTERS FOR AN INT8 ATTENTION.
+  //
+  // A flash kernel issues one 128-deep QK product per key block, back to
+  // back into a live accumulator, with ONE store for the whole loop --
+  // which is this kernel's shape and not a standalone K=128 GEMM's.
+  //
+  // MEASURED on an M5, TFLOP/s at 128-deep chunks: int8 20.8, f16 11.0,
+  // a ratio of 1.89x. The f16 figure is itself the check that this
+  // harness is faithful: the real flash kernel measures 10.5 TFLOP/s at
+  // video geometry, within 5% of the 11.0 here at the same depth and
+  // structure. So the 1.16x a standalone K=128 GEMM shows was measuring
+  // that GEMM's per-tile store, and an int8 QK is worth ~1.9x on half a
+  // flash kernel's matrix work -- about 1.3x on the kernel.
+  ComputeFunction f_k256 =
+      lib_mma.function("gemm_i8i8_sc_f16_n64_kacc_k256");
+  ComputeFunction f_k128 =
+      lib_mma.function("gemm_i8i8_sc_f16_n64_kacc_k128");
+  // ...and the f16 twin, so the ratio is the dtype rather than the shape.
+  ComputeFunction f_f128 = lib_mma.function("dense_gemm_mma_kacc_k128_f16");
+  ComputeFunction f_f512 = lib_mma.function("dense_gemm_mma_kacc_k512_f16");
   ComputeFunction f_g5 = lib_mma.function("gemm_i8i8_sc_f16_n64_g512");
   ComputeFunction f_qr = lib_dq.function("quant_f16_i8_row");
   ComputeFunction f_qg = lib_dq.function("quant_f16_i8_row_g512");
@@ -2169,6 +2280,11 @@ TEST(gemm_i8, k512_chunked) {
     SharedBuffer wsgb = mc->make_shared_buffer((std::size_t)N * G * 2);
     SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
     SharedBuffer yb2 = mc->make_shared_buffer((std::size_t)M * N * 2);
+    // The UNQUANTIZED weight, for the f16 arm of the chunk-depth sweep.
+    SharedBuffer wfb = mc->make_shared_buffer(w.size() * 2);
+    if (!wfb.empty()) {
+      std::memcpy(wfb.contents(), w.data(), w.size() * 2);
+    }
     if (yb.empty() || yb2.empty() || wqgb.empty()) {
       std::printf("[gemm_i8k] alloc failed %dx%dx%d -- skip\n", M, N, K);
       return;
@@ -2263,13 +2379,45 @@ TEST(gemm_i8, k512_chunked) {
     auto t2 = std::chrono::steady_clock::now();
     launch(f_qg, f_g5, asgb, wqgb, wsgb, yb, iters);
     auto t3 = std::chrono::steady_clock::now();
-    const double s1 = secs_(t0, t1), s2 = secs_(t1, t2), s3 = secs_(t2, t3);
+    launch(f_qr, f_k256, asb, wqb, wsb, yb, iters);
+    auto t4 = std::chrono::steady_clock::now();
+    launch(f_qr, f_k128, asb, wqb, wsb, yb, iters);
+    auto t5 = std::chrono::steady_clock::now();
+    auto launch_f16k = [&](ComputeFunction& fn, int n) {
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        for (int i = 0; i < n; ++i) {
+          enc.set_function(fn);
+          enc.set_buffer(0, xb); enc.set_buffer(1, wfb);
+          enc.set_buffer(2, wfb); enc.set_buffer(3, yb);
+          enc.set_constant(4, K); enc.set_constant(5, N);
+          enc.set_constant(6, M); enc.set_constant(7, 0);
+          enc.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                        (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+        }
+      }
+      st.commit().wait();
+    };
+    launch_f16k(f_f512, 1);
+    auto t6 = std::chrono::steady_clock::now();
+    launch_f16k(f_f512, iters);
+    auto t7 = std::chrono::steady_clock::now();
+    launch_f16k(f_f128, iters);
+    auto t8 = std::chrono::steady_clock::now();
+    const double sf5 = secs_(t6, t7), sf1 = secs_(t7, t8);
+    const double s1 = secs_(t0, t1), s2 = secs_(t1, t2), s3 = secs_(t2, t3),
+                 s4 = secs_(t3, t4), s5 = secs_(t4, t5);
     std::printf("[gemm_i8k] M=%4d N=%5d K=%5d: single %.0f GF/s (%.2f ms)"
                 "  kacc %.0f GF/s (%.2f ms, %.2fx)  g512 %.0f GF/s "
                 "(%.2f ms, %.2fx)\n",
                 M, N, K, gflop / s1, s1 * 1e3 / iters,
                 gflop / s2, s2 * 1e3 / iters, s1 / s2,
                 gflop / s3, s3 * 1e3 / iters, s1 / s3);
+    std::printf("[gemm_i8k]   chunk depth, same accumulator: int8 512 %.0f"
+                "  256 %.0f  128 %.0f GF/s | f16 512 %.0f  128 %.0f | "
+                "i8/f16 at 128 %.2fx\n",
+                gflop / s2, gflop / s4, gflop / s5, gflop / sf5,
+                gflop / sf1, sf1 / s5);
   };
   run_shape(256, 512, 1024, /*check=*/true, 1);       // oracles + quality
   run_shape(4096, 12288, 4096, /*check=*/false, 5);   // flux2 block proj
@@ -3256,4 +3404,75 @@ TEST(gemm_mma, row_band_does_not_fire_at_shipped_shapes)
   std::printf("[gemm_mma] row band: %s\n",
               clean ? "inactive at every shipped shape, controls still caught"
                     : "FIRES WHERE IT SHOULD NOT");
+}
+
+// THE INT8 FRAGMENT MMA, at attention's own shape.
+//
+// attn_steel_nax does not issue a 128-deep matmul2d per key block: it
+// builds that product out of EIGHT 16-deep fragment MMAs
+// (NAXFrag_t::mma, a matmul2d<16,32,16>) chained into the same register
+// fragments. gemm_i8.k512_chunked answers the question at 128-deep
+// chunks (int8 20.8 TFLOP/s against f16 11.0); this answers it at the
+// depth the kernel actually runs, which is the one that decides whether
+// an int8 QK is worth wiring in.
+//
+// Operands stay in registers for the whole loop and there is one store
+// at the end, so what is timed is the matrix pipe and not the loads --
+// the same thing the flash kernel's inner loop is bounded by.
+TEST(attn_qk_i8, frag_rate)
+{
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[qk_i8] no matrix cores -- SKIPPED\n");
+    return;
+  }
+  ComputeLibrary lib = mc->load_library("attn_qk_i8_probe");
+  ComputeFunction f_f16 = lib.function("qk_frag_rate_f16");
+  ComputeFunction f_i8 = lib.function("qk_frag_rate_i8");
+  if (!f_f16.valid() || !f_i8.valid()) {
+    std::printf("[qk_i8] probe kernels unavailable -- skip\n");
+    return;
+  }
+  constexpr int kSG = 4;          // the kernel's wm
+  constexpr int kTG = 4096;       // threadgroups, to fill the machine
+  constexpr int kIters = 512;     // key blocks walked per threadgroup
+  SharedBuffer ob = mc->make_shared_buffer((std::size_t)kTG * 4);
+  ASSERT_TRUE(!ob.empty());
+
+  auto run = [&](ComputeFunction& fn, int reps) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute();
+      for (int i = 0; i < reps; ++i) {
+        enc.set_function(fn);
+        enc.set_buffer(0, ob);
+        enc.set_constant(1, kIters);
+        enc.dispatch({(unsigned)(32 * kSG * kTG), 1, 1},
+                     {(unsigned)(32 * kSG), 1, 1});
+      }
+    }
+    st.commit().wait();
+  };
+
+  // 8 fragment MMAs of 16x32x16 per iteration per simdgroup.
+  const double flop_per_rep = 2.0 * 8.0 * 16.0 * 32.0 * 16.0 *
+                              (double)kIters * kSG * kTG;
+  const int reps = 20;
+  run(f_f16, 2); run(f_i8, 2);                       // warm
+  auto t0 = std::chrono::steady_clock::now();
+  run(f_f16, reps);
+  auto t1 = std::chrono::steady_clock::now();
+  run(f_i8, reps);
+  auto t2 = std::chrono::steady_clock::now();
+  const double s_f16 = secs_(t0, t1), s_i8 = secs_(t1, t2);
+  const double g_f16 = flop_per_rep * reps / s_f16 / 1e9;
+  const double g_i8 = flop_per_rep * reps / s_i8 / 1e9;
+  std::printf("[qk_i8] 16-deep fragment chain, TD=8, %d tg x %d sg: f16 "
+              "%.0f GF/s  int8 %.0f GF/s  i8/f16 %.2fx\n", kTG, kSG,
+              g_f16, g_i8, s_f16 / s_i8);
+  // The claim under test. A ratio near 1 would say the fragment MMA does
+  // not carry int8's advantage down to 16-deep, and an int8 QK would be
+  // pointless however accurate it is.
+  EXPECT_TRUE(g_f16 > 0.0 && g_i8 > 0.0);
 }

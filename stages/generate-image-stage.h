@@ -11,6 +11,7 @@
 // path on the VPIPE_BUILD_APPLE_SILICON axis. On non-Apple builds this stage
 // is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/shared/sage-attention.h"
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
@@ -181,6 +182,8 @@ private:
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  // SageAttention (LOSSY int8 QK^T), family-agnostic like _i8_gemm.
+  genai::sage::Config _sage{};
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 

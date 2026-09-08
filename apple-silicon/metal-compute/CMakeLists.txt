@@ -85,6 +85,13 @@ add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
 add_vpipe_metal_kernel(sdpa SRC attention/sdpa.metal)
 add_vpipe_metal_kernel(sdpa_bf16 SRC attention/sdpa.metal
                        DEFINES VPIPE_ELT=bfloat VPIPE_BF16=1)
+# Sol-Attn (NVlabs/Sana, arXiv:2607.24027) -- see
+# generative-models/shared/sol-attention.h. The EXACT blocks are run by
+# attn_steel above, block-sparse; this is the routing and the
+# approximate half.
+add_vpipe_metal_kernel(sol_attn_mma SRC attention/sol_attn_mma.metal)
+add_vpipe_metal_kernel(sol_attn_mma_bf16 SRC attention/sol_attn_mma.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(qwen3_5_gated_delta
                        SRC gated-delta/qwen3_5_gated_delta.metal)
 add_vpipe_metal_kernel(qwen3_5_gated_delta_bf16
@@ -144,6 +151,31 @@ add_vpipe_metal_kernel(dense_gemm_mma_bf16 SRC gemm/dense_gemm_mma.metal
 add_vpipe_metal_kernel(conv2d_mma SRC gemm/conv2d_mma.metal
                        STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(conv2d_mma_bf16 SRC gemm/conv2d_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
+
+# Sol-Attn's routing proxy as one batched matmul2d. Its own target
+# because it is metal4.0 + MPP where the rest of sol_attn_mma is not, and
+# the loader asks supports_matrix_cores() before binding it.
+# Can the NAX fragment MMA run int8, and at what rate at attention's
+# 16-deep fragment shape? The probe that decides whether an int8 QK is
+# worth wiring into the flash kernel. Same headers as attn_steel_nax.
+add_vpipe_metal_kernel(attn_qk_i8_probe
+                       SRC attention/attn_qk_i8_probe.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS
+                          vendored/mlx/backend/metal/kernels/steel/attn/nax.h)
+
+# The int8 QK's prologue: per-block quantization of Q and K plus the key
+# mean the smoothing needs. Plain MSL -- no matrix ops -- so it builds
+# everywhere and the f16/bf16 twins are the usual pair.
+add_vpipe_metal_kernel(sage_quant SRC attention/sage_quant.metal)
+add_vpipe_metal_kernel(sage_quant_bf16 SRC attention/sage_quant.metal
+                       DEFINES VPIPE_ELT=bfloat)
+
+add_vpipe_metal_kernel(sol_proxy_mma SRC attention/sol_proxy_mma.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
+add_vpipe_metal_kernel(sol_proxy_mma_bf16 SRC attention/sol_proxy_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)

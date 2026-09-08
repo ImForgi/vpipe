@@ -1,0 +1,1125 @@
+// Sol-Attn on the MATRIX UNITS: the exact half on the tree's own steel
+// flash kernel, the approximate half on a small MMA flash loop over the
+// summaries, and the two merged.
+//
+// The first port ran the whole method in one plain simdgroup kernel and
+// measured 281 GF/s against steel's 6656 -- so the routing's 3.8x saving
+// was buried under a 24x kernel deficit. This is the same method with
+// the exact blocks handed to steel, which is what the published CuTe
+// kernels do and what this tree's VDN window already proved possible
+// (has_spans + loader jump, measured at 1.85x and converting sparsity to
+// time nearly 1:1).
+//
+// THE BASELINE HERE IS DENSE STEEL, not the earlier kernel. Comparing a
+// new kernel against the one it replaces flatters it; the question is
+// whether Sol beats the attention the model would otherwise run.
+
+#include "minitest.h"
+
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/session.h"
+#include "generative-models/shared/metal-sol-attention.h"
+#include "generative-models/shared/sol-attention.h"
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using namespace vpipe;
+using namespace vpipe::genai;
+using namespace vpipe::metal_compute;
+
+namespace {
+
+// Steel's tiles for head_dim 128, from attn_steel.metal's header.
+constexpr int kSteelBQ = 32;
+constexpr int kSteelBK = 16;
+// The matrix-core flash kernel's own tiles. Coarser on both axes, so
+// the routing decides for 64 rows at a time instead of 32 -- a real
+// difference in what gets kept, not only a faster way to keep it.
+constexpr int kNaxBQ = 64;
+constexpr int kNaxBK = 32;
+constexpr int kD = 128;
+
+struct AttnP {
+  int B, H, D, qL, kL, gqa;
+  float scale;
+  int NQ, NK, NQa, NKa, qL_rem, kL_rem, qL_off;
+  std::int64_t Qs[3], Ks[3], Vs[3], Os[3];
+};
+
+std::uint32_t rnd_(std::uint32_t& s)
+{
+  s = s * 1664525u + 1013904223u;
+  return s;
+}
+float uni_(std::uint32_t& s)
+{
+  return (float)(rnd_(s) >> 8) / 8388608.0f - 1.0f;
+}
+
+// Clustered q/k, as in sol-attention.cc: uniform noise has no routing
+// decision to make and would report a sparsity nobody sees.
+void
+clustered_(std::vector<float>& q, std::vector<float>& k,
+           std::vector<float>& v, int H, int T, int centres, float spread,
+           std::uint32_t seed)
+{
+  const std::size_t n = (std::size_t)H * T * kD;
+  q.resize(n); k.resize(n); v.resize(n);
+  std::uint32_t s = seed;
+  std::vector<float> dir((std::size_t)centres * kD);
+  for (auto& x : dir) { x = uni_(s); }
+  auto fill = [&](std::vector<float>& dst) {
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < T; ++t) {
+        const int c = (t / 37) % centres;
+        float* row = dst.data() + ((std::size_t)h * T + t) * kD;
+        float nrm = 0.0f;
+        for (int i = 0; i < kD; ++i) {
+          row[i] = dir[(std::size_t)c * kD + i] * (1.0f - spread) +
+                   uni_(s) * spread;
+          nrm += row[i] * row[i];
+        }
+        nrm = std::sqrt(nrm > 0.0f ? nrm : 1.0f);
+        for (int i = 0; i < kD; ++i) { row[i] /= nrm; }
+      }
+    }
+  };
+  fill(q); fill(k);
+  for (auto& x : v) { x = uni_(s); }
+}
+
+SharedBuffer up_(MetalCompute* mc, const std::vector<float>& x, bool bf16)
+{
+  SharedBuffer b = mc->make_shared_buffer(x.size() * 2);
+  if (b.empty()) { return b; }
+  if (!bf16) {
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < x.size(); ++i) { d[i] = (_Float16)x[i]; }
+    return b;
+  }
+  auto* d = static_cast<std::uint16_t*>(b.contents());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    std::uint32_t u;
+    std::memcpy(&u, &x[i], 4);
+    d[i] = (std::uint16_t)(u >> 16);
+  }
+  return b;
+}
+
+double rel_(const std::vector<float>& a, const std::vector<float>& b)
+{
+  double n = 0.0, d = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double e = (double)a[i] - (double)b[i];
+    n += e * e;
+    d += (double)b[i] * (double)b[i];
+  }
+  return d > 0.0 ? std::sqrt(n / d) : std::sqrt(n);
+}
+
+// Everything one geometry needs, so the two tests share the setup.
+struct Rig {
+  MetalCompute* mc = nullptr;
+  ComputeLibrary lib_sol, lib_steel;
+  ComputeFunction f_sum, f_stats, f_route, f_scan, f_emit, f_approx, f_merge;
+  ComputeFunction f_steel_dense, f_steel_spans;
+  bool bf16 = false;
+  // WHICH FLASH KERNEL TAKES THE EXACT HALF, and therefore what the CSR
+  // and the routing are quantised to: the ALU steel entry is bq 32 /
+  // bk 16, the matrix-core one bq 64 / bk 32. The approximate half
+  // tiles 32 rows either way, so NQA is its own count.
+  bool nax = false;
+  int BQ = 0, BK = 0;
+  int H = 0, T = 0, TPAD = 0, NQ = 0, NQA = 0, NK = 0, BLK = 0;
+  float scale = 0.0f;
+  SharedBuffer q, k, v, o_dense, o_exact, o_out;
+  SharedBuffer qc, kc, vc, mean, var, flags, kept, qb_off, qb_blk;
+  SharedBuffer o_a, m_a, l_a, m_e, l_e, counts, params, sp_params, sp_bounds;
+  SharedBuffer arena;
+
+  bool load(MetalCompute* m, int heads, int tokens, int blk,
+            bool want_nax = false)
+  {
+    mc = m; H = heads; T = tokens; BLK = blk;
+    nax = want_nax && m->supports_matrix_cores();
+    BQ = nax ? kNaxBQ : kSteelBQ;
+    BK = nax ? kNaxBK : kSteelBK;
+    if (BLK % BK != 0) { return false; }
+    NQ = (T + BQ - 1) / BQ;
+    NQA = (T + kSteelBQ - 1) / kSteelBQ;
+    NK = (T + BLK - 1) / BLK;
+    TPAD = NQA * kSteelBQ;
+    scale = 1.0f / std::sqrt((float)kD);
+    // The dtype is an env switch so the two can be compared in one run:
+    // H3 is bf16 and the tests default to f16, and a kernel that is fast
+    // in one and not the other is a fact about simdgroup_matrix support,
+    // not about the method.
+    bf16 = std::getenv("VPIPE_SOL_BF16") != nullptr;
+    lib_sol = mc->load_library(bf16 ? "sol_attn_mma_bf16" : "sol_attn_mma");
+    lib_steel = mc->load_library(nax ? "attn_steel_nax" : "attn_steel");
+    f_sum = lib_sol.function("sol_summaries_mma");
+    f_stats = lib_sol.function("sol_kc_stats_mma");
+    f_route = lib_sol.function("sol_route_mma");
+    f_scan = lib_sol.function("sol_scan_mma");
+    f_emit = lib_sol.function("sol_emit_mma");
+    f_approx = lib_sol.function("sol_approx_mma");
+    f_merge = lib_sol.function("sol_merge_mma");
+    FunctionConstants fd;
+    fd.set_bool(200, (T % 64) == 0).set_bool(201, (T % 32) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, false).set_bool(304, false);
+    const char* dense_name =
+        nax ? (bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128")
+            : (bf16 ? "attn_steel_h_bd128_bf16" : "attn_steel_h_bd128");
+    f_steel_dense = lib_steel.function(dense_name, fd);
+    FunctionConstants fs;
+    fs.set_bool(200, (T % 64) == 0).set_bool(201, (T % 32) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, true).set_bool(304, true);
+    f_steel_spans = lib_steel.function(dense_name, fs);
+    return f_sum.valid() && f_stats.valid() && f_route.valid() &&
+           f_scan.valid() && f_emit.valid() && f_approx.valid() &&
+           f_merge.valid() && f_steel_dense.valid() && f_steel_spans.valid();
+  }
+
+  bool alloc()
+  {
+    const std::size_t n = (std::size_t)H * T * kD;
+    o_dense = mc->make_shared_buffer(n * 2);
+    o_exact = mc->make_shared_buffer(n * 2);
+    o_out   = mc->make_shared_buffer(n * 2);
+    qc = mc->make_shared_buffer((std::size_t)H * NQ * kD * 2);
+    kc = mc->make_shared_buffer((std::size_t)H * NK * kD * 2);
+    vc = mc->make_shared_buffer((std::size_t)H * NK * kD * 2);
+    mean = mc->make_shared_buffer((std::size_t)H * kD * 4);
+    var  = mc->make_shared_buffer((std::size_t)H * kD * 4);
+    flags = mc->make_shared_buffer((std::size_t)H * NQ * NK);
+    kept  = mc->make_shared_buffer((std::size_t)H * NQ * 4);
+    qb_off = mc->make_shared_buffer((std::size_t)H * (NQ + 1) * 4);
+    // Worst case: every query block keeps every key block.
+    qb_blk = mc->make_shared_buffer((std::size_t)H * NQ *
+                                    (std::size_t)(T / BK + 1) * 4);
+    o_a = mc->make_shared_buffer((std::size_t)H * TPAD * kD * 4);
+    m_a = mc->make_shared_buffer((std::size_t)H * T * 4);
+    l_a = mc->make_shared_buffer((std::size_t)H * T * 4);
+    m_e = mc->make_shared_buffer((std::size_t)H * T * 4);
+    l_e = mc->make_shared_buffer((std::size_t)H * T * 4);
+    counts = mc->make_shared_buffer(8);
+    params = mc->make_shared_buffer(sizeof(AttnP));
+    sp_params = mc->make_shared_buffer(5 * 4);
+    sp_bounds = mc->make_shared_buffer(8);
+    if (params.empty() || qb_blk.empty() || o_a.empty()) { return false; }
+    auto* p = static_cast<AttnP*>(params.contents());
+    p->B = 1; p->H = H; p->D = kD; p->qL = T; p->kL = T; p->gqa = 1;
+    p->scale = scale;
+    p->NQ = NQ; p->NK = (T + BK - 1) / BK;
+    p->NQa = T / BQ; p->NKa = T / BK;
+    p->qL_rem = T - p->NQa * BQ;
+    p->kL_rem = T - p->NKa * BK;
+    p->qL_off = 0;
+    const std::int64_t hm[3] = {(std::int64_t)H * T * kD,
+                                (std::int64_t)T * kD, kD};
+    for (int i = 0; i < 3; ++i) {
+      p->Qs[i] = hm[i]; p->Ks[i] = hm[i]; p->Vs[i] = hm[i];
+      p->Os[i] = hm[i];
+    }
+    int* sp = static_cast<int*>(sp_params.contents());
+    // tokens_per_frame 0 switches steel's span-edge predicate off: the
+    // Sol list is exact at BK granularity, so nothing needs masking.
+    sp[0] = 0; sp[1] = 0; sp[2] = 0; sp[3] = 0;
+    sp[4] = NQ + 1;              // qb_off is [H][NQ + 1]
+    std::memset(sp_bounds.contents(), 0, sp_bounds.byte_size());
+    return true;
+  }
+
+  void encode_dense(ComputeEncoder& e)
+  {
+    e.set_function(f_steel_dense);
+    e.set_buffer(0, q); e.set_buffer(1, k); e.set_buffer(2, v);
+    e.set_buffer(3, o_dense); e.set_buffer(4, params);
+    e.dispatch({32u * (unsigned)NQ, 4u * (unsigned)H, 1}, {32, 4, 1});
+  }
+
+  // A bitmask of passes to LEAVE OUT, so the bench can attribute its own
+  // cost by difference: 1 summaries, 2 stats, 4 route, 8 scan, 16 emit,
+  // 32 approx, 64 exact, 128 merge. The output is nonsense with
+  // anything set -- this is a stopwatch, not a mode. Mirrors
+  // VPIPE_SOL_SKIP in MetalSolAttention.
+  int skip = 0;
+
+  void encode_sol(ComputeEncoder& e, float tau, int radius, int sink_lo,
+                  int sink_hi)
+  {
+    const int per = BLK / BK;
+    const int nks = (T + BK - 1) / BK;
+    // Summaries: twice, because q is summarised at the QUERY block size
+    // and k/v at the KEY block size, and they are independent here.
+    if ((skip & 1) == 0) {
+    e.set_function(f_sum);
+    e.set_buffer(0, q); e.set_buffer(1, k); e.set_buffer(2, v);
+    e.set_buffer(3, qc); e.set_buffer(4, kc); e.set_buffer(5, vc);
+    e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NK);
+    e.set_constant(9, BLK);
+    e.dispatch({kD, (unsigned)H, (unsigned)NK}, {kD, 1, 1});
+    e.set_function(f_sum);
+    e.set_buffer(0, q); e.set_buffer(1, q); e.set_buffer(2, q);
+    e.set_buffer(3, qc); e.set_buffer(4, qc); e.set_buffer(5, qc);
+    e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NQ);
+    e.set_constant(9, BQ);
+    e.dispatch({kD, (unsigned)H, (unsigned)NQ}, {kD, 1, 1});
+    }
+
+    if ((skip & 2) == 0) {
+    e.set_function(f_stats);
+    e.set_buffer(0, kc); e.set_buffer(1, mean); e.set_buffer(2, var);
+    e.set_constant(3, kD); e.set_constant(4, NK);
+    e.dispatch({kD, (unsigned)H, 1}, {kD, 1, 1});
+    }
+
+    if ((skip & 4) == 0) {
+    e.set_function(f_route);
+    e.set_buffer(0, qc); e.set_buffer(1, kc); e.set_buffer(2, mean);
+    e.set_buffer(3, var); e.set_buffer(4, flags); e.set_buffer(5, kept);
+    e.set_buffer(6, counts);
+    e.set_constant(7, scale); e.set_constant(8, tau);
+    e.set_constant(9, kD); e.set_constant(10, NK); e.set_constant(11, NQ);
+    e.set_constant(12, BLK); e.set_constant(13, BQ);
+    e.set_constant(14, radius);
+    e.set_constant(15, sink_lo); e.set_constant(16, sink_hi);
+    e.set_constant(17, per);
+    e.set_constant(18, nks);
+    e.dispatch({32, (unsigned)H, (unsigned)NQ}, {32, 1, 1});
+    }
+
+    if ((skip & 8) == 0) {
+    e.set_function(f_scan);
+    e.set_buffer(0, kept); e.set_buffer(1, qb_off);
+    e.set_constant(2, NQ); e.set_constant(3, H); e.set_constant(4, per);
+    e.dispatch({1, 1, 1}, {1, 1, 1});
+    }
+
+    if ((skip & 16) == 0) {
+    e.set_function(f_emit);
+    e.set_buffer(0, flags); e.set_buffer(1, qb_off); e.set_buffer(2, qb_blk);
+    e.set_constant(3, NQ); e.set_constant(4, NK); e.set_constant(5, per);
+    e.set_constant(6, nks);
+    e.dispatch({32, (unsigned)H, (unsigned)NQ}, {32, 1, 1});
+    }
+
+    if ((skip & 32) == 0) {
+    e.set_function(f_approx);
+    e.set_buffer(0, q); e.set_buffer(1, kc); e.set_buffer(2, vc);
+    e.set_buffer(3, flags); e.set_buffer(4, o_a); e.set_buffer(5, m_a);
+    e.set_buffer(6, l_a);
+    e.set_constant(7, scale); e.set_constant(8, T); e.set_constant(9, kD);
+    e.set_constant(10, NK); e.set_constant(11, NQ);
+    e.set_constant(12, BLK); e.set_constant(13, TPAD);
+    e.set_constant(14, BQ);       // the ROUTING block; this tiles 32
+    // The grid is in THREADS and the threadgroup is 2-D, so y must be
+    // 4 * H for tid.y to be the head -- exactly as the steel dispatch
+    // below spells it. {128, H, NQA} instead gives H/4 threadgroups in y
+    // and four redundant ones in x, which writes a quarter of the heads
+    // and leaves the rest at whatever the buffer held.
+    e.dispatch({32, 4u * (unsigned)H, (unsigned)NQA}, {32, 4, 1});
+    }
+
+    if ((skip & 64) == 0) {
+    e.set_function(f_steel_spans);
+    e.set_buffer(0, q); e.set_buffer(1, k); e.set_buffer(2, v);
+    e.set_buffer(3, o_exact); e.set_buffer(4, params);
+    e.set_buffer(8, qb_off); e.set_buffer(9, qb_blk);
+    e.set_buffer(10, sp_params); e.set_buffer(11, sp_bounds);
+    e.set_buffer(12, m_e); e.set_buffer(13, l_e);
+    e.dispatch({32u * (unsigned)NQ, 4u * (unsigned)H, 1}, {32, 4, 1});
+    }
+
+    if ((skip & 128) == 0) {
+    e.set_function(f_merge);
+    e.set_buffer(0, o_exact); e.set_buffer(1, m_e); e.set_buffer(2, l_e);
+    e.set_buffer(3, o_a); e.set_buffer(4, m_a); e.set_buffer(5, l_a);
+    e.set_buffer(6, o_out);
+    e.set_constant(7, T); e.set_constant(8, kD); e.set_constant(9, TPAD);
+    e.dispatch({kD, (unsigned)H, (unsigned)T}, {kD, 1, 1});
+    }
+  }
+
+  bool run(bool sol, float tau, int radius, int sink_lo, int sink_hi,
+           double* ms)
+  {
+    std::memset(counts.contents(), 0, counts.byte_size());
+    const auto t0 = std::chrono::steady_clock::now();
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      if (sol) { encode_sol(e, tau, radius, sink_lo, sink_hi); }
+      else     { encode_dense(e); }
+    }
+    std::string err;
+    if (!st.commit().wait_ok(&err)) {
+      std::printf("[sol-mma] dispatch failed: %s\n", err.c_str());
+      return false;
+    }
+    *ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t0).count();
+    return true;
+  }
+
+  std::vector<float> read(const SharedBuffer& b) const
+  {
+    const std::size_t n = (std::size_t)H * T * kD;
+    std::vector<float> o(n);
+    if (!bf16) {
+      const auto* p = static_cast<const _Float16*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = (float)p[i]; }
+      return o;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t u = (std::uint32_t)p[i] << 16;
+      std::memcpy(&o[i], &u, 4);
+    }
+    return o;
+  }
+
+  double kept_fraction() const
+  {
+    // The counter is in STEEL key blocks, so the denominator is too.
+    const auto* c = static_cast<const std::uint32_t*>(counts.contents());
+    const long long nks = (T + BK - 1) / BK;
+    return (double)c[0] / (double)((long long)H * NQ * nks);
+  }
+};
+
+}  // namespace
+
+// The composed path against DENSE STEEL, at a size where the routing has
+// something to choose from. Both arms are matrix-core kernels over the
+// same inputs, so what separates them is the approximation and nothing
+// else -- and tau = -inf, which keeps every block, must reproduce dense
+// to the accumulation floor with the whole five-pass machinery still in
+// the way.
+TEST(sol_attention_mma, matches_dense_steel)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  int H = 4, T = 2048, BLK = 64;
+  if (const char* e = std::getenv("VPIPE_SOL_T")) { T = std::atoi(e); }
+  if (const char* e = std::getenv("VPIPE_SOL_H")) { H = std::atoi(e); }
+  if (const char* e = std::getenv("VPIPE_SOL_BLK")) { BLK = std::atoi(e); }
+  // BOTH FLASH KERNELS, and the matrix-core one is not a second copy of
+  // the same statement: it routes at a 64-row query block against the
+  // ALU kernel's 32, walks a CSR in 32-key units rather than 16, and
+  // exports its softmax statistics from a cooperative-tensor fragment
+  // rather than a simdgroup one. tau = -inf is what pins all three at
+  // once -- keep every block and the whole machinery has to reproduce
+  // that kernel's own dense output.
+  for (int arm = 0; arm < 2; ++arm) {
+  const bool want_nax = arm == 1;
+  if (want_nax && !mc->supports_matrix_cores()) {
+    std::printf("[sol-mma] no matrix cores -- NAX arm SKIPPED\n");
+    break;
+  }
+  Rig r;
+  if (!r.load(mc, H, T, BLK, want_nax)) {
+    std::printf("[sol-mma] kernels did not validate\n");
+    return;
+  }
+  ASSERT_TRUE(r.alloc());
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, r.H, r.T, 8, 0.35f, 0xa11ce001u);
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  ASSERT_TRUE(!r.q.empty() && !r.k.empty() && !r.v.empty());
+
+  double ms = 0.0;
+  ASSERT_TRUE(r.run(false, 0.0f, 1, 0, 0, &ms));
+  const std::vector<float> dense = r.read(r.o_dense);
+
+  // EVERY BLOCK EXACT. The five passes still run, the merge still
+  // combines two partials, and the answer must come back dense -- which
+  // pins the merge, the m/l export and the CSR against the one case
+  // with a known answer.
+  ASSERT_TRUE(r.run(true, -1.0e30f, 1, 0, 0, &ms));
+  const std::vector<float> all_exact = r.read(r.o_out);
+  const double e0 = rel_(all_exact, dense);
+  std::printf("[sol-mma] %-3s blk %d: tau=-inf vs dense: rel-L2 %.3e "
+              "(%.1f%% kept)\n", r.nax ? "nax" : "alu", BLK, e0,
+              r.kept_fraction() * 100.0);
+  EXPECT_TRUE(e0 < 5e-3);
+
+  ASSERT_TRUE(r.run(true, 1.0f, 1, 0, 0, &ms));
+  const std::vector<float> sol = r.read(r.o_out);
+  const double e1 = rel_(sol, dense);
+  std::printf("[sol-mma] %-3s blk %d: tau=1.0  vs dense: rel-L2 %.4f "
+              "(%.1f%% kept)\n", r.nax ? "nax" : "alu", BLK, e1,
+              r.kept_fraction() * 100.0);
+  EXPECT_TRUE(e1 < 0.1);
+  EXPECT_TRUE(e1 > 1e-4);          // it really did approximate something
+  }
+}
+
+// THE BENCHMARK (VPIPE_SOL_BENCH=1), at H3's production attention
+// geometry, against the dense steel kernel the model actually runs.
+TEST(sol_attention_mma, bench)
+{
+  if (std::getenv("VPIPE_SOL_BENCH") == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  int heads = 8, tokens = 20036;
+  if (const char* e = std::getenv("VPIPE_SOL_BENCH_HEADS")) {
+    heads = std::atoi(e);
+  }
+  if (const char* e = std::getenv("VPIPE_SOL_BENCH_ROWS")) {
+    tokens = std::atoi(e);
+  }
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, heads, tokens, 24, 0.35f, 0x50150150u);
+
+  std::printf("[sol-mma] %d heads x %d rows x 128\n", heads, tokens);
+  std::printf("[sol-mma] %4s %6s %9s %9s %9s %8s %8s\n", "arm", "BLK",
+              "dense", "rig", "class", "speedup", "kept");
+  // THE KEY BLOCK SIZE IS THE SWEEP. Bigger blocks make the routing
+  // cheaper (fewer proxy scores, shorter CSR) and the summary coarser
+  // (a centroid over more keys represents each of them worse), so there
+  // is a knee somewhere and nothing says 64 is it on this hardware.
+  // BOTH ARMS, and the dense column moves with them: comparing Sol on
+  // the matrix-core kernel against dense on the ALU one would credit
+  // the approximation with the port. What each row says is what routing
+  // buys ON THAT KERNEL; what the two blocks of rows say to each other
+  // is what the port buys.
+  for (int arm = 0; arm < 2; ++arm) {
+  const bool want_nax = arm == 1;
+  if (want_nax && !mc->supports_matrix_cores()) { break; }
+  for (const int blk : {32, 64, 128, 256}) {
+    Rig r;
+    if (!r.load(mc, heads, tokens, blk, want_nax)) { continue; }
+    if (!r.alloc()) { continue; }
+    r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+    if (r.q.empty()) { continue; }
+    double warm = 0.0, dense_ms = 0.0, sol_ms = 0.0;
+    // The sink H3 sets: everything below video_start is prompt and
+    // soundtrack and must be read exactly. Mirrored here so the bench
+    // measures the configuration the model actually runs.
+    int sink_tok = 0;
+    if (const char* e = std::getenv("VPIPE_SOL_SINK")) {
+      sink_tok = std::atoi(e);
+    }
+    const int slo = 0;
+    const int shi = sink_tok > 0 ? (sink_tok + blk - 1) / blk : 0;
+    if (!r.run(true, 1.0f, 1, slo, shi, &warm)) { continue; }
+    if (!r.run(false, 0.0f, 1, 0, 0, &dense_ms)) { continue; }
+    if (!r.run(false, 0.0f, 1, 0, 0, &dense_ms)) { continue; }
+    if (!r.run(true, 1.0f, 1, slo, shi, &sol_ms)) { continue; }
+    // AND THE CLASS THE MODEL CALLS, which is not the rig: on a
+    // matrix-core box its approximate half is the flash kernel with the
+    // routing's flags as a mask, where the rig's is still the
+    // simdgroup one. That difference is the point of the column.
+    double cls_ms = 0.0;
+    {
+      if (want_nax) { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+      else          { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+      std::string err;
+      std::unique_ptr<MetalSolAttention> sol =
+          MetalSolAttention::load(mc, r.bf16, &err);
+      SharedBuffer out =
+          mc->make_shared_buffer((std::size_t)heads * tokens * kD * 2);
+      sol::Config cfg;
+      cfg.enabled = true;
+      cfg.tau = 1.0f;
+      cfg.local_radius = 1;
+      cfg.key_block = blk;
+      cfg.sink_start = 0;
+      cfg.sink_tokens = sink_tok;
+      auto once = [&](double* ms) {
+        const auto t0 = std::chrono::steady_clock::now();
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          if (!sol->encode(e, r.q, r.k, r.v, out, heads, tokens, kD,
+                           r.scale, cfg, &err)) {
+            return false;
+          }
+        }
+        if (!st.commit().wait_ok(&err)) { return false; }
+        *ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count();
+        return true;
+      };
+      if (!sol || !once(&cls_ms) || !once(&cls_ms)) { cls_ms = 0.0; }
+      ::unsetenv("VPIPE_SOL_NO_NAX");
+    }
+    std::printf("[sol-mma] %4s %6d %8.1fms %8.1fms %8.1fms %7.2fx %7.1f%%\n",
+                r.nax ? "nax" : "alu", blk, dense_ms, sol_ms, cls_ms,
+                cls_ms > 0.0 ? dense_ms / cls_ms : 0.0,
+                r.kept_fraction() * 100.0);
+    // WHERE THE REMAINING TIME IS, by difference. The exact half is the
+    // one pass whose cost the routing controls; everything else is
+    // Sol's own, and once the exact half moves to the matrix cores that
+    // own cost is most of what is left. Attributed by leaving one pass
+    // out rather than by timing it alone, because a per-pass commit
+    // pays to make ~1 GB of scratch resident again and would report
+    // that instead.
+    if (std::getenv("VPIPE_SOL_BENCH_PROFILE") != nullptr) {
+      struct { int bit; const char* name; } part[] = {
+          {1, "summaries"}, {4, "route"}, {16, "emit"},
+          {32, "approx"}, {64, "exact"}, {128, "merge"}};
+      for (const auto& pt : part) {
+        double without = 0.0;
+        r.skip = pt.bit;
+        if (!r.run(true, 1.0f, 1, slo, shi, &without)) { continue; }
+        if (!r.run(true, 1.0f, 1, slo, shi, &without)) { continue; }
+        std::printf("[sol-mma]        %-10s %7.1fms (%.0f%%)\n", pt.name,
+                    sol_ms - without,
+                    sol_ms > 0.0 ? 100.0 * (sol_ms - without) / sol_ms : 0.0);
+      }
+      r.skip = 0;
+    }
+  }
+  }
+  EXPECT_TRUE(true);
+}
+
+// The APPROXIMATE half alone, against a CPU computation of exactly what
+// it is supposed to produce. Isolated on purpose: composed with steel
+// and the merge, an error here is a number between 0 and 2 with nothing
+// to say which of five passes produced it.
+TEST(sol_attention_mma, the_approximate_partial_is_what_it_claims)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  Rig r;
+  const int H = 1, T = 512, BLK = 64;
+  if (!r.load(mc, H, T, BLK)) { return; }
+  ASSERT_TRUE(r.alloc());
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 4, 0.4f, 0x1234u);
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  ASSERT_TRUE(!r.q.empty());
+
+  // tau enormous and no local band: everything the routing can drop, it
+  // drops -- so the approximate half carries almost the whole answer and
+  // an error in it cannot hide.
+  double ms = 0.0;
+  ASSERT_TRUE(r.run(true, 1.0e30f, -1, 0, 0, &ms));
+
+  const int NK = r.NK;
+  const auto* fl = static_cast<const unsigned char*>(r.flags.contents());
+  const auto* kcp = static_cast<const _Float16*>(r.kc.contents());
+  const auto* vcp = static_cast<const _Float16*>(r.vc.contents());
+  const auto* map = static_cast<const float*>(r.m_a.contents());
+  const auto* lap = static_cast<const float*>(r.l_a.contents());
+  const auto* oap = static_cast<const float*>(r.o_a.contents());
+
+  const float ls = r.scale * 1.44269504088896340736f;
+  const float bonus = std::log2((float)BLK);
+  double worst_o = 0.0, worst_l = 0.0;
+  int checked = 0;
+  for (int t = 0; t < T; t += 37) {
+    const int qb = t / kSteelBQ;
+    // The CPU version of the same partial: one logit per approximate
+    // block, the block MEAN as its value, +log2(BLK) on the score.
+    std::vector<double> acc((std::size_t)kD, 0.0);
+    double m = -INFINITY, l = 0.0;
+    for (int n = 0; n < NK; ++n) {
+      if (fl[(std::size_t)qb * NK + n] != 0) { continue; }
+      double dot = 0.0;
+      for (int i = 0; i < kD; ++i) {
+        dot += (double)q[(std::size_t)t * kD + i] *
+               (double)(float)kcp[(std::size_t)n * kD + i];
+      }
+      const double s = dot * ls + bonus;
+      const double mn = std::max(m, s);
+      const double corr = (m == -INFINITY) ? 0.0 : std::exp2(m - mn);
+      const double p = std::exp2(s - mn);
+      l = l * corr + p;
+      for (int i = 0; i < kD; ++i) {
+        acc[(std::size_t)i] = acc[(std::size_t)i] * corr +
+                              p * (double)(float)vcp[(std::size_t)n * kD + i];
+      }
+      m = mn;
+    }
+    if (l <= 0.0) { continue; }
+    ++checked;
+    // Compare at the SAME max: the kernel and this may have taken
+    // different running maxima, and only the ratio is meaningful.
+    const double sh = std::exp2(m - (double)map[t]);
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < kD; ++i) {
+      const double got = oap[((std::size_t)t) * kD + i];
+      const double want = acc[(std::size_t)i] * sh;
+      num += (got - want) * (got - want);
+      den += want * want;
+    }
+    const double eo = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    const double el = std::abs((double)lap[t] - l * sh) /
+                      std::max(1e-12, l * sh);
+    worst_o = std::max(worst_o, eo);
+    worst_l = std::max(worst_l, el);
+  }
+  std::printf("[sol-mma] approx partial over %d rows: worst o %.4f, "
+              "worst l %.4f\n", checked, worst_o, worst_l);
+  EXPECT_TRUE(checked > 0);
+  EXPECT_TRUE(worst_o < 0.02);
+  EXPECT_TRUE(worst_l < 0.02);
+}
+
+// THE CLASS THE MODEL ACTUALLY CALLS, against dense.
+//
+// Everything above drives the kernels through a rig that fills
+// AttnParams itself. MetalSolAttention fills its own, and a field it
+// forgets is a zero rather than an error -- which is how the exact half
+// shipped running every routed block at scale 0, a uniform average of
+// the values it kept. Nothing else could see it: the rig supplies the
+// field, and the model-level tests ask only that the answer be finite,
+// reproducible and different from dense, all of which a uniform
+// attention is.
+//
+// tau = -inf keeps every block, so the composed call must reproduce
+// dense to the accumulation floor -- with the routing, both partials
+// and the merge still in the way.
+TEST(sol_attention_mma, the_class_reproduces_dense)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 4, T = 2048, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 8, 0.35f, 0xc1a55e51u);
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool want_nax = arm == 1;
+    if (want_nax && !mc->supports_matrix_cores()) { break; }
+    // The class reads the environment once per process, so the ALU arm
+    // has to be asked for before the first load.
+    if (!want_nax) { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+    else           { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+    Rig r;
+    if (!r.load(mc, H, T, BLK, want_nax)) { continue; }
+    ASSERT_TRUE(r.alloc());
+    r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+    r.v = up_(mc, v, r.bf16);
+    if (r.q.empty()) { return; }
+    double ms = 0.0;
+    ASSERT_TRUE(r.run(false, 0.0f, 1, 0, 0, &ms));
+    const std::vector<float> dense = r.read(r.o_dense);
+
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { std::printf("[sol-mma] %s\n", err.c_str()); return; }
+    // The class picks its own kernel; if it disagrees with the arm we
+    // asked for, the comparison would be against the wrong dense.
+    EXPECT_TRUE(sol->uses_matrix_cores() == want_nax);
+
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!out.empty());
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = -1.0e30f;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, out, H, T, kD, r.scale,
+                                cfg, &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    const std::vector<float> got = r.read(out);
+    const double e0 = rel_(got, dense);
+    std::printf("[sol-mma] %-3s class tau=-inf vs dense: rel-L2 %.3e\n",
+                want_nax ? "nax" : "alu", e0);
+    EXPECT_TRUE(e0 >= 0.0 && e0 < 5e-3);
+
+    // ...and a real tau still approximates rather than degenerating.
+    cfg.tau = 1.0f;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, out, H, T, kD, r.scale,
+                                cfg, &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    const double e1 = rel_(r.read(out), dense);
+    std::printf("[sol-mma] %-3s class tau=1.0  vs dense: rel-L2 %.4f\n",
+                want_nax ? "nax" : "alu", e1);
+    EXPECT_TRUE(e1 > 1e-4 && e1 < 0.1);
+  }
+  ::unsetenv("VPIPE_SOL_NO_NAX");
+}
+
+// THE TWO ROUTING KERNELS MUST KEEP THE SAME BLOCKS.
+//
+// The proxy is the same dot product either way -- accumulated in f32
+// and stored in f32 -- so moving it from a per-key simdgroup reduction
+// into one batched GEMM changes the summation ORDER and nothing else.
+// The bar is therefore the routing DECISION and not the output quality:
+// a threshold crossing that moved would show up here as a different
+// kept count, where in the output it would hide inside a tolerance that
+// the approximation already occupies.
+TEST(sol_attention_mma, the_gemm_proxy_routes_identically)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[sol-mma] no matrix cores -- proxy A/B SKIPPED\n");
+    return;
+  }
+  const int H = 4, T = 4096, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x9e3779b9u);
+
+  Rig r;
+  if (!r.load(mc, H, T, BLK, /*want_nax=*/true)) { return; }
+  ASSERT_TRUE(r.alloc());
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  if (r.q.empty()) { return; }
+
+  std::vector<float> out[2];
+  long long kept[2] = {0, 0};
+  for (int arm = 0; arm < 2; ++arm) {
+    if (arm == 0) { ::setenv("VPIPE_SOL_NO_PROXY_GEMM", "1", 1); }
+    else          { ::unsetenv("VPIPE_SOL_NO_PROXY_GEMM"); }
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { return; }
+    sol->reset_counts();
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!o.empty());
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = 1.0f;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, o, H, T, kD, r.scale, cfg,
+                                &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    out[arm] = r.read(o);
+    kept[arm] = sol->exact_blocks();
+  }
+  ::unsetenv("VPIPE_SOL_NO_PROXY_GEMM");
+  const double rel = rel_(out[1], out[0]);
+  std::printf("[sol-mma] proxy A/B: fused kept %lld, gemm kept %lld, "
+              "outputs rel-L2 %.3e\n", kept[0], kept[1], rel);
+  EXPECT_TRUE(kept[0] > 0 && kept[0] == kept[1]);
+  // Same blocks and the same exact-half arithmetic, so the outputs are
+  // the same bytes -- the proxy feeds a decision and nothing else.
+  EXPECT_TRUE(rel == 0.0);
+}
+
+// scratch_bytes() must equal what ensure_scratch_ actually allocates.
+//
+// It is spent at the FIRST ENCODE -- inside the first forward, long
+// after anything that plans memory has had its say -- so a planner asks
+// this instead, and an estimate never compared with the allocation it
+// predicts drifts the first time a buffer is added. It had already
+// drifted twice before this test existed: it counted an fp32 [H, TPAD,
+// D] approximate output the matrix-core arm does not allocate, and
+// missed both buffers that arm does.
+//
+// Checked at both arms and two key blocks, because the two change
+// different terms: the arm swaps a 4-byte padded partial for a 2-byte
+// one and adds the proxy matrix, the block sets the summary length.
+TEST(sol_attention_mma, the_scratch_estimate_matches_the_allocation)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 8, T = 8192;
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool want_nax = arm == 1;
+    if (want_nax && !mc->supports_matrix_cores()) { break; }
+    if (!want_nax) { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+    else           { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+    for (const int blk : {32, 64}) {
+      std::string err;
+      std::unique_ptr<MetalSolAttention> sol =
+          MetalSolAttention::load(mc, /*bf16=*/true, &err);
+      ASSERT_TRUE(sol != nullptr);
+      if (!sol) { return; }
+      EXPECT_TRUE(sol->uses_matrix_cores() == want_nax);
+      SharedBuffer q = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+      SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+      ASSERT_TRUE(!q.empty() && !o.empty());
+      sol::Config cfg;
+      cfg.enabled = true;
+      cfg.tau = 1.0f;
+      cfg.key_block = blk;
+      {
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          const bool ok =
+              sol->encode(e, q, q, q, o, H, T, kD, 0.08f, cfg, &err);
+          if (!ok) { std::printf("[sol_mem] encode: %s\n", err.c_str()); }
+          ASSERT_TRUE(ok);
+        }
+        ASSERT_TRUE(st.commit().wait_ok(&err));
+      }
+      const std::size_t want =
+          MetalSolAttention::scratch_bytes(H, T, kD, blk, want_nax);
+      const std::size_t got = sol->resident_bytes();
+      std::printf("[sol_mem] %-3s blk %3d: estimate %7.1f MB, allocated "
+                  "%7.1f MB%s\n", want_nax ? "nax" : "alu", blk,
+                  (double)want / 1048576.0, (double)got / 1048576.0,
+                  want == got ? "" : "   MISMATCH");
+      // EXACT, not a bound: any difference is a buffer one of them knows
+      // about and the other does not, which is the whole failure this
+      // catches.
+      EXPECT_TRUE(want == got);
+    }
+  }
+  ::unsetenv("VPIPE_SOL_NO_NAX");
+}
+
+// LENT SCRATCH IS THE SAME SCRATCH.
+//
+// Everything Sol holds bar a few hundred bytes lives for one call, so
+// the caller can hand it memory it is not using -- and the DiT has 4
+// attention windows of exactly that: the fused qkv projection, dead
+// from the transpose to the feed-forward, and the arena's last window,
+// dead until the transpose that follows the call.
+//
+// Two things have to hold and neither is obvious. The carve must be
+// BYTE-IDENTICAL in its answer, because a buffer that overlapped a live
+// one would show up as an approximation moving rather than as a crash.
+// And private_bytes() must predict what is left, exactly -- a planner
+// that under-counts is the failure this whole change is about.
+TEST(sol_attention_mma, a_lent_scratch_is_the_same_scratch)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 4, T = 4096, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x5011euL);
+
+  Rig r;
+  if (!r.load(mc, H, T, BLK, mc->supports_matrix_cores())) { return; }
+  ASSERT_TRUE(r.alloc());
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  if (r.q.empty()) { return; }
+
+  // What the DiT lends, in this rig's terms: the fused projection is
+  // three attention windows and the spare arena window is one.
+  const std::size_t lend_a = (std::size_t)T * 3 * (std::size_t)H * kD * 2;
+  const std::size_t lend_b = (std::size_t)T * (std::size_t)H * kD * 2;
+  SharedBuffer arena_a = mc->make_shared_buffer(lend_a);
+  SharedBuffer arena_b = mc->make_shared_buffer(lend_b);
+  ASSERT_TRUE(!arena_a.empty() && !arena_b.empty());
+  // POISONED, so nothing Sol is supposed to write is accidentally right
+  // because the allocator handed over zeros.
+  std::memset(arena_a.contents(), 0x5a, lend_a);
+  std::memset(arena_b.contents(), 0x5a, lend_b);
+
+  std::vector<float> out[2];
+  std::size_t owned[2] = {0, 0};
+  for (int arm = 0; arm < 2; ++arm) {
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { return; }
+    if (arm == 1) { sol->set_arena(arena_a, arena_b); }
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!o.empty());
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = 1.0f;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, o, H, T, kD, r.scale, cfg,
+                                &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    out[arm] = r.read(o);
+    owned[arm] = sol->resident_bytes();
+  }
+  const bool same = out[0].size() == out[1].size() &&
+                    std::memcmp(out[0].data(), out[1].data(),
+                                out[0].size() * 4) == 0;
+  const std::size_t want = MetalSolAttention::private_bytes(
+      H, T, kD, BLK, mc->supports_matrix_cores(), lend_a, lend_b);
+  std::printf("[sol_mem] own %7.1f MB unlent -> %7.1f MB lent (predicted "
+              "%7.1f), outputs %s\n", (double)owned[0] / 1048576.0,
+              (double)owned[1] / 1048576.0,
+              (double)(want - MetalSolAttention::pinned_bytes()) / 1048576.0,
+              same ? "IDENTICAL" : "DIFFER");
+  EXPECT_TRUE(same);
+  // The lend has to actually take, and the prediction has to be the
+  // carve -- resident_bytes() excludes the pinned four, which
+  // private_bytes() includes.
+  EXPECT_TRUE(owned[1] < owned[0]);
+  EXPECT_TRUE(owned[1] + MetalSolAttention::pinned_bytes() == want);
+}
+
+// THE LENDER GETS ITS ARENA BACK. This is the bug the 1344x768 x 328
+// frame H3 run died of, and it is a LIFETIME bug rather than a sizing
+// one, which is why every memory figure in that run looked reasonable.
+//
+// Sol announces its scratch to the process-wide residency set, which
+// RETAINS what it holds -- and most of that scratch is windows carved
+// out of the arena the DiT lent. A subview shares its parent's
+// MTL::Buffer, so the set was handed the DiT's whole multi-gigabyte
+// forward arena. `unload_when_idle: destroy` then destroyed the DiT and
+// freed nothing: the set was still holding it, and the set lives on
+// MetalCompute, which outlives every model. The VAE decode that ran next
+// found the box full and refused.
+//
+// Measured through the DEVICE's allocated size rather than Sol's own
+// accounting, because Sol's accounting was never wrong -- it reported
+// the few hundred bytes it really owns, which is exactly why nothing
+// noticed.
+TEST(sol_attention_mma, destroying_sol_gives_the_lent_arena_back)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->residency_set_supported()) { return; }
+  const int H = 4, T = 4096, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x5011euL);
+
+  Rig r;
+  if (!r.load(mc, H, T, BLK, mc->supports_matrix_cores())) { return; }
+  ASSERT_TRUE(r.alloc());
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  if (r.q.empty()) { return; }
+
+  const std::size_t lend_a = (std::size_t)T * 3 * (std::size_t)H * kD * 2;
+  const std::size_t lend_b = (std::size_t)T * (std::size_t)H * kD * 2;
+  const std::size_t lent = lend_a + lend_b;
+
+  const std::size_t base = mc->memory_budget().allocated;
+  {
+    SharedBuffer arena_a = mc->make_shared_buffer(lend_a);
+    SharedBuffer arena_b = mc->make_shared_buffer(lend_b);
+    ASSERT_TRUE(!arena_a.empty() && !arena_b.empty());
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { return; }
+    sol->set_arena(arena_a, arena_b);
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!o.empty());
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = 1.0f;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, o, H, T, kD, r.scale, cfg,
+                                &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    // Everything is alive here, so the arena is legitimately on the books.
+    EXPECT_TRUE(mc->memory_budget().allocated >= base + lent);
+  }
+  // ...and gone here. Before the fix this stayed up by the whole lend,
+  // for the life of the process.
+  const std::size_t after = mc->memory_budget().allocated;
+  EXPECT_TRUE(after < base + lent / 2);
+}
+
+// The same thing on the REBUILD path, which is how it compounded: the
+// DiT takes its arena back (set_arena with nothing) before allocating a
+// bigger one, so a run that grew its scratch left one dead arena in the
+// set per rebuild.
+TEST(sol_attention_mma, taking_the_arena_back_releases_it)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->residency_set_supported()) { return; }
+  const int H = 4, T = 2048, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 8, 0.35f, 0x77e1uL);
+
+  Rig r;
+  if (!r.load(mc, H, T, BLK, mc->supports_matrix_cores())) { return; }
+  ASSERT_TRUE(r.alloc());
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  if (r.q.empty()) { return; }
+
+  const std::size_t lend_a = (std::size_t)T * 3 * (std::size_t)H * kD * 2;
+  const std::size_t lend_b = (std::size_t)T * (std::size_t)H * kD * 2;
+  const std::size_t lent = lend_a + lend_b;
+
+  std::string err;
+  std::unique_ptr<MetalSolAttention> sol =
+      MetalSolAttention::load(mc, r.bf16, &err);
+  ASSERT_TRUE(sol != nullptr);
+  if (!sol) { return; }
+
+  const std::size_t base = mc->memory_budget().allocated;
+  {
+    SharedBuffer arena_a = mc->make_shared_buffer(lend_a);
+    SharedBuffer arena_b = mc->make_shared_buffer(lend_b);
+    ASSERT_TRUE(!arena_a.empty() && !arena_b.empty());
+    sol->set_arena(arena_a, arena_b);
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!o.empty());
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = 1.0f;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, o, H, T, kD, r.scale, cfg,
+                                &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    // The lender takes it back, exactly as the DiT does before it
+    // reallocates. Sol outlives this scope; the arena must not.
+    sol->set_arena(SharedBuffer{}, SharedBuffer{});
+  }
+  const std::size_t after = mc->memory_budget().allocated;
+  EXPECT_TRUE(after < base + lent / 2);
+}

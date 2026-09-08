@@ -55,6 +55,11 @@ struct AttnSpanParams {
   int tokens_per_frame;
   int num_frames;
   int anchors; ///< bit 0: anchor COLUMNS, bit 1: anchor ROWS
+  /// vpipe: stride between HEADS in qb_off. 0 = one list shared by every
+  /// head, which is what a geometric window is (VDN's window depends on
+  /// the frame layout and not on the head). Sol-Attn routes per head, so
+  /// it passes NQ + 1 and lays qb_off out as [H][NQ + 1].
+  int qb_stride;
 };
 
 } // namespace steel

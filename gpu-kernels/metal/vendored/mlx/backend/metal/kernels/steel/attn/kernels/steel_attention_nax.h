@@ -30,6 +30,75 @@ constant bool has_spans_set [[function_constant(303)]];
 constant bool has_spans =
     is_function_constant_defined(has_spans_set) ? has_spans_set : false;
 
+// vpipe: export this pass's online-softmax statistics, so a SECOND
+// partial attention over a disjoint key set can be merged with it.
+//
+// The matrix-core twin of the ALU kernel's constant 304, and it exists
+// for the same one caller: Sol-Attn runs the blocks its routing KEEPS
+// here at full flash throughput and summarises the rest elsewhere, and
+// the two halves combine only if both report their running maximum and
+// denominator. O is stored ALREADY divided by sum_score, so the merge
+// multiplies it back and nothing about the store changes.
+//
+// Read through is_function_constant_defined, like has_spans: the four
+// callers that predate this set 200/201/300..303 and stop there, and
+// unset must mean false EXPLICITLY rather than by luck.
+constant bool export_ml_set [[function_constant(304)]];
+constant bool export_ml =
+    is_function_constant_defined(export_ml_set) ? export_ml_set : false;
+
+// vpipe: a per-(query block, KEY) byte mask, which is what lets this
+// kernel also run Sol-Attn's APPROXIMATE half.
+//
+// That half is an attention over the summary sequence -- one key per
+// routing block -- from which the blocks the routing kept exact must be
+// excluded, or they would be counted twice. The exclusion is decided
+// per query block and per key, which is exactly the routing's own flag
+// array, so nothing is materialised: `block_mask` IS that array, read
+// as [H][params->NQ][params->kL] with a nonzero byte meaning EXCLUDE.
+//
+// A per-element mask (has_mask) would be [qL, kL] -- 50 million bytes a
+// head at video geometry against the flag array's 100 thousand -- and a
+// span list cannot say it at all, the CSR's unit being 32 keys where
+// this decision is per key.
+//
+// A ROW WITH EVERY KEY EXCLUDED IS LEGITIMATE (tau low enough keeps
+// every block) and produces max_score == finite_min, since that is both
+// the initial value and what the mask writes. The caller reads that
+// sentinel and drops the half; see sol_merge_ml_mma.
+constant bool has_block_mask_set [[function_constant(305)]];
+constant bool has_block_mask =
+    is_function_constant_defined(has_block_mask_set) ? has_block_mask_set
+                                                     : false;
+
+// vpipe: run the QK^T product in INT8, SageAttention-style
+// (arXiv:2410.02367). Q and K arrive pre-quantized with ONE scale per
+// block -- per query block for Q, per key block for K -- so the dequant
+// of a score tile is a single scalar, and it folds into the softmax's
+// log2 scale that the f16 path applies here anyway.
+//
+// P*V IS NOT QUANTIZED and is not affected: the probabilities are a
+// softmax output and V carries the outliers, which is the same division
+// the paper draws.
+//
+// WHY IT IS WORTH DOING AT ALL, on a part where a standalone K=128 GEMM
+// shows int8 only 1.16x ahead: this kernel does not issue a 128-deep
+// product per key block. It builds it from eight 16-deep fragment MMAs
+// chained into the same register fragments, and at THAT shape the
+// matrix pipe runs int8 at exactly 2.00x f16 (32.2 against 16.1
+// TFLOP/s, attn_qk_i8.frag_rate). The GEMM figure was measuring a
+// per-tile store this kernel does not pay.
+//
+// The caller must also pass the SMOOTHED K -- K minus its mean over
+// tokens. That is free and exact rather than an approximation:
+// subtracting a per-channel mean shifts every score in a row by the same
+// q.mean, and softmax does not see a per-row shift. It is what makes the
+// int8 range hold the signal instead of a shared bias, and it is worth
+// most of the accuracy (sage_attention.per_block_int8_needs_the_smoothing).
+constant bool qk_int8_set [[function_constant(306)]];
+constant bool qk_int8 =
+    is_function_constant_defined(qk_int8_set) ? qk_int8_set : false;
+
 template <typename T>
 struct TransformScale {
   T scale;
@@ -114,6 +183,20 @@ template <
     // hi >= num_frames are how "nothing outside on that side" is said.
     const device int2* span_bounds
         [[buffer(11), function_constant(has_spans)]],
+    // vpipe: [B, H, qL] each, this pass's per-row max and denominator.
+    device float* ml_max [[buffer(12), function_constant(export_ml)]],
+    device float* ml_sum [[buffer(13), function_constant(export_ml)]],
+    // vpipe: [H, NQ, kL] bytes; nonzero excludes that key from this
+    // query block.
+    const device uchar* block_mask
+        [[buffer(14), function_constant(has_block_mask)]],
+    // vpipe: the int8 QK operands and their per-block scales. Q8/K8 are
+    // [B, H, qL|kL, BD] int8, tightly packed; the scales are [B, H, NQ]
+    // and [B, H, NK] fp32, one per block of the kernel's own tiling.
+    const device int8_t* Q8 [[buffer(15), function_constant(qk_int8)]],
+    const device int8_t* K8 [[buffer(16), function_constant(qk_int8)]],
+    const device float* q_scale [[buffer(17), function_constant(qk_int8)]],
+    const device float* k_scale [[buffer(18), function_constant(qk_int8)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -140,6 +223,31 @@ template <
   O += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
+
+  // vpipe: the int8 twins, tightly packed [B, H, L, BD] -- their row
+  // stride is BD and not the f16 tensors', which may be a fused
+  // projection's. Advanced in step with K below.
+  const device int8_t* Q8b = nullptr;
+  const device int8_t* K8b = nullptr;
+  const device float* qsc = nullptr;
+  const device float* ksc = nullptr;
+  if (qk_int8) {
+    // Q is indexed by the QUERY head and K by the KV head, exactly as
+    // the f16 tensors above are. Reducing K8 to the query head would be
+    // invisible at gqa_factor 1 -- which is what H3 and Qwen-Image run --
+    // and would read a neighbouring head's keys on every GQA family
+    // (FLUX.2 and Krea-2 are both HED/KVH > 1). So the KV base is its
+    // own arithmetic, over KVH = H / gqa_factor heads.
+    const size_t hbase =
+        (size_t(tid.z) * size_t(params->H) + size_t(tid.y));
+    const size_t kvh =
+        size_t(params->H) / size_t(max(1, params->gqa_factor));
+    const size_t kvbase = size_t(tid.z) * kvh + size_t(kv_head_idx);
+    Q8b = Q8 + (hbase * size_t(params->qL) + size_t(tid.x) * BQ) * BD;
+    K8b = K8 + kvbase * size_t(params->kL) * BD;
+    qsc = q_scale + hbase * size_t(params->NQ) + size_t(tid.x);
+    ksc = k_scale + kvbase * size_t(params->NK);
+  }
 
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
@@ -173,6 +281,7 @@ template <
   // Prepare mma tile offsets
   const short tm = kU * TQ * simd_group_id;
   Q += tm * int(params->Q_strides[2]);
+  if (qk_int8) { Q8b += tm * BD; }
 
   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
   const short sm = simd_coord.y;
@@ -226,8 +335,12 @@ template <
   int vis_base = 0;
   int kb_prev = 0;
   if (has_spans) {
-    vis_base = qb_off[tid.x];
-    nvis = qb_off[tid.x + 1] - vis_base;
+    // qb_stride == 0 is one list shared by every head; anything else
+    // lays qb_off out as [H][NQ + 1]. See AttnSpanParams -- a geometric
+    // window does not depend on the head and Sol's routing does.
+    const int qbi = int(tid.y) * span_params->qb_stride + int(tid.x);
+    vis_base = qb_off[qbi];
+    nvis = qb_off[qbi + 1] - vis_base;
   }
 
   // Loop over KV seq length
@@ -256,6 +369,59 @@ template <
     stile_t Stile;
 
     Stile.clear();
+
+    // vpipe: the INT8 product, when the caller supplied one.
+    //
+    // Same loop, same fragment shapes, same accumulation order -- only
+    // the operand type and the accumulator change, and the dequant
+    // scalar replaces the scale multiply the f16 path does below. The
+    // int8 operands are indexed by the ABSOLUTE key block rather than by
+    // an advancing pointer, so the sparse jump above needs no twin.
+    if (qk_int8) {
+      using itile_t = NAXTile<int32_t, TQ, TK>;
+      itile_t Si;
+      Si.clear();
+      const device int8_t* K8t = K8b + (size_t)kb * BK * BD;
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik += 2) {
+          STEEL_PRAGMA_UNROLL
+          for (short id = 0; id < TD; id++) {
+            NAXTile<int8_t, 1, 1> Qt;
+            NAXTile<int8_t, 2, 1> Kt;
+            const int qoff = iq * kU * BD + id * kU;
+            const int koff = ik * kU * BD + id * kU;
+            if (!align_Q && is_last_q) {
+              Qt.load_rows(Q8b + qoff, BD, lim_rows_q - iq * kU);
+            } else {
+              Qt.load(Q8b + qoff, BD);
+            }
+            if (!align_K && is_last_k) {
+              Kt.load_rows(K8t + koff, BD, lim_rows_k - ik * kU);
+            } else {
+              Kt.load(K8t + koff, BD);
+            }
+            itile_t::NAXFrag_t::template mma<int32_t, int8_t, int8_t>(
+                Si.frag_at(iq, ik),
+                Si.frag_at(iq, ik + 1),
+                Qt.frag_at(0, 0),
+                metal::false_type{},
+                Kt.frag_at(0, 0),
+                Kt.frag_at(1, 0),
+                metal::true_type{});
+          }
+        }
+      }
+      // ONE SCALAR for the whole tile: the two block scales and the
+      // softmax's log2 factor, which is what makes per-block
+      // quantization the right granularity for a flash kernel.
+      const float dq = qsc[0] * ksc[kb] * float(scale2);
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+        Stile.elems()[ii] = (AccumType)((float)Si.elems()[ii] * dq);
+      }
+    } else {
 
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
@@ -304,6 +470,7 @@ template <
     for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
       Stile.elems()[ii] *= float(scale2);
     }
+    }   // !qk_int8
 
     // Mask out length sequence
     if (!align_K && is_last_k) {
@@ -404,6 +571,34 @@ template <
                 ok = (kf == 0) || (kf == nf - 1);
               }
               if (!ok) { fg[ii * stile_t::kFragThrCols + jj] = neg_inf; }
+            }
+          }
+        }
+      }
+    }
+
+    // vpipe: the routing's own exclusion, per query block and per key.
+    // Column-only -- every row of this query block obeys the same flag
+    // row -- so the row index never enters it.
+    if (has_block_mask) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+      const device uchar* brow =
+          block_mask + (size_t(tid.y) * size_t(params->NQ) + size_t(tid.x)) *
+                           size_t(params->kL);
+      const int base_col = kb * BK;
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& fg = Stile.frag_at(iq, ik);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+            const int c = base_col + ik * kU + jj + sn;
+            const bool drop = (c >= params->kL) || (brow[c] != 0);
+            if (!drop) { continue; }
+            STEEL_PRAGMA_UNROLL
+            for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+              fg[ii * stile_t::kFragThrCols + jj] = neg_inf;
             }
           }
         }
@@ -564,6 +759,33 @@ template <
     if (!has_spans) {
       K += BK * int(params->K_strides[2]);
       V += BK * int(params->V_strides[2]);
+    }
+  }
+
+  // vpipe: the statistics, BEFORE the normalize consumes them.
+  //
+  // row_reduce leaves every lane of a row holding the same value -- it
+  // finishes with two simd_shuffle_xor steps across exactly the lanes
+  // that share the row -- so one of the four writes. `sn` is the
+  // fragment COLUMN and is 0 for exactly one of them.
+  //
+  // The row is the O tile's own: TQ == 1 here (asserted above), so the
+  // vec index i is the fragment's element row and lands at
+  // sm + i * kFragRowsJump, under the same tid.x * BQ + tm the store
+  // below uses.
+  if (export_ml) {
+    if (sn == 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        const int row =
+            int(tid.x) * BQ + tm + sm + i * otile_t::kFragRowsJump;
+        if (row < params->qL) {
+          const size_t o =
+              (size_t(tid.z) * params->H + size_t(tid.y)) * params->qL + row;
+          ml_max[o] = float(max_score[i]);
+          ml_sum[o] = float(sum_score[i]);
+        }
+      }
     }
   }
 

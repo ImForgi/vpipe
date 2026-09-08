@@ -32,6 +32,9 @@ set(LOCAL_SOURCES
   shared/i8-gemm.cc
   shared/lora-names.cc
   shared/runtime-lora.cc
+  shared/sol-attention.cc
+  shared/metal-sol-attention.cc
+  shared/metal-sage-attention.cc
   shared/wan-vae-names.cc
   shared/wired-pool.cc
   shared/mcp/file-sandbox.cc

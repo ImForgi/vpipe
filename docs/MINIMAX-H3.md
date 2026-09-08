@@ -263,6 +263,8 @@ From the `generate-video` stage:
 | `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
+| `sage_attn` | `false` | An opt-in **lossy** accelerated mode, independent of both `i8_gemm` and `sol_attn` and settable with either — it runs the attention's QK^T product in int8 with a per-block scale, where `sol_attn` decides which blocks are attended at all. 1.20× on the attention at video geometry, at the same cosine the f16 kernel scores. Matrix cores only. See [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk). |
+| `sol_attn` | `false` | Another opt-in **lossy** accelerated mode, and an independent one — it changes how the attention between the GEMMs is computed where `i8_gemm` changes the GEMMs. 1.27× on the wall clock at 124 frames of 832 × 480, with no extra weights; see [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing) for the knobs beside it. |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
 And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
@@ -303,9 +305,12 @@ smallest machine that runs this at all — a **fanless MacBook Air 15-inch
 `steps` is the setting that moves this most, and the Turbo adapter is what
 buys the low count: without it, plan on 8 steps for a draft and 16 for a
 final clip, at roughly proportional cost. What moves the cost of each *step*
-is [the VDN linear branch](#faster-attention--the-vdn-linear-branch), which
-takes the 124-frame Pro run to **4 min 38 s** and saves more the longer the
-clip.
+is one of the two attention settings: [the VDN linear
+branch](#faster-attention--the-vdn-linear-branch), which takes the
+124-frame Pro run to **4 min 38 s** and saves more the longer the clip, or
+[Sol-Attn routing](#faster-attention--sol-attn-routing), which needs no
+extra weights and takes a 124-frame run at 832 × 480 from 3 min 30 s to
+**2 min 44 s**.
 
 **The two columns are not equally solid, and it is worth saying which is
 which.** The M5 Pro column is repeatable: fans, one pinned clock, the same
@@ -1373,6 +1378,167 @@ that is where this setting is worth reaching for.
 > dense baseline; treat that as their claim, not a reproduction. Generate both
 > at a seed you like before committing a long job to it.
 
+### Cheaper attention — SageAttention's int8 QK
+
+The other setting that changes attention, and the one that composes with
+everything else here. [**SageAttention**](https://arxiv.org/abs/2410.02367)
+runs the **QK^T product in int8** — not by dropping keys, but by computing
+every one of them more cheaply. One flag:
+
+```json
+"sage_attn": true
+```
+
+**What it does.** A flash attention's matrix work is two products per key
+block: `QK^T` and `P·V`. Sage quantizes the first pair of operands to int8
+with **one scale per block** — per query block for Q, per key block for K,
+which is exactly the granularity the kernel already tiles at, so
+dequantizing a score tile is a single scalar multiply. `P·V` is left in the
+tensor dtype: `P` is a probability, already well-conditioned, and
+quantizing it would buy the same again for a much worse error.
+
+**The key smoothing is what makes it work, and it is exact.** K is
+quantized as `K − mean(K)` over tokens. A key channel's outlier is not
+variation between tokens but a large bias shared by all of them, and
+subtracting it spends the int8 range on the signal instead of the bias.
+Nothing is added back afterwards: a per-channel shift moves every score in
+a row by the same `⟨q, mean⟩`, and softmax does not see a per-row shift. Q
+is *not* smoothed, and that asymmetry is not an oversight — only the key
+side carries the shared bias, and a shift of Q would move each score by
+`⟨q_shift, k_j⟩`, which varies along the row.
+
+**Measured**, on an M5 at 8 heads × 20036 rows × head_dim 128:
+
+| | one attention |
+|---|---|
+| f16 kernel | **156.6 ms** |
+| int8 QK, prologue included | **130.6 ms** |
+
+**1.20×**, of which the quantization prologue is 2.2 ms — 1.7% of the call.
+The ceiling is 1.33×: int8 is 2.00× on the fragment pipe and QK is half a
+flash kernel's matrix work, so this is most of what was there to take.
+Accuracy is cosine **0.99992** against a double-precision reference, where
+the f16 kernel is *also* 0.99992.
+
+**Matrix cores only.** The int8 fragment MMA is an M5 instruction and there
+is no ALU fallback, so an M4 says so once in the log and runs dense rather
+than refusing — a graph that runs today keeps running everywhere it ran
+before.
+
+**It composes.** `sage_attn`, `sol_attn` and `i8_gemm` are three
+independent choices and none of them reads the others: `i8_gemm` decides
+how a block's GEMMs are computed, `sol_attn` which key blocks are attended
+at all, and `sage_attn` how the attended ones are multiplied.
+`sage_dense_layers` leaves a leading run of blocks in f16; it defaults to
+**0**, unlike
+`sol_dense_layers`' 1, because Sage computes every key and every query and
+there is no published profile that needs a dense prefix.
+
+The same setting is on `generate-image`, where FLUX.2, Krea-2 and
+Qwen-Image-Edit take it.
+
+### Faster attention — Sol-Attn routing
+
+The other way to make a step cheaper, and it needs nothing you do not
+already have. [**Sol-Attn**](https://nvlabs.github.io/Sana/Sol-Attn/) is a
+training-free sparse attention from NVIDIA's Sana project. Unlike the VDN
+branch above it is **not a checkpoint** — there is nothing to download and
+nothing to attach, and nothing about it is partition-specific, where the
+branch is trained for FL2VA's blocks. One flag on `generate-video`:
+
+```json
+"sol_attn": true
+```
+
+**What it does.** Attention is dominated by key blocks that contribute
+almost nothing, and *which* ones those are depends on the clip, the head
+and the layer — so it cannot be decided in advance. Sol decides it while
+the softmax runs, from a proxy it computes anyway. Per block of 64 keys it
+keeps two summaries — the keys' centroid and the values' mean — and per
+query block a threshold. One product against the centroids scores every key
+block at 1/64 of the dense cost. A block above the threshold is attended
+**exactly**; one below is **folded into the same running softmax** as if all
+64 of its keys carried the centroid's score. So nothing is dropped, no
+routing map is ever built, and there is no second pass.
+
+**The threshold is a distribution, not a block count.** `sol_tau` is
+measured in **standard deviations** of that proxy's own spread across
+blocks, which is what lets a single number serve every head, layer,
+resolution and clip length — where "keep the best 20 blocks" could not.
+Higher keeps fewer.
+
+**Two things stay exact whatever `sol_tau` says**, and neither is a tuning
+knob. A band of blocks either side of the query's own frame: the near
+diagonal is exactly where a centroid is a poor stand-in, because
+neighbouring keys are the ones a query is there to tell apart. And the
+prompt and soundtrack rows — H3 packs those into one sequence with the
+video, and a prompt summarised by its centroid is a prompt half-read.
+
+#### What it saves
+
+124 frames at **832 × 480**, 24 fps, 6 steps with the
+[Turbo LoRA](#fewer-steps--the-turbo-lora) and `i8_gemm`, on a **MacBook
+Pro 16-inch (M5 Pro), 24 GB**:
+
+| | 124 frames, 5.2 s |
+|---|---|
+| dense attention | **3 min 30 s** |
+| Sol-Attn, `sol_tau` 1.0 | **2 min 44 s** |
+
+**1.27× on the wall clock, and 1.40× on the denoise itself** — the model
+load, the prompt encode and the VAE decode are the same work either way.
+The run kept **23%** of key blocks exact. That fraction is a property of
+the DATA rather than of `sol_tau` alone, so it is measured rather than
+predicted: the log reports it once per forward, and it is the number to
+watch when tuning.
+
+**It costs no memory.** Everything Sol needs lives for the length of one
+attention call, so vpipe lends it buffers the model is not using over that
+stretch instead of allocating any — **861 MB** at the size above that the
+setting never asks the box for.
+
+#### Against the VDN branch
+
+Both replace the same attention and **only one can be on**; naming both
+turns Sol off for the branch's blocks and says so in the log. They are not
+the same trade:
+
+| | VDN linear branch | Sol-Attn |
+|---|---|---|
+| extra weights | ~5 GB, a second checkpoint | **none** |
+| partitions | FL2VA only — its weights are trained for those blocks | **not partition-specific** |
+| what changes | attention itself — a window plus a linear recurrence | which blocks are attended exactly |
+| how it scales | the window is **linear** in clip length, so its advantage widens without limit | a roughly constant fraction of blocks — near a quarter in the runs measured here |
+
+So the branch is the one to reach for on a long clip at a large size, and
+Sol is the one that costs nothing to try. No head-to-head at a single
+geometry is offered here — the figures in each section are at the size each
+was measured at.
+
+#### The knobs
+
+| key | shipped | notes |
+|---|---|---|
+| `sol_attn` | `false` | Off. It is an approximation, and which clips it is safe on is a judgement about the model rather than about the kernel. |
+| `sol_tau` | `1.0` | In standard deviations. Higher keeps fewer blocks: speed rises and quality falls, monotonically in both. |
+| `sol_key_block` | `64` | **32 or 64 only.** 32 does more exact work, is slower and is more faithful — a centroid over 32 keys stands in for them better, while halving the block doubles both the routing and the summary sequence. Larger blocks were measured and lose on both counts, so they are declined with a warning and a fall back to 64. |
+| `sol_dense_layers` | `1` | Leading blocks left dense. The first block is where the residual stream is least redundant, and it is one of 50. |
+| `sol_local_radius` | `1` | Blocks either side of the query's own kept exact whatever the routing says. |
+
+It composes with the [Turbo LoRA](#fewer-steps--the-turbo-lora) and with
+`i8_gemm`, and the second is worth being precise about, since both are
+lossy: measured in this stack, their errors are **independent** — the pair
+lands at the quadrature sum of the two apart, not at the linear one, and
+switching Sol on does not amplify what `i8_gemm` costs.
+
+> **This is a quality trade as well as a speed one.** What Sol drops is
+> chosen per clip, so its effect is not the same on every prompt, and
+> nothing in this repository compares a routed clip against a dense one for
+> fidelity at full length. Upstream reports quality preserved; treat that as
+> their claim, not a reproduction. Generate both at a seed you like before
+> committing a long job to it, and raise `sol_tau` only against output you
+> have looked at.
+
 ## Memory
 
 **16 GB is the floor, and it works** — but only because the two big models are
@@ -1436,7 +1602,9 @@ encoder warns about it and resamples, and the fix is to set the producing
 - The video VAE is 24-channel at 1/16 resolution; audio decodes through a
   separate VAE to **32 kHz stereo**.
 - On **M5**, the GEMMs and attention run on the GPU's matrix cores
-  (`matmul2d` / NAX flash attention).
+  (`matmul2d` / NAX flash attention) — including both accelerated attention
+  settings, whose exact halves are that same flash kernel walking only the
+  key blocks they keep.
 
 ## References and licences
 
@@ -1468,6 +1636,34 @@ with the licence text in the repo's own `LICENSE`.
             Zhaoyang Lv and Chenfeng Xu and Haiwen Feng},
   year   = {2026},
   url    = {https://openvdn.github.io/}
+}
+```
+
+**Sol-Attn** — the routed attention of
+[Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing)
+— is by Haopeng Li, Yitong Li, Junsong Chen, Tian Ye, Haozhe Liu, Jincheng
+Yu, Duomin Wang, Ruihua Zhang, Zeke Xie, Enze Xie and Song Han, of NVIDIA.
+It ships as part of NVIDIA's **Sana** repository, under that repository's
+**Apache-2.0** licence. It carries no weights of its own, so nothing is
+downloaded for it and nothing is redistributed here — the implementation in
+this tree is written from the published method and sources.
+
+- Project page: <https://nvlabs.github.io/Sana/Sol-Attn/>
+- Paper: <https://arxiv.org/abs/2607.24027>
+- Code: <https://github.com/NVlabs/Sana>
+
+```bibtex
+@misc{li2026solattn,
+  title  = {Sol-Attn: Accelerating Video Generation Inference via
+            On-the-Fly Attention Sparsification},
+  author = {Haopeng Li and Yitong Li and Junsong Chen and Tian Ye and
+            Haozhe Liu and Jincheng Yu and Duomin Wang and Ruihua Zhang and
+            Zeke Xie and Enze Xie and Song Han},
+  year   = {2026},
+  eprint = {2607.24027},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url    = {https://arxiv.org/abs/2607.24027}
 }
 ```
 

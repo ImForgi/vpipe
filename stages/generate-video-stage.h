@@ -10,6 +10,8 @@
 // On non-Apple builds the stage is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/krea2/flow-sampler.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
@@ -234,6 +236,11 @@ public:
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }
   int                latent_frames()   const noexcept;
+  // The RESOLVED Sol-Attn config, after the key-block validation. Test-
+  // only, and the reason it exists: whether a rejected block size falls
+  // back or is silently kept is not visible from config_error(), because
+  // a perf knob spelled wrong warns rather than failing the stage.
+  const genai::sol::Config& sol_config() const noexcept { return _sol; }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -262,6 +269,12 @@ private:
   int           _steps  = 40;
   // LOSSY dynamic-int8 block GEMMs (opt-in; minimax-h3 only)
   bool        _i8_gemm{};
+  // Sol-Attn, family-agnostic beside _i8_gemm; see the config docs.
+  genai::sol::Config _sol{};
+  // SageAttention, family-agnostic beside _sol and _i8_gemm. Carried to
+  // plugin families too (VideoModelCreateArgs::sage), because the
+  // families out of tree run the same flash kernel.
+  genai::sage::Config _sage{};
   std::uint64_t _seed   = 0;
   std::uint64_t _emitted = 0;
 

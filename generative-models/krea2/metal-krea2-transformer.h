@@ -1,6 +1,8 @@
 #ifndef GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 #define GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
@@ -58,6 +60,10 @@ class MetalKrea2Transformer {
     // Accelerated mode (LOSSY, opt-in): dynamic-int8 GEMMs for the big
     // block matmuls (see shared/i8-gemm.h). VPIPE_I8_GEMM overrides.
     bool  i8_gemm         = false;
+    // SageAttention: the QK^T product in int8. Independent of i8_gemm
+    // above -- that one chooses how the block's GEMMs are computed and
+    // this one how the attention between them is.
+    sage::Config sage;
     int   text_head_dim() const { return text_hidden / text_heads; }  // 128
   };
 
@@ -371,6 +377,9 @@ class MetalKrea2Transformer {
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm / VPIPE_I8_GEMM);
   // null when off. Tried first in gemm_mma_ for qualifying shapes.
   std::unique_ptr<I8GemmContext> _i8;
+  // The int8 QK prologue. Null when the box has no matrix cores or the
+  // config did not ask; every use is guarded.
+  std::unique_ptr<MetalSageAttention> _sage;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

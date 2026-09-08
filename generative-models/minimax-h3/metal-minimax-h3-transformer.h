@@ -17,7 +17,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/runtime-lora.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 
 namespace vpipe {
 namespace genai {
@@ -152,6 +156,30 @@ class MetalMiniMaxH3Transformer {
     // hand) at a cost of 4.8% extra int8 MACs, inside its 10% cap.
     // Set from generate-video's `i8_gemm`; VPIPE_I8_GEMM overrides.
     bool i8_gemm = false;
+
+    // Sol-Attn (LOSSY), from generate-video's `sol_attn*` keys. Off by
+    // default. Attention here is dense self-attention over the packed
+    // sequence, which is exactly the shape the method approximates; the
+    // KV SINK is set from the layout rather than from config, because
+    // the prompt and the soundtrack sit in that sequence and a prompt
+    // read through a block centroid is a prompt half-read.
+    //
+    // MUTUALLY EXCLUSIVE WITH THE VDN LINEAR BRANCH, and not as a
+    // policy: VDN replaces attention with a windowed softmax whose
+    // complement a linear recurrence carries, so approximating the
+    // softmax half would leave the two halves describing different key
+    // sets and the partition -- the whole invariant of that design --
+    // would stop holding.
+    //
+    // INDEPENDENT OF `i8_gemm` above, and settable with it. The two act
+    // on different halves of a block: i8_gemm on the GEMMs, this on the
+    // attention between them. Neither reads the other's state.
+    sol::Config sol;
+    // SageAttention. Independent of `sol` beside it and of `i8_gemm`:
+    // Sol decides which key blocks are attended, Sage how the ones that
+    // are get computed, and i8_gemm how the GEMMs around them do. None
+    // of the three reads the others.
+    sage::Config sage;
 
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
@@ -709,6 +737,38 @@ class MetalMiniMaxH3Transformer {
                                 int grid_h, int grid_w, int n_text,
                                 std::size_t* arena_floor = nullptr) const;
 
+  // What SOL-ATTN will also want at this sequence length, or 0 when it
+  // is off. The same shape of question as vdn_scratch_bytes above and
+  // for the same reason: it is a second allocation, spent at the first
+  // routed block and therefore after every planning decision.
+  //
+  // MOST OF IT IS NOT AN ALLOCATION AT ALL. Sol's scratch lives for one
+  // call, and with it on the fused qkv projection and the arena's last
+  // attention window are both dead for exactly that stretch -- so what
+  // this returns is what is LEFT after that loan, which at production
+  // geometry is a few hundred bytes against 861 MB unlent. It is the
+  // real carve and not a subtraction; see
+  // MetalSolAttention::private_bytes.
+  std::size_t sol_scratch_bytes(int seq) const;
+
+  // How many times the activation scratch has been ALLOCATED.
+  //
+  // One per geometry is right; more than one within a denoise is the
+  // bug this counts: the set is built in full before the old one is
+  // dropped, so a rebuild peaks at both at once -- 13 GB twice at video
+  // geometry. See kTimestepSlots.
+  // Timestep slots the activation scratch is SIZED for, whatever a
+  // single forward presents. `n_t` moves within a denoise (1 on the
+  // first step, 2 once the video and audio schedules diverge) and three
+  // small buffers depend on it, so keying the scratch on the exact
+  // value rebuilt every activation buffer in the model to grow a few
+  // hundred KB. Must not exceed GenerateVideoStage's
+  // kTimestepsUpperBound, which is what the preflight sizes the box
+  // against.
+  static constexpr int kTimestepSlots = 4;
+
+  int scratch_rebuilds() const { return _scratch_rebuilds; }
+
   // Which kernel one block projection dispatches on.
   //
   // The steel arms are affine_qmm_steel tile heights, and run everywhere.
@@ -1064,9 +1124,11 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
   };
+
   bool ensure_scratch_(int seq, int n_text, int n_t,
                        std::size_t arena_floor);
   Scratch _s;
+  int     _scratch_rebuilds = 0;
 
   // ---- VDN-H3's hybrid attention -------------------------------------
   //
@@ -1125,6 +1187,11 @@ class MetalMiniMaxH3Transformer {
   // this a later forward would reuse a 64x32 pipeline while addressing
   // it as 32x16.
   int _attn_nax_built = -1;
+  // Whether the cached pair was built for Sage. A THIRD tag beside the
+  // sequence and the kernel, because turning Sage on changes the
+  // function and nothing else about the geometry does -- so without it
+  // an A/B in one process would measure the first arm twice.
+  int _attn_sage_built = -1;
   int _vdn_frames = 0, _vdn_tpf = 0, _vdn_vstart = 0, _vdn_seq = 0;
   // A window wide enough to reach every frame IS the original attention,
   // and then the linear half must NOT run: it carries the window's
@@ -1415,6 +1482,13 @@ class MetalMiniMaxH3Transformer {
   // AND available; the DiT runs bf16, so it holds the bf16 i8 kernels --
   // the f16 ones would misread these buffers into NaN.
   std::unique_ptr<I8GemmContext> _i8;
+  // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
+  // the kernels validated; see the attention dispatch.
+  std::unique_ptr<MetalSolAttention> _sol;
+  // The int8 QK prologue and its operands. Null when the box has no
+  // matrix cores or the config did not ask -- and every use is guarded,
+  // because a box without them runs the same forward densely.
+  std::unique_ptr<MetalSageAttention> _sage;
   // Deep-K split for fc2 (K = ffn = 14336). Its own gate|up direction runs
   // ~11 TFLOP/s where the single-op reduction over ffn manages ~5.3, and the
   // chooser closes that; see mma-splitk.h. Self-gates on K, on rows, and on
@@ -1438,6 +1512,10 @@ class MetalMiniMaxH3Transformer {
   metal_compute::SharedBuffer    _nan_report;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
+  // The int8-QK twin of _fn_attn_main. Two instantiations rather than
+  // one, because `sage.dense_layers` leaves the leading blocks on the
+  // f16 kernel and the two must coexist within one forward.
+  metal_compute::ComputeFunction _fn_attn_main_i8;
   // Rows the GEMM tuner measures at, and therefore the row count a tuned
   // answer is filed under -- see tune_row_key(). Fixed at load from
   // VPIPE_H3_TUNE_ROWS.

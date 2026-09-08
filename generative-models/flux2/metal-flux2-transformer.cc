@@ -1070,6 +1070,12 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
+  {
+    bool sage_fatal = false;
+    m->_sage = MetalSageAttention::load_for_model(
+        mc, /*bf16=*/true, cfg.sage, "MetalFlux2Transformer", &sage_fatal);
+    if (sage_fatal) { return nullptr; }
+  }
   // Fuse the SwiGLU FF (default on, EXCEPT on the matmul2d path): needs the
   // dense swiglu twin, and -- for a quantized DiT -- the g64 qmm swiglu twins.
   // The weight dequant is F16 (the f16 metallib's native-half path).
@@ -2383,10 +2389,11 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     p->O_strides[0] = p->Q_strides[0];
     p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = HD;
   };
-  auto attn_fn = [&](int qL, int kL) {
+  auto attn_fn = [&](int qL, int kL, bool i8) {
     metal_compute::FunctionConstants fc;
     fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
-        .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(sage::kQkInt8Constant, i8);
     return nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
   };
@@ -2394,20 +2401,41 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // both dispatches are encoded into one stream, so a single mutable buffer
   // would hand the second group's shape to the first at execution time.
   const bool split_attn = kv_recipe && QA < seq;
-  metal_compute::ComputeFunction fn_attn, fn_attn_ref;
+  metal_compute::ComputeFunction fn_attn, fn_attn_ref, fn_attn_i8;
   SharedBuffer attn_params_ref;
   bool use_steel = _steel_attn_ok && !_attn_params.empty();
   if (use_steel) {
     fill_params(_attn_params, QA, KL);
-    fn_attn = attn_fn(QA, KL);
+    fn_attn = attn_fn(QA, KL, false);
     use_steel = fn_attn.valid();
   }
   if (use_steel && split_attn) {
     attn_params_ref = _mc->make_shared_buffer(sizeof(SteelAttnParams));
     if (attn_params_ref.empty()) { return {}; }
     fill_params(attn_params_ref, IS_REF, IS_REF);
-    fn_attn_ref = attn_fn(IS_REF, IS_REF);
+    fn_attn_ref = attn_fn(IS_REF, IS_REF, false);
     use_steel = fn_attn_ref.valid();
+  }
+  // SAGE, on the matrix-core entry and on the UNDIVIDED attention only.
+  //
+  // The klein_kv recipe splits one attention into two dispatches over
+  // different query bands, and the two have different sequence lengths --
+  // so a single prologue cannot serve both, and alternating between the
+  // two geometries would rebuild the int8 scratch twice per block. The
+  // honest answer for that recipe is dense, said once at load rather
+  // than implied by a number that failed to move.
+  const bool sage_on = use_steel && nax && !split_attn && (bool)_sage &&
+                       _cfg.sage.enabled &&
+                       _cfg.sage.dense_layers < n_blocks;
+  if (sage_on) {
+    fn_attn_i8 = attn_fn(QA, KL, true);
+  }
+  if ((bool)_sage && _cfg.sage.enabled && split_attn &&
+      _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalFlux2Transformer: sage_attn is off for this generation -- the "
+        "klein_kv reference recipe splits the attention into two query "
+        "bands of different lengths"));
   }
   // The recipe's masking IS the pair of grouped dispatches; the scalar
   // fallback has no way to express it, and quietly running one undivided
@@ -2465,15 +2493,31 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // RMSNorm'd). head-major transpose -> rope -> flash attn -> transpose the
   // result into `out` (row stride out_rs; out_rs > 0 writes a sub-view, e.g.
   // att -> scat[:, :H]).
-  auto attention = [&](auto& op, const SharedBuffer& out, int out_rs) {
+  auto attention = [&](auto& op, const SharedBuffer& out, int out_rs,
+                       int layer) {
     op.tr_rope(jq, qt, seq, HED, HD);   // fused transpose + rope (q)
     op.tr_rope(jk, kt, KL, HED, HD);    // fused transpose + rope (k)
     op.tr(jv, 0, vt, 0, KL, HED, HD);   // v: transpose only (no rope)
     if (use_steel) {
+      // SAGE: quantize q/k for THIS block, into the same encoder and
+      // immediately before the dispatch that reads them. The encoder is
+      // serial, so the ordering is the encoder's and there is no barrier
+      // to get wrong. qt/kt are the head-major transposes just written
+      // above, which is also what the attention params describe.
+      bool i8_ok = false;
+      if (sage_on && layer >= _cfg.sage.dense_layers &&
+          fn_attn_i8.valid()) {
+        const MetalSageAttention::Operand qo{&qt, 0, HD, seq * HD};
+        const MetalSageAttention::Operand ko{&kt, 0, HD, KL * HD};
+        std::string gerr;
+        i8_ok = _sage->prepare(*op.e, qo, ko, HED, KVH, QA, KL, HD, A_BQ,
+                               A_BK, _cfg.sage, &gerr);
+      }
       // Group A: text + generated queries over every key.
-      op.e->set_function(fn_attn);
+      op.e->set_function(i8_ok ? fn_attn_i8 : fn_attn);
       op.e->set_buffer(0, qt); op.e->set_buffer(1, kt); op.e->set_buffer(2, vt);
       op.e->set_buffer(3, atb); op.e->set_buffer(4, _attn_params);
+      if (i8_ok) { _sage->bind(*op.e); }
       op.e->dispatch({32 * a_nqb, 4 * (unsigned)HED, 1}, {32, 4, 1});
       if (split_attn) {
         // Group B: reference queries over reference keys ONLY. Same buffers
@@ -2713,7 +2757,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.copy_rows(kv->v[(std::size_t)L], 0, jv, (std::size_t)seq * H,
                      IS_REF_ALL, H);
       }
-      attention(op, att, 0);                               // -> att (contiguous)
+      attention(op, att, 0, L);                       // -> att (contiguous)
       op.tap("dbl_attn_txt", L, att, 0, TS, H);            // to_add_out input
       op.gemm(att, b.ao, ob, 0, TS, H, H, 0,               // text att[0:TS]
               dl(&DoubleLora::ao));
@@ -2909,9 +2953,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op = make_ops(enc); mk = tnow();
     }
     if (ff_direct) {
-      attention(op, scat, H + SMLP);   // att -> scat[:, :H] (mlp already in [H:])
+      attention(op, scat, H + SMLP, L);  // att -> scat[:, :H] (mlp in [H:])
     } else {
-      attention(op, att, 0);           // att -> att, concat below
+      attention(op, att, 0, L);         // att -> att, concat below
     }
     if (prof) {
       enc.end(); stream.commit().wait(); t_sgl_attn += ms_since(mk);
