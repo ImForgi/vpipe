@@ -48,8 +48,21 @@ using namespace metal;
 // directly; the threshold statistics that need fp32 are separate and
 // small.
 //
+// WHICH SUMMARIES THIS CALL PRODUCES, as a bit mask: 1 q, 2 k, 4 v. The
+// caller wants two different block sizes -- q at the exact half's query
+// block and k/v at the routing block -- so it runs this twice, and
+// without the mask the second call bound q three times and summarised
+// it three times into the same destination. That was two thirds of the
+// pass's bandwidth for nothing.
+//
+// AND IT IS ALSO WHAT KEEPS THE q PASS IN BOUNDS. `N` is one count for
+// all three destinations, so a k/v call with N = nk was writing nk
+// query centroids into a buffer holding nq -- harmless while nq >= nk,
+// which is every geometry the ALU kernel routes, and a 2x overrun on the
+// matrix-core one at key block 32, where the query block is 64.
+//
 //   0:q 1:k 2:v (VPIPE_ELT [H,T,D])  3:qc 4:kc 5:vc (VPIPE_ELT [H,N,D])
-//   6:T 7:D 8:N 9:BLK (int)
+//   6:T 7:D 8:N 9:BLK 10:which (int)
 // grid (D, H, N) THREADS; threadgroup (D,1,1).
 kernel void sol_summaries_mma(
     const device VPIPE_ELT* q  [[buffer(0)]],
@@ -62,6 +75,7 @@ kernel void sol_summaries_mma(
     constant int&           D  [[buffer(7)]],
     constant int&           N  [[buffer(8)]],
     constant int&           BLK [[buffer(9)]],
+    constant int&           which [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  d   [[thread_index_in_threadgroup]])
 {
@@ -70,20 +84,28 @@ kernel void sol_summaries_mma(
   const int t0 = b * BLK;
   if ((int)d >= D || t0 >= T) { return; }
   const int len = min(BLK, T - t0);
-  const device VPIPE_ELT* qh = q + ((uint)h * T + t0) * D;
-  const device VPIPE_ELT* kh = k + ((uint)h * T + t0) * D;
-  const device VPIPE_ELT* vh = v + ((uint)h * T + t0) * D;
-  float qs = 0.0f, ks = 0.0f, vs = 0.0f;
-  for (int t = 0; t < len; ++t) {
-    qs += float(qh[(uint)t * D + d]);
-    ks += float(kh[(uint)t * D + d]);
-    vs += float(vh[(uint)t * D + d]);
-  }
   const uint o = ((uint)h * N + b) * D + d;
   const float inv = 1.0f / float(len);
-  qc[o] = VPIPE_ELT(qs * inv);
-  kc[o] = VPIPE_ELT(ks * inv);
-  vc[o] = VPIPE_ELT(vs * inv);
+  // One loop per destination rather than one loop over three, so the
+  // mask is tested once and an unwanted tensor is never read.
+  if ((which & 1) != 0) {
+    const device VPIPE_ELT* qh = q + ((uint)h * T + t0) * D;
+    float s = 0.0f;
+    for (int t = 0; t < len; ++t) { s += float(qh[(uint)t * D + d]); }
+    qc[o] = VPIPE_ELT(s * inv);
+  }
+  if ((which & 2) != 0) {
+    const device VPIPE_ELT* kh = k + ((uint)h * T + t0) * D;
+    float s = 0.0f;
+    for (int t = 0; t < len; ++t) { s += float(kh[(uint)t * D + d]); }
+    kc[o] = VPIPE_ELT(s * inv);
+  }
+  if ((which & 4) != 0) {
+    const device VPIPE_ELT* vh = v + ((uint)h * T + t0) * D;
+    float s = 0.0f;
+    for (int t = 0; t < len; ++t) { s += float(vh[(uint)t * D + d]); }
+    vc[o] = VPIPE_ELT(s * inv);
+  }
 }
 
 //   0:kc (VPIPE_ELT [H,N,D]) 1:mean 2:var (float [H,D]) 3:D 4:N (int)
@@ -187,12 +209,32 @@ kernel void sol_route_mma(
   // block sits in, which is where the two granularities meet.
   const int qk = (qb * BQ) / BLK;
   device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
+  // THE QUERY CENTROID IS LOOP-INVARIANT and was being re-read from
+  // device memory once per key block -- the same four elements, NK
+  // times, for a kernel whose inner loop is four multiplies. Hoisted
+  // into registers, which needs the trip count to be a constant, so it
+  // is the head_dim-128 case that gets it and the general loop stays
+  // for anything else. The index set is unchanged ({lane, lane+32, ...}
+  // in that order), so the two arms sum in the same order and route
+  // identically.
+  constexpr int NPT = SOL_D / 32;
+  const bool fast = (D == SOL_D);
+  float qv[NPT];
+  if (fast) {
+    for (int c = 0; c < NPT; ++c) { qv[c] = float(qbar[c * 32 + (int)lane]); }
+  }
   uint n_keep = 0;
   for (int n = 0; n < NK; ++n) {
     const device VPIPE_ELT* kr = kc + ((uint)h * NK + n) * D;
     float dot = 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
-      dot += float(qbar[i]) * float(kr[i]);
+    if (fast) {
+      for (int c = 0; c < NPT; ++c) {
+        dot += qv[c] * float(kr[c * 32 + (int)lane]);
+      }
+    } else {
+      for (int i = (int)lane; i < D; i += 32) {
+        dot += float(qbar[i]) * float(kr[i]);
+      }
     }
     dot = simd_sum(dot) * ls;
     const bool tail  = (n == NK - 1);   // see the file header
@@ -309,17 +351,30 @@ kernel void sol_route_p_mma(
   }
 }
 
-// The prefix sum, per head, into steel's [H][NQ + 1] qb_off.
+// The prefix sum, into steel's [H][NQ + 1] qb_off.
+//
+// ONE RUNNING TOTAL ACROSS HEADS, not one per head: qb_blocks is a
+// single flat array, so head h's list starts where head h - 1's ended
+// and qb_off[h][NQ] is by construction qb_off[h + 1][0].
+//
+// THREE STEPS IN ONE THREADGROUP, because a prefix sum wants a global
+// barrier and a dispatch has none. Each thread sums a contiguous chunk;
+// the chunk totals are scanned; each thread walks its chunk again from
+// its own base. That is two passes over H * NQ counts at 256-way
+// parallelism instead of one pass at 1-way -- which at 56 heads x 627
+// query blocks was 35 thousand dependent adds on a single GPU thread,
+// and measured 2.1 ms for 140 KB of arithmetic.
 //
 //   0:kept (uint [H,NQ]) 1:qb_off (int [H*(NQ+1)])
 //   2:NQ 3:H 4:per (int, unused -- kept is already in steel blocks)
-// grid (1, 1, 1) THREADS; threadgroup (1,1,1) -- one thread, H*NQ adds.
+// grid (256, 1, 1) THREADS; threadgroup (256,1,1).
 kernel void sol_scan_mma(
     const device uint* kept    [[buffer(0)]],
     device int*        qb_off  [[buffer(1)]],
     constant int&      NQ      [[buffer(2)]],
     constant int&      H       [[buffer(3)]],
-    constant int&      per     [[buffer(4)]])
+    constant int&      per     [[buffer(4)]],
+    uint t [[thread_index_in_threadgroup]])
 {
   // Bound and unread: `kept` already counts steel blocks, so the factor
   // has no use here. The SLOT stays because the emit kernel beside it
@@ -327,17 +382,50 @@ kernel void sol_scan_mma(
   // remember which of the two skips it is a caller that will get it
   // wrong.
   (void)per;
-  int acc = 0;
-  for (int h = 0; h < H; ++h) {
-    for (int q = 0; q < NQ; ++q) {
-      qb_off[h * (NQ + 1) + q] = acc;
-      // `kept` is already in STEEL blocks, so no per factor here.
-      acc += (int)kept[h * NQ + q];
+  constexpr int NT = 256;
+  threadgroup uint part[NT];
+  const int M = H * NQ;
+  const int chunk = (M + NT - 1) / NT;
+  const int lo = min((int)t * chunk, M);
+  const int hi = min(lo + chunk, M);
+
+  uint s = 0;
+  for (int i = lo; i < hi; ++i) { s += kept[i]; }
+  part[t] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // 256 dependent adds by one thread, against 35 thousand. A tree would
+  // save 248 of them and cost two more barriers.
+  if (t == 0) {
+    uint acc = 0;
+    for (int i = 0; i < NT; ++i) {
+      const uint c = part[i];
+      part[i] = acc;
+      acc += c;
     }
-    qb_off[h * (NQ + 1) + NQ] = acc;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint acc = part[t];
+  for (int i = lo; i < hi; ++i) {
+    const int h = i / NQ, q = i - h * NQ;
+    qb_off[h * (NQ + 1) + q] = (int)acc;
+    // A head's terminator is the next head's first start, written by
+    // whoever writes that start -- so it lands exactly once even when a
+    // chunk boundary falls inside a head.
+    if (q == 0 && h > 0) { qb_off[(h - 1) * (NQ + 1) + NQ] = (int)acc; }
+    acc += kept[i];
+  }
+  // ...and the LAST head has no successor to write its terminator, so
+  // the thread holding the end of the array writes it.
+  if (hi == M && M > 0) { qb_off[(H - 1) * (NQ + 1) + NQ] = (int)acc; }
 }
 
+// ALL 32 LANES, which is what a compaction wants and what the shape of
+// the problem allows: the destination of a kept block is its own count
+// plus the counts of every kept block before it, and that is a simd
+// prefix sum. Written one lane at a time it was 31 idle lanes and NK
+// single-byte dependent loads per query block.
+//
 //   0:flags (uchar [H,NQ,NK]) 1:qb_off (int) 2:qb_blocks (int)
 //   3:NQ 4:NK 5:per (int)
 // grid (32, H, NQ) THREADS; threadgroup (32,1,1).
@@ -352,19 +440,27 @@ kernel void sol_emit_mma(
     uint3 tid  [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
-  if (lane != 0) { return; }
   const int h  = (int)tid.y;
   const int qb = (int)tid.z;
   const device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
   int w = qb_off[h * (NQ + 1) + qb];
   // ASCENDING and duplicate-free: steel's loaders only ever move
   // forward, so a repeat would read the wrong bytes for the rest of the
-  // row rather than merely double-counting.
-  for (int n = 0; n < NK; ++n) {
-    if (fl[n] == (uchar)0) { continue; }
-    const int lo = n * per;
-    const int hi = min(lo + per, NKS);   // see sol_route_mma
-    for (int j = lo; j < hi; ++j) { qb_blk[w++] = j; }
+  // row rather than merely double-counting. The prefix sum preserves
+  // that -- lane order is key-block order, and a lane's own blocks are
+  // written in order behind it.
+  for (int n0 = 0; n0 < NK; n0 += 32) {
+    const int n = n0 + (int)lane;
+    int lo = 0, hi = 0;
+    if (n < NK && fl[n] != (uchar)0) {
+      lo = n * per;
+      hi = min(lo + per, NKS);          // see sol_route_mma
+    }
+    const uint cnt = (uint)max(0, hi - lo);
+    const uint off = simd_prefix_exclusive_sum(cnt);
+    int o = w + (int)off;
+    for (int j = lo; j < hi; ++j) { qb_blk[o++] = j; }
+    w += (int)simd_sum(cnt);
   }
 }
 

@@ -25,7 +25,8 @@
 //   attn_steel[_nax] (has_block_mask + export_ml)   the approximate half
 //   attn_steel[_nax] (has_spans + export_ml)        the exact half
 //   sol_merge_ml_mma        the two partial softmaxes into one output
-//     (or sol_merge_mma, beside sol_approx_mma on the ALU arm)
+//     (or sol_merge_mma, beside sol_approx_mma, under
+//      VPIPE_SOL_NO_MASKED_APPROX)
 //
 // WHICH FLASH KERNEL DECIDES THE TILES, and they are not the same: the
 // ALU steel entry routes at a 32-row query block and walks a CSR in
@@ -54,6 +55,21 @@
 // both halves there it is 64 again -- which is also the more accurate
 // block, so the fast choice and the faithful one are the same one.
 //
+// THE ALU ROW ABOVE PREDATES THE MASK REACHING THE ALU KERNEL, and its
+// approximate half was still sol_approx_mma. MEASURED again on an M4
+// Pro, same 56 heads x 20036 rows x 128 against the same kernel dense:
+//
+//   block    dense       sol    speedup     was
+//      32   1727 ms   376 ms    4.59x    2.88x
+//      64   1729 ms   372 ms    4.65x    3.63x
+//     128   1728 ms   448 ms    3.85x    3.44x
+//     256   1756 ms   670 ms    2.62x    2.54x
+//
+// AND THE KNEE IS GONE AT THE TOP. 32 and 64 are within 1% of each
+// other now that the approximate half is no longer the term that grows
+// when the block shrinks -- so on this hardware the FAITHFUL block is
+// free, where it used to cost 26%. The rest of the ordering stands.
+//
 // AND IT ALLOCATES ALMOST NOTHING. Every buffer here lives for ONE
 // call -- summaries, routing, CSR and both partial softmaxes are all
 // consumed by the merge that ends it -- so it takes memory the caller
@@ -75,6 +91,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 
 #include <memory>
@@ -174,6 +191,65 @@ class MetalSolAttention {
   void set_arena(const metal_compute::SharedBuffer& a,
                  const metal_compute::SharedBuffer& b);
 
+  // SAGE ON THE EXACT HALF, which is the one that composes.
+  //
+  // The two are orthogonal by construction: Sol decides WHICH key blocks
+  // are attended and Sage how the ones that are get multiplied. The
+  // exact half reads the full q/k -- the same tensors a caller's own
+  // prologue quantizes -- so it takes the int8 QK with no change to the
+  // kernel at all: the int8 operands there are indexed by the ABSOLUTE
+  // key block out of `qb_blocks`, not by the advancing pointer the f16
+  // path walks, so the sparse jump needs no twin. That was true before
+  // anything composed them and is why this is a host-side change only.
+  //
+  // The APPROXIMATE half is deliberately left alone. It attends the
+  // block SUMMARIES, not the keys -- a 1/64-scale product against a
+  // tensor this object built itself -- so quantizing it would need a
+  // second prologue over `kc` to save a fraction of a fraction.
+  //
+  // The caller runs the prologue and passes the driver here BEFORE
+  // encode(); `nullptr` (the default) is the f16 exact half. Borrowed
+  // for the length of the call, and only honoured on the matrix-core
+  // arm, where the int8 fragment MMA exists.
+  void set_sage(const MetalSageAttention* sage);
+
+  // THE SAGE CONFIG THAT COMPOSES, and it is not the one a caller would
+  // pass on its own.
+  //
+  // Sage quantizes K as K - mean(K), which is EXACT under a softmax
+  // because a per-channel shift moves every score in a ROW by the same
+  // <q, mean> and softmax does not see a per-row constant. That argument
+  // needs the whole row to be inside ONE softmax. Sol's is not: the row
+  // is split between the exact half and the approximate one, the
+  // approximate half scores against centroids built from the UNSHIFTED
+  // keys, and the merge combines two separately normalised partial
+  // softmaxes. The shift then does not cancel -- it displaces one half
+  // against the other by exp(<q_i, mean>), per row and unbounded.
+  //
+  // MEASURED in the H3 stack against a dense reference: Sol alone
+  // 0.0190, Sage alone 0.0049, composed WITH the smoothing 0.0376 --
+  // twice Sol's own error, from a term that should have cancelled -- and
+  // composed without it 0.0198. Over 50 layers at video geometry that is
+  // the difference between a clip and noise.
+  //
+  // So a composing caller quantizes K RAW, and pays the int8 range the
+  // smoothing was buying (MEASURED elsewhere: cosine 0.9985 against
+  // 0.9999 on deliberately biased keys). Recovering it means shifting
+  // Sol's own centroids by the same mean so both halves speak one logit
+  // space -- routing is invariant under that, since a uniform shift
+  // moves the proxy distribution and its threshold together -- and that
+  // is the better fix and a larger one.
+  static sage::Config compose(sage::Config in)
+  {
+    in.smooth_k = false;
+    return in;
+  }
+
+  // Whether the last encode() actually ran the exact half in int8 -- so
+  // a caller reports what happened rather than what it asked for, and an
+  // A/B cannot measure the same arm twice.
+  bool sage_engaged() const noexcept { return _sage_on; }
+
   // What this object allocates for itself however much is lent: the
   // AttnParams pair, the span params and their bounds, and the routing
   // counter. All host-written or host-read, so none of them can live in
@@ -229,7 +305,26 @@ class MetalSolAttention {
   // exact half moved to the matrix cores, being the last piece still
   // running on plain simdgroup matrices at 1/64 of the work but nothing
   // like 1/64 of the time.
-  metal_compute::ComputeFunction _fn_approx_nax;
+  //
+  // AND THE SAME IS TRUE WITHOUT MATRIX CORES, which is why the mask is
+  // now in both flash kernels rather than only the matrix-core one.
+  // MEASURED on an M4 Pro, 56 heads x 20036 rows x 128, the pass timed
+  // alone: 123.3 ms on sol_approx_mma against a dense-scaled ideal of
+  // ~27, and the same half on attn_steel with the flag mask.
+  metal_compute::ComputeFunction _fn_approx_masked;
+  // The exact half's int8 twin, and the driver that fills its operands.
+  // The pointer is BORROWED -- the caller owns the driver and has
+  // already run its prologue into the same encoder.
+  const MetalSageAttention*     _sage = nullptr;
+  bool                          _sage_on = false;
+  // Whether the cached exact function was built for the int8 QK. A tag
+  // beside the sequence and the summary length, because turning Sage on
+  // changes the function and nothing else about the geometry does.
+  int                           _steel_sage = -1;
+  // Whether the approximate half takes that kernel. True unless
+  // VPIPE_SOL_NO_MASKED_APPROX asks for the simdgroup one, which is the
+  // A/B and the reason sol_approx_mma is still here.
+  bool _masked = true;
   // The routing proxy as one batched GEMM, and the routing kernel that
   // reads it. The fused sol_route_mma stays for the ALU arm: it is the
   // reference the two are checked against, and on a GPU with no matrix

@@ -80,6 +80,15 @@ MetalSolAttention::load(MetalCompute* mc, bool bf16, std::string* err)
   // READ PER LOAD, not once per process: a static would latch whichever
   // arm ran first, and the two are compared inside one test binary.
   // load() happens once per model, so there is nothing to save.
+  //
+  // AND THE APPROXIMATE HALF GOES TO THE FLASH KERNEL ON BOTH ARMS.
+  // That half is an attention over the summary sequence with the
+  // routing's flags as a per-(query block, key) mask, and there is
+  // nothing matrix-core about saying so -- the mask is in the SHARED
+  // steel header, so the ALU kernel carries it too.
+  // VPIPE_SOL_NO_MASKED_APPROX keeps sol_approx_mma, which is what the
+  // two are compared against.
+  s->_masked = std::getenv("VPIPE_SOL_NO_MASKED_APPROX") == nullptr;
   const bool no_nax = std::getenv("VPIPE_SOL_NO_NAX") != nullptr;
   if (mc->supports_matrix_cores() && !no_nax) {
     s->_lib_nax = mc->load_library("attn_steel_nax");
@@ -160,11 +169,18 @@ sol_scratch_plan_(std::size_t H, std::size_t T, std::size_t D,
   // kernel per query block per head, because nothing bounds what the
   // routing keeps until it has run.
   out->push_back(H * nq * (T / bk + 1) * 4);         // qb_blk
-  if (!nax) { out->push_back(H * tp * D * 4); }      // o_a, the ALU arm's
   out->push_back(H * T * 4);                         // m_a
   out->push_back(H * T * 4);                         // l_a
   out->push_back(H * T * D * 2);                     // o_e
-  if (nax) { out->push_back(H * T * D * 2); }        // o_an
+  // The approximate half's output, which BOTH arms now take from the
+  // flash kernel: the tensor dtype and no padded tail. The fp32
+  // [H, TPAD, D] one sol_approx_mma wants is twice this and is
+  // allocated only under VPIPE_SOL_NO_MASKED_APPROX -- a bench arm, so
+  // the estimate describes the DEFAULT and says so, rather than
+  // carrying an env read into a static. `tp` is what that buffer would
+  // have been sized by, and is why the parameter is still here.
+  out->push_back(H * T * D * 2);                     // o_an
+  (void)tp;
   out->push_back(H * T * 4);                         // m_e
   out->push_back(H * T * 4);                         // l_e
 }
@@ -287,6 +303,17 @@ MetalSolAttention::pinned_bytes()
 }
 
 void
+MetalSolAttention::set_sage(const MetalSageAttention* sage)
+{
+  // MATRIX CORES ONLY, and silently so is not an option: a caller that
+  // asked for both and got the f16 exact half would report a Sage run.
+  // The ALU steel kernel has no int8 branch -- there is no fragment MMA
+  // under it to buy -- so the honest answer on that arm is `false`, and
+  // sage_engaged() is what the caller reports instead of its own config.
+  _sage = (sage != nullptr && _nax) ? sage : nullptr;
+}
+
+void
 MetalSolAttention::set_arena(const SharedBuffer& a, const SharedBuffer& b)
 {
   const bool same = a.contents() == _arena_a.contents() &&
@@ -394,18 +421,18 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   _qb_off = mk(H * (std::size_t)(nq + 1) * 4);
   _qb_blk = mk(H * (std::size_t)nq *
                (std::size_t)(tokens / _bk + 1) * 4);
-  // THE fp32 [H, TPAD, D] APPROXIMATE OUTPUT IS THE ALU ARM'S ALONE.
-  // The matrix-core arm's approximate half is the flash kernel, which
-  // stores normalised and in the tensor dtype into `_o_an` -- half the
-  // bytes and no padded tail -- and never touches this. Allocating it
-  // anyway cost 427 MB of the 861 MB Sol held at 56 heads x 14861 rows,
-  // for a buffer nothing on that path reads.
-  if (!_nax) { _o_a = mk(H * (std::size_t)_tpad * D * 4); }
-  else       { _o_a = SharedBuffer{}; }
+  // THE fp32 [H, TPAD, D] APPROXIMATE OUTPUT IS sol_approx_mma'S ALONE.
+  // The flash approximate half -- which is both arms now -- stores
+  // normalised and in the tensor dtype into `_o_an`, half the bytes and
+  // no padded tail, and never touches this. Allocating it anyway cost
+  // 427 MB of the 861 MB Sol held at 56 heads x 14861 rows, for a
+  // buffer nothing on that path reads.
+  if (!_masked) { _o_a = mk(H * (std::size_t)_tpad * D * 4); }
+  else          { _o_a = SharedBuffer{}; }
   _m_a = mk(H * (std::size_t)tokens * 4);
   _l_a = mk(H * (std::size_t)tokens * 4);
   _o_e = mk(H * (std::size_t)tokens * D * 2);
-  if (_nax) {
+  if (_masked) {
     // The flash approximate half stores in the tensor dtype and needs no
     // padded tail, so it is HALF the bytes of the fp32 [H, TPAD, D] the
     // simdgroup kernel wants.
@@ -446,7 +473,7 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   // The approximate half's output is ONE of the two, never both: which
   // one is the arm's, so checking the wrong one refuses a scratch that
   // is complete.
-  const bool approx_out_ok = _nax ? !_o_an.empty() : !_o_a.empty();
+  const bool approx_out_ok = _masked ? !_o_an.empty() : !_o_a.empty();
   if (_qc.empty() || _kc.empty() || _vc.empty() || _flags.empty() ||
       _qb_blk.empty() || !approx_out_ok || _o_e.empty() ||
       _params.empty() || _sp_params.empty()) {
@@ -469,7 +496,7 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   for (int i = 0; i < 3; ++i) {
     p->Qs[i] = hm[i]; p->Ks[i] = hm[i]; p->Vs[i] = hm[i]; p->Os[i] = hm[i];
   }
-  if (_nax) {
+  if (_masked) {
     // The APPROXIMATE half's geometry: the same queries against the
     // SUMMARY sequence, so qL is the rows and kL is the block count.
     // `NQ` is what the block mask divides by -- it is the routing's
@@ -527,9 +554,11 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   if (_mc->session() != nullptr) {
     _mc->session()->log_normal(fmt(
         "MetalSolAttention: scratch (re)allocated for {} heads x {} rows, "
-        "block {} -> nq {} nk {}, {} MB; exact half on {} (bq {} bk {})",
+        "block {} -> nq {} nk {}, {} MB; both halves on {} (bq {} bk {}), "
+        "approximate half {}",
         heads, tokens, blk, nq, nk, resident_bytes() >> 20,
-        _nax ? "attn_steel_nax" : "attn_steel", _bq, _bk));
+        _nax ? "attn_steel_nax" : "attn_steel", _bq, _bk,
+        _masked ? "block-masked" : "sol_approx_mma"));
   }
   _heads = heads; _tokens = tokens; _d = d; _nq = nq; _nk = nk;
   // In STEEL key blocks: that is what the route kernel counts, so a
@@ -546,13 +575,19 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
   // a property of `nk`, which moves with the key block at a fixed
   // sequence -- so a bench sweeping the block at one length would keep
   // the first specialisation for every later one.
-  if (_steel_seq == tokens && _steel_nk == _nk && _fn_steel.valid()) {
+  // THE SAGE FLAG IS PART OF THE KEY. It changes the exact function and
+  // nothing else about the geometry does, so without it an A/B in one
+  // process keeps whichever arm specialised first.
+  const int want_sage = (_sage != nullptr) ? 1 : 0;
+  if (_steel_seq == tokens && _steel_nk == _nk && _steel_sage == want_sage
+      && _fn_steel.valid()) {
     return true;
   }
   FunctionConstants fc;
   fc.set_bool(200, (tokens % 64) == 0).set_bool(201, (tokens % 32) == 0)
       .set_bool(300, false).set_bool(301, false).set_bool(302, false)
-      .set_bool(303, true).set_bool(304, true);
+      .set_bool(303, true).set_bool(304, true)
+      .set_bool(sage::kQkInt8Constant, want_sage != 0);
   _fn_steel = _nax
       ? _lib_nax.function(
             _bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128",
@@ -565,17 +600,26 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
     }
     return false;
   }
-  if (_nax) {
+  if (_masked) {
     // The approximate half on the same kernel: no spans, the routing's
     // flag array as a per-(query block, key) mask, and its own softmax
     // statistics out for the merge.
+    //
+    // align_K is asked of the SUMMARY length and at the coarser of the
+    // two key blocks, which is conservative on the ALU kernel (16, not
+    // 32) and therefore right: an unnecessary length mask costs the
+    // ragged block a predicate, where a missing one reads past kL.
     FunctionConstants fa;
     fa.set_bool(200, (tokens % 64) == 0).set_bool(201, (_nk % 32) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(303, false).set_bool(304, true).set_bool(305, true);
-    _fn_approx_nax = _lib_nax.function(
-        _bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128", fa);
-    if (!_fn_approx_nax.valid()) {
+    _fn_approx_masked = _nax
+        ? _lib_nax.function(
+              _bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128",
+              fa)
+        : _lib_steel.function(
+              _bf16 ? "attn_steel_h_bd128_bf16" : "attn_steel_h_bd128", fa);
+    if (!_fn_approx_masked.valid()) {
       if (err != nullptr) {
         *err = "the block-masked flash attention did not specialise";
       }
@@ -584,6 +628,7 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
   }
   _steel_seq = tokens;
   _steel_nk = _nk;
+  _steel_sage = want_sage;
   return true;
 }
 
@@ -612,6 +657,11 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   }
   if (!ensure_scratch_(heads, tokens, d, err)) { return false; }
   if (!ensure_steel_(tokens, err)) { return false; }
+  // WHAT ACTUALLY HAPPENED, not what was asked: set_sage already
+  // dropped the driver on a box with no matrix cores, so this is the
+  // one place that knows, and sage_engaged() is what a caller should
+  // report and a bench should key its arms on.
+  _sage_on = (_sage != nullptr) && _steel_sage == 1;
   // THE SCALE IS PER CALL AND THE SCRATCH IS NOT, so it is written here
   // rather than where the rest of AttnParams is filled.
   //
@@ -651,12 +701,16 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // 1. summaries. Twice, because q is summarised at the QUERY block size
   //    and k/v at the KEY block size: routing has to be decided at
   //    steel's own query block or two of them would share one CSR entry.
+  //    EACH CALL ASKS FOR ONLY WHAT IT WANTS -- 2|4 then 1 -- because
+  //    the block size is per call and the destination count with it.
+  const int kSumQ = 1, kSumKV = 6;
   if ((skip & 1) == 0) {
   enc.set_function(_fn_sum);
   enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
   enc.set_buffer(3, _qc); enc.set_buffer(4, _kc); enc.set_buffer(5, _vc);
   enc.set_constant(6, tokens); enc.set_constant(7, d);
   enc.set_constant(8, nk); enc.set_constant(9, _blk);
+  enc.set_constant(10, kSumKV);
   enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)nk},
                {(unsigned)d, 1, 1});
   enc.set_function(_fn_sum);
@@ -664,6 +718,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_buffer(3, _qc); enc.set_buffer(4, _qc); enc.set_buffer(5, _qc);
   enc.set_constant(6, tokens); enc.set_constant(7, d);
   enc.set_constant(8, nq); enc.set_constant(9, _bq);
+  enc.set_constant(10, kSumQ);
   enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)nq},
                {(unsigned)d, 1, 1});
   }
@@ -725,7 +780,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_buffer(0, _kept); enc.set_buffer(1, _qb_off);
   enc.set_constant(2, nq); enc.set_constant(3, heads);
   enc.set_constant(4, per);
-  enc.dispatch({1, 1, 1}, {1, 1, 1});
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
   }
 
   if ((skip & 16) == 0) {
@@ -745,8 +800,8 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // which the flag array says directly, as a per-(query block, key)
   // mask. MEASURED at 8 heads x 20036 rows: 17.7 ms of a 52.5 ms call
   // on the simdgroup kernel, at 1/64 of the dense work.
-  if ((skip & 32) == 0 && _nax) {
-  enc.set_function(_fn_approx_nax);
+  if ((skip & 32) == 0 && _masked) {
+  enc.set_function(_fn_approx_masked);
   enc.set_buffer(0, q); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
   enc.set_buffer(3, _o_an); enc.set_buffer(4, _params_a);
   enc.set_buffer(12, _m_a); enc.set_buffer(13, _l_a);
@@ -776,13 +831,17 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_buffer(8, _qb_off); enc.set_buffer(9, _qb_blk);
   enc.set_buffer(10, _sp_params); enc.set_buffer(11, _sp_bounds);
   enc.set_buffer(12, _m_e); enc.set_buffer(13, _l_e);
+  // The int8 operands the caller's prologue filled, at 15..18. The
+  // function was built with constant 306 above or these slots are
+  // unused, so the two cannot disagree: both follow `_sage`.
+  if (_sage != nullptr) { _sage->bind(enc); }
   enc.dispatch({32u * (unsigned)nq, 4u * (unsigned)heads, 1}, {32, 4, 1});
   }
 
   // 8. merge. Which one follows from which kernel produced the
   //    approximate half: the flash one stores normalised and in the
   //    tensor dtype, and its +log2(BLK) is applied here.
-  if ((skip & 128) == 0 && _nax) {
+  if ((skip & 128) == 0 && _masked) {
   const float bonus = std::log2((float)_blk);
   enc.set_function(_fn_merge_ml);
   enc.set_buffer(0, _o_e); enc.set_buffer(1, _m_e); enc.set_buffer(2, _l_e);

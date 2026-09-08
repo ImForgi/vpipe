@@ -267,13 +267,13 @@ struct Rig {
     e.set_buffer(0, q); e.set_buffer(1, k); e.set_buffer(2, v);
     e.set_buffer(3, qc); e.set_buffer(4, kc); e.set_buffer(5, vc);
     e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NK);
-    e.set_constant(9, BLK);
+    e.set_constant(9, BLK); e.set_constant(10, 6);
     e.dispatch({kD, (unsigned)H, (unsigned)NK}, {kD, 1, 1});
     e.set_function(f_sum);
     e.set_buffer(0, q); e.set_buffer(1, q); e.set_buffer(2, q);
     e.set_buffer(3, qc); e.set_buffer(4, qc); e.set_buffer(5, qc);
     e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NQ);
-    e.set_constant(9, BQ);
+    e.set_constant(9, BQ); e.set_constant(10, 1);
     e.dispatch({kD, (unsigned)H, (unsigned)NQ}, {kD, 1, 1});
     }
 
@@ -303,7 +303,7 @@ struct Rig {
     e.set_function(f_scan);
     e.set_buffer(0, kept); e.set_buffer(1, qb_off);
     e.set_constant(2, NQ); e.set_constant(3, H); e.set_constant(4, per);
-    e.dispatch({1, 1, 1}, {1, 1, 1});
+    e.dispatch({256, 1, 1}, {256, 1, 1});
     }
 
     if ((skip & 16) == 0) {
@@ -351,6 +351,13 @@ struct Rig {
     }
   }
 
+  // How many times one timed command buffer encodes the pipeline. 1 is
+  // the bench; the per-pass profile raises it, because attributing an
+  // 8 ms pass by subtracting two 480 ms runs is a difference of the same
+  // order as the noise between them. Every pass here is idempotent given
+  // its inputs, so a repeat measures the same work again.
+  int repeat = 1;
+
   bool run(bool sol, float tau, int radius, int sink_lo, int sink_hi,
            double* ms)
   {
@@ -359,8 +366,10 @@ struct Rig {
     CommandStream st = mc->make_command_stream();
     {
       ComputeEncoder e = st.begin_compute();
-      if (sol) { encode_sol(e, tau, radius, sink_lo, sink_hi); }
-      else     { encode_dense(e); }
+      for (int i = 0; i < repeat; ++i) {
+        if (sol) { encode_sol(e, tau, radius, sink_lo, sink_hi); }
+        else     { encode_dense(e); }
+      }
     }
     std::string err;
     if (!st.commit().wait_ok(&err)) {
@@ -573,8 +582,8 @@ TEST(sol_attention_mma, bench)
     // that instead.
     if (std::getenv("VPIPE_SOL_BENCH_PROFILE") != nullptr) {
       struct { int bit; const char* name; } part[] = {
-          {1, "summaries"}, {4, "route"}, {16, "emit"},
-          {32, "approx"}, {64, "exact"}, {128, "merge"}};
+          {1, "summaries"}, {2, "stats"}, {4, "route"}, {8, "scan"},
+          {16, "emit"}, {32, "approx"}, {64, "exact"}, {128, "merge"}};
       for (const auto& pt : part) {
         double without = 0.0;
         r.skip = pt.bit;
@@ -589,6 +598,157 @@ TEST(sol_attention_mma, bench)
   }
   }
   EXPECT_TRUE(true);
+}
+
+// SOL'S OWN PASSES, one at a time and repeated, because the bench
+// attributes them by subtracting two runs of the whole thing -- and at
+// the production geometry the two are ~480 ms apart while the pass
+// between them is 8. Here each pass is the ONLY thing in the command
+// buffer, encoded VPIPE_SOL_BENCH_PASSES times (default 16), so what is
+// timed is the pass and the noise divides.
+//
+// The EXACT half is left out: it is not Sol's scaffolding, it is the
+// attention, and it would dominate the run it is supposed to be
+// measured beside. The approximate half is in, because on this arm it
+// IS one of Sol's own kernels.
+TEST(sol_attention_mma, bench_passes)
+{
+  if (std::getenv("VPIPE_SOL_BENCH_PASSES") == nullptr) { return; }
+  int R = std::atoi(std::getenv("VPIPE_SOL_BENCH_PASSES"));
+  if (R <= 0) { R = 16; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  int heads = 56, tokens = 20036, blk = 64;
+  if (const char* e = std::getenv("VPIPE_SOL_BENCH_HEADS")) {
+    heads = std::atoi(e);
+  }
+  if (const char* e = std::getenv("VPIPE_SOL_BENCH_ROWS")) {
+    tokens = std::atoi(e);
+  }
+  if (const char* e = std::getenv("VPIPE_SOL_BLK")) { blk = std::atoi(e); }
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, heads, tokens, 24, 0.35f, 0x50150150u);
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool want_nax = arm == 1;
+    if (want_nax && !mc->supports_matrix_cores()) { break; }
+    Rig r;
+    if (!r.load(mc, heads, tokens, blk, want_nax)) { continue; }
+    if (!r.alloc()) { continue; }
+    r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+    r.v = up_(mc, v, r.bf16);
+    if (r.q.empty()) { continue; }
+    double warm = 0.0;
+    r.run(true, 1.0f, 1, 0, 16, &warm);
+    std::printf("[sol-pass] %s %d heads x %d rows, block %d, x%d\n",
+                r.nax ? "nax" : "alu", heads, tokens, blk, R);
+    struct { int bit; const char* name; } part[] = {
+        {1, "summaries"}, {2, "stats"}, {4, "route"}, {8, "scan"},
+        {16, "emit"}, {32, "approx"}, {128, "merge"}};
+    r.repeat = R;
+    for (const auto& pt : part) {
+      r.skip = 0xff & ~pt.bit;
+      double ms = 0.0;
+      if (!r.run(true, 1.0f, 1, 0, 16, &ms)) { continue; }
+      if (!r.run(true, 1.0f, 1, 0, 16, &ms)) { continue; }
+      std::printf("[sol-pass]   %-10s %7.2f ms\n", pt.name, ms / R);
+    }
+    r.repeat = 1;
+    r.skip = 0;
+  }
+  EXPECT_TRUE(true);
+}
+
+// THE SUMMARY PASS WRITES ONLY WHAT IT WAS ASKED FOR, which is the
+// contract that keeps it in bounds.
+//
+// `N` is ONE count for all three destinations, and the caller runs the
+// kernel twice with two different block sizes -- k/v at the routing
+// block, q at the exact half's query block. So a k/v call carries
+// N = nk, and while it also wrote q it was writing nk query centroids
+// into a buffer holding nq. That is harmless wherever nq >= nk, which
+// is every geometry the ALU kernel routes, and a 2x overrun on the
+// matrix-core one at key block 32 -- where the query block is 64 and nk
+// is therefore twice nq.
+//
+// The geometry here is that one, on purpose and on any GPU: nk = 2 * nq
+// with the destinations sized honestly and filled with a pattern, so a
+// write outside the mask's permission is a changed byte rather than a
+// fault that may or may not happen.
+TEST(sol_attention_mma, a_summary_pass_writes_only_what_it_was_asked_for)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const bool bf16 = std::getenv("VPIPE_SOL_BF16") != nullptr;
+  ComputeLibrary lib =
+      mc->load_library(bf16 ? "sol_attn_mma_bf16" : "sol_attn_mma");
+  ComputeFunction f_sum = lib.function("sol_summaries_mma");
+  ASSERT_TRUE(f_sum.valid());
+  if (!f_sum.valid()) { return; }
+
+  // The matrix-core arm's shape: query block 64, key block 32.
+  const int H = 2, T = 512, BQ = 64, BLK = 32;
+  const int NQ = T / BQ, NK = T / BLK;      // 8 and 16
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 4, 0.4f, 0xA5A5u);
+  SharedBuffer bq_ = up_(mc, q, bf16), bk = up_(mc, k, bf16),
+               bv = up_(mc, v, bf16);
+  SharedBuffer qc = mc->make_shared_buffer((std::size_t)H * NQ * kD * 2);
+  SharedBuffer kc = mc->make_shared_buffer((std::size_t)H * NK * kD * 2);
+  SharedBuffer vc = mc->make_shared_buffer((std::size_t)H * NK * kD * 2);
+  ASSERT_TRUE(!bq_.empty() && !qc.empty() && !kc.empty() && !vc.empty());
+  if (qc.empty() || kc.empty() || vc.empty() || bq_.empty()) { return; }
+  auto fill = [](SharedBuffer& b, unsigned char c) {
+    std::memset(b.contents(), c, b.byte_size());
+  };
+  auto unchanged = [](const SharedBuffer& b, unsigned char c) {
+    const auto* p = static_cast<const unsigned char*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size(); ++i) {
+      if (p[i] != c) { return false; }
+    }
+    return true;
+  };
+  auto changed = [](const SharedBuffer& b, unsigned char c) {
+    const auto* p = static_cast<const unsigned char*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size(); ++i) {
+      if (p[i] != c) { return true; }
+    }
+    return false;
+  };
+  auto encode = [&](int N, int blk, int which) {
+    std::string err;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      e.set_function(f_sum);
+      e.set_buffer(0, bq_); e.set_buffer(1, bk); e.set_buffer(2, bv);
+      e.set_buffer(3, qc); e.set_buffer(4, kc); e.set_buffer(5, vc);
+      e.set_constant(6, T); e.set_constant(7, (int)kD);
+      e.set_constant(8, N); e.set_constant(9, blk);
+      e.set_constant(10, which);
+      e.dispatch({kD, (unsigned)H, (unsigned)N}, {kD, 1, 1});
+    }
+    return st.commit().wait_ok(&err);
+  };
+
+  // k and v, at the ROUTING block -- the call whose N exceeds nq.
+  fill(qc, 0xAB); fill(kc, 0xCD); fill(vc, 0xCD);
+  ASSERT_TRUE(encode(NK, BLK, 6));
+  // Not one byte of the query centroids, all NQ * D of which sit inside
+  // the NK * D this dispatch would have written.
+  EXPECT_TRUE(unchanged(qc, 0xAB));
+  EXPECT_TRUE(changed(kc, 0xCD));
+  EXPECT_TRUE(changed(vc, 0xCD));
+
+  // ...and q, at the QUERY block, leaves the other two alone.
+  fill(qc, 0xAB); fill(kc, 0xCD); fill(vc, 0xCD);
+  ASSERT_TRUE(encode(NQ, BQ, 1));
+  EXPECT_TRUE(changed(qc, 0xAB));
+  EXPECT_TRUE(unchanged(kc, 0xCD));
+  EXPECT_TRUE(unchanged(vc, 0xCD));
 }
 
 // The APPROXIMATE half alone, against a CPU computation of exactly what
@@ -1094,7 +1254,15 @@ TEST(sol_attention_mma, taking_the_arena_back_releases_it)
   ASSERT_TRUE(sol != nullptr);
   if (!sol) { return; }
 
-  const std::size_t base = mc->memory_budget().allocated;
+  // COUNTED, NOT WEIGHED. The sibling test above reads
+  // currentAllocatedSize(), which is the whole DEVICE's figure and moves
+  // with every other Metal object in the process -- so a bound of half
+  // the lent bytes bounds unrelated activity as much as it bounds this,
+  // and it failed here at EXACTLY the tolerance the moment a test that
+  // touches Metal was added ahead of it. What the bug actually was is an
+  // allocation the residency set never gave back, and the set can be
+  // asked how many it is holding.
+  const std::size_t held = mc->residency_stats().current;
   {
     SharedBuffer arena_a = mc->make_shared_buffer(lend_a);
     SharedBuffer arena_b = mc->make_shared_buffer(lend_b);
@@ -1116,10 +1284,149 @@ TEST(sol_attention_mma, taking_the_arena_back_releases_it)
       }
       ASSERT_TRUE(st.commit().wait_ok(&err));
     }
+    // ...and the whole scratch came OUT of the arena, which is the other
+    // half of the claim: a take-back that returns nothing is trivially
+    // clean if nothing was ever lent.
+    EXPECT_TRUE(sol->resident_bytes() == 0);
+    // ...AND THE SET ACTUALLY TOOK THE ARENA, which is what makes the
+    // count below an invariant rather than a tautology. `held` is read
+    // outside the scope and is 0 on a fresh session, so `after == held`
+    // is 0 == 0 -- true whether the adds happen or not. The sibling test
+    // has this witness in its byte form (>= base + lent); converting
+    // this one to counts dropped it.
+    EXPECT_TRUE(mc->residency_stats().current > held);
     // The lender takes it back, exactly as the DiT does before it
     // reallocates. Sol outlives this scope; the arena must not.
     sol->set_arena(SharedBuffer{}, SharedBuffer{});
   }
-  const std::size_t after = mc->memory_budget().allocated;
-  EXPECT_TRUE(after < base + lent / 2);
+  const std::size_t after = mc->residency_stats().current;
+  std::printf("[sol_mem] take-back: the set held %llu allocations, now "
+              "%llu\n", (unsigned long long)held,
+              (unsigned long long)after);
+  EXPECT_TRUE(after == held);
+  (void)lent;
+}
+
+// SOL AND SAGE TOGETHER, which before this composed only in the config
+// file: the branch that routes returns before the dispatch Sage lives
+// on, so a graph naming both ran Sage on the one block Sol leaves dense
+// and nothing said so.
+//
+// They are orthogonal by construction -- Sol decides WHICH key blocks
+// are attended, Sage how the ones that are get multiplied -- so the bar
+// is that turning Sage on moves the answer by about what int8 costs and
+// not by what a routing change would cost. Three arms against ONE dense
+// reference: Sol alone, Sage alone, and both.
+//
+// The composed arm is required to differ from Sol-alone BITWISE as well.
+// Two arms agreeing perfectly is exactly what a function constant that
+// failed to apply looks like, and it is the failure this test exists
+// for -- the whole bug was a path that silently did nothing.
+TEST(sol_attention_mma, sage_composes_with_the_exact_half)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[sol-sage] no matrix cores -- the int8 QK cannot run, "
+                "SKIPPED\n");
+    return;
+  }
+  const int H = 4, T = 4096, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x5a6e77uL);
+
+  Rig r;
+  if (!r.load(mc, H, T, BLK, /*nax=*/true)) { return; }
+  ASSERT_TRUE(r.alloc());
+  r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+  r.v = up_(mc, v, r.bf16);
+  if (r.q.empty()) { return; }
+
+  std::string err;
+  std::unique_ptr<MetalSageAttention> sage =
+      MetalSageAttention::load(mc, r.bf16, &err);
+  ASSERT_TRUE(sage != nullptr);
+  if (!sage) { return; }
+
+  // tau = -inf keeps every block exact, so the routing is the identity
+  // and what is left between the arms is the int8 product alone. That is
+  // the discriminator: under a routed tau the two effects would be mixed
+  // and neither bound would mean anything.
+  auto run = [&](bool sage_on, float tau, std::vector<float>* out,
+                 bool* engaged) {
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    if (!sol) { return false; }
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    if (o.empty()) { return false; }
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = tau;
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      bool ok = true;
+      if (sage_on) {
+        const MetalSageAttention::Operand qo{&r.q, 0, kD, T * kD};
+        const MetalSageAttention::Operand ko{&r.k, 0, kD, T * kD};
+        // compose(), not a bare Config: the key smoothing is exact
+        // under ONE softmax and Sol's row is split across two, so a
+        // composing caller quantizes K raw. Passing the bare config
+        // here would test a configuration no model can reach and would
+        // hide the term that does not cancel -- see
+        // sol_attention_h3.sol_and_sage_compose_in_the_stack, where the
+        // difference is 0.0376 against 0.0191.
+        sage::Config gc;
+        gc.enabled = true;
+        ok = sage->prepare(e, qo, ko, H, H, T, T, kD, sol->query_block(),
+                           sol->key_block_unit(),
+                           MetalSolAttention::compose(gc), &err);
+      }
+      if (!ok) { return false; }
+      sol->set_sage(sage_on ? sage.get() : nullptr);
+      if (!sol->encode(e, r.q, r.k, r.v, o, H, T, kD, r.scale, cfg, &err)) {
+        return false;
+      }
+    }
+    if (!st.commit().wait_ok(&err)) { return false; }
+    *engaged = sol->sage_engaged();
+    *out = r.read(o);
+    return true;
+  };
+
+  std::vector<float> dense, sol_only, both;
+  bool e0 = false, e1 = false, e2 = false;
+  ASSERT_TRUE(run(false, -std::numeric_limits<float>::infinity(), &dense,
+                  &e0));
+  ASSERT_TRUE(run(false, 1.0f, &sol_only, &e1));
+  ASSERT_TRUE(run(true, 1.0f, &both, &e2));
+  if (dense.empty() || both.empty()) { return; }
+  // The arms are the arms: without this the test can run Sol twice.
+  EXPECT_TRUE(!e0 && !e1);
+  EXPECT_TRUE(e2);
+
+  const double r_sol = rel_(sol_only, dense);
+  const double r_both = rel_(both, dense);
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < both.size(); ++i) {
+    differ += (both[i] != sol_only[i]) ? 1 : 0;
+  }
+  std::printf("[sol-sage] vs dense: sol %.4f | sol+sage %.4f, %zu of %zu "
+              "differ from sol alone\n", r_sol, r_both, differ, both.size());
+  // Sage costs the routed answer about what int8 costs a dense one --
+  // not what a changed routing would cost, which is the failure that
+  // would show up here as the second bound blowing past the first.
+  EXPECT_TRUE(std::isfinite(r_both));
+  EXPECT_TRUE(r_both < r_sol + 0.02);
+  // ...and it RAN. One percent, not the quarter this bound started at:
+  // that figure was calibrated against a composition that was WRONG --
+  // the key smoothing displaced the exact half's logits against the
+  // approximate half's, which moved 90% of the output. Corrected, Sage
+  // costs the routed answer about what int8 costs a dense one and moves
+  // a fifth of it. A bound fitted to the broken number would have
+  // rejected the fix.
+  EXPECT_TRUE(differ > both.size() / 100);
 }

@@ -133,6 +133,15 @@ public:
     int head_dim = 128;      // the BACKBONE's; the branch's is in Config
     int hidden   = 5376;
     int n_layers = 50;
+    // Whether the box HAS matrix cores, which the estimate needs and
+    // cannot ask: `load()` takes the matrix-core route only when this
+    // and `bf16_features` are both true and the libraries validate, and
+    // three of its landing buffers exist only on that route. Booking
+    // them on a GPU that will not take it over-reserves the arena --
+    // 67 MB at 37 frames, silently, and in the one number a graph is
+    // refused by. Defaulted TRUE so the figure stays the worst case for
+    // a caller that does not know.
+    bool matrix_cores = true;
   };
 
   // The geometry of one forward. `grid_h * grid_w` must equal the

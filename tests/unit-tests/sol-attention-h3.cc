@@ -22,6 +22,7 @@
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/sage-attention.h"
 
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -626,4 +628,194 @@ TEST(sol_attention_h3, a_denoise_allocates_its_scratch_once)
   // the assertion below would pass for the wrong reason.
   EXPECT_TRUE(nt_seen[1] > nt_seen[0]);
   EXPECT_TRUE(m->scratch_rebuilds() == 1);
+}
+
+// SOL AND SAGE IN THE SAME STACK, which is the pair that composes only
+// here: Sol decides which key blocks are attended and Sage how the ones
+// that are get multiplied, and the exact half is the one dispatch both
+// of them touch.
+//
+// FOUR ARMS against one dense reference, because three of the possible
+// failures are indistinguishable from two arms. Sol alone and Sage alone
+// each have to land where they land on their own; the composed arm has
+// to land near Sol's, since Sage costs the routed answer about what int8
+// costs a dense one. An arm that comes back non-finite, or an order of
+// magnitude out, is the composition and not either half.
+TEST(sol_attention_h3, sol_and_sage_compose_in_the_stack)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[h3_sage] no matrix cores -- the int8 QK cannot run, "
+                "SKIPPED\n");
+    return;
+  }
+
+  const int latf  = envi_("VPIPE_H3_SOL_LATF", 20);
+  const int lath  = envi_("VPIPE_H3_SOL_LATH", 16);
+  const int latw  = envi_("VPIPE_H3_SOL_LATW", 16);
+  const int naud  = envi_("VPIPE_H3_SOL_AUD", 40);
+  const int ntext = envi_("VPIPE_H3_SOL_TEXT", 16);
+
+  // Same reason the sibling above pins it: every arm builds its own
+  // transformer, and a tuner that measures can hand two arms different
+  // projection tiles before attention is reached at all.
+  ::setenv("VPIPE_H3_NO_QMM_AUTOTUNE", "1", 1);
+  struct Unpin {
+    ~Unpin() { ::unsetenv("VPIPE_H3_NO_QMM_AUTOTUNE"); }
+  } unpin;
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    return;
+  }
+  cfg.n_layers = envi_("VPIPE_H3_SOL_LAYERS", 2);
+
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(
+      text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
+      h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.7f, 0.5f, 0.0f, &uniq, &row_idx);
+
+  const SharedBuffer vb = ramp_(
+      mc, (std::size_t)L.video_indices.size() * cfg.video_patch_elems(),
+      0.017f);
+  const SharedBuffer ab = ramp_(
+      mc, (std::size_t)L.audio_indices.size() * cfg.audio_channels, 0.031f);
+  const SharedBuffer tb =
+      ramp_(mc, (std::size_t)ntext * cfg.text_dim, 0.005f);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  auto run_arm = [&](const sol::Config& sc, const sage::Config& gc,
+                     const char* what, std::vector<std::uint16_t>* out) {
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.sol = sc;
+    c.sage = gc;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, c);
+    if (m == nullptr) { return false; }
+    MetalMiniMaxH3Transformer::Step step;
+    step.video  = &vb;
+    step.audio  = &ab;
+    step.text   = &tb;
+    step.layout = &L;
+    step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[h3_sage] %s: %s\n", what, ferr.c_str());
+      return false;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    out->assign(p, p + v.video.byte_size() / 2);
+    std::size_t bad = 0;
+    const double r = rms_(*out, &bad);
+    std::printf("[h3_sage] %-16s rms %.6f  non-finite %zu\n", what, r, bad);
+    return true;
+  };
+
+  sol::Config sol_off;
+  sol::Config sol_on;
+  sol_on.enabled = true;
+  sol_on.tau = 1.0f;
+  sol_on.dense_layers = 1;
+  sage::Config sage_off;
+  sage::Config sage_on;
+  sage_on.enabled = true;
+  sage_on.dense_layers = 0;
+
+  std::vector<std::uint16_t> dense, only_sol, only_sage, both;
+  if (!run_arm(sol_off, sage_off, "dense", &dense)) { return; }
+  if (!run_arm(sol_on, sage_off, "sol", &only_sol)) { return; }
+  if (!run_arm(sol_off, sage_on, "sage", &only_sage)) { return; }
+  if (!run_arm(sol_on, sage_on, "sol+sage", &both)) { return; }
+  ASSERT_TRUE(both.size() == dense.size());
+  if (both.size() != dense.size()) { return; }
+
+  auto rel_to_dense = [&](const std::vector<std::uint16_t>& x) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < dense.size(); ++i) {
+      const double a = bf16_(x[i]), b = bf16_(dense[i]);
+      num += (a - b) * (a - b);
+      den += b * b;
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 0.0;
+  };
+  // THE ROUTING TURNED OFF, which is the discriminator the arms above
+  // cannot be: at tau = -inf Sol keeps every key block exact, so the
+  // composed arm attends exactly what Sage alone attends by the same
+  // int8 product, and the two must land on top of each other. A gap
+  // here is the COMPOSITION -- the operands, their indexing, the
+  // function constant -- and not the approximation.
+  //
+  // The reference is Sage with the SAME key handling the composed path
+  // uses (MetalSolAttention::compose clears the smoothing), or the two
+  // arms differ by the very shift this test is downstream of and the
+  // check measures that instead of what it is for.
+  sol::Config sol_exact;
+  sol_exact.enabled = true;
+  sol_exact.tau = -std::numeric_limits<float>::infinity();
+  sol_exact.dense_layers = 0;
+  std::vector<std::uint16_t> sage_raw_only, exact_both;
+  const bool have_raw =
+      run_arm(sol_off, MetalSolAttention::compose(sage_on), "sage(raw)",
+              &sage_raw_only);
+  if (have_raw && run_arm(sol_exact, sage_on, "sol(-inf)+sage",
+                          &exact_both) &&
+      exact_both.size() == sage_raw_only.size()) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < sage_raw_only.size(); ++i) {
+      const double a = bf16_(exact_both[i]), b = bf16_(sage_raw_only[i]);
+      num += (a - b) * (a - b);
+      den += b * b;
+    }
+    const double gap = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[h3_sage] sol(tau=-inf)+sage vs sage(raw) alone: %.4f\n",
+                gap);
+    EXPECT_TRUE(std::isfinite(gap) && gap < 0.005);
+  }
+
+  // THE ARM THAT USED TO SHIP IS NO LONGER REACHABLE from here, and
+  // deliberately: MetalSolAttention::compose clears the smoothing for
+  // every composing caller, so a config asking for it back is ignored.
+  // What guards it is the ratio below -- the bug sat at 1.98x Sol's own
+  // error, which is the shape a term that should have cancelled makes.
+
+  const double r_sol = rel_to_dense(only_sol);
+  const double r_sage = rel_to_dense(only_sage);
+  const double r_both = rel_to_dense(both);
+  std::printf("[h3_sage] vs dense: sol %.4f | sage %.4f | sol+sage %.4f\n",
+              r_sol, r_sage, r_both);
+
+  // Each half on its own is the control; the composed arm is the claim.
+  EXPECT_TRUE(std::isfinite(r_sol) && r_sol < 0.5);
+  EXPECT_TRUE(std::isfinite(r_sage) && r_sage < 0.5);
+  // Sage costs the ROUTED answer about what it costs a dense one, so the
+  // composed arm sits near Sol's and not in a different regime. Garbage
+  // -- the failure this test was written for -- lands far outside.
+  EXPECT_TRUE(std::isfinite(r_both));
+  // COMPOSING MUST NOT MULTIPLY SOL'S ERROR. Sage costs the routed
+  // answer about what int8 costs a dense one, so the composed arm sits
+  // just above Sol's. The bug this replaced sat at 1.98x, which is why
+  // the bound is a ratio and not a slack: a slack wide enough for the
+  // two errors to add is also wide enough to admit a term that should
+  // have cancelled.
+  EXPECT_TRUE(r_both < r_sol * 1.4);
+
+  // ...and Sage actually ran on the routed blocks: composing must move
+  // the answer off Sol-alone, or it silently did nothing.
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < both.size(); ++i) {
+    if (both[i] != only_sol[i]) { ++differ; }
+  }
+  std::printf("[h3_sage] sol+sage differs from sol alone in %zu/%zu\n",
+              differ, both.size());
+  EXPECT_TRUE(differ > both.size() / 100);
 }

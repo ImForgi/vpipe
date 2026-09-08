@@ -751,6 +751,12 @@ class MetalMiniMaxH3Transformer {
   // MetalSolAttention::private_bytes.
   std::size_t sol_scratch_bytes(int seq) const;
 
+  // ...and SageAttention's, which a preflight needs for the same reason
+  // and did not have: its int8 twins of q and k are H * seq * head_dim
+  // BYTES each, which at video geometry is a gigabyte and a half that
+  // nothing sizing the box had heard of.
+  std::size_t sage_scratch_bytes(int seq) const;
+
   // How many times the activation scratch has been ALLOCATED.
   //
   // One per geometry is right; more than one within a denoise is the
@@ -1219,6 +1225,12 @@ class MetalMiniMaxH3Transformer {
   // Every buffer of the scratch, so the wired pool can take them all
   // without a second list that drifts from the struct above.
   std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+  // How much of `_s.qkv` Sage may carve from at this geometry, or 0.
+  // ONE place, because the ESTIMATE and the LEND must not disagree
+  // about it -- and the conditions are not obvious: Sol takes that
+  // buffer whenever it is on, and the fused attention spellings read
+  // q/k/v out of it in place, so it is spare in exactly one case.
+  std::size_t sage_lend_bytes_(int seq) const;
 
   // Wire (or give back) the model's FIXED holdings -- the activation
   // scratch. Charged to the shared pool like everything else.

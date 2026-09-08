@@ -750,3 +750,78 @@ TEST(metal_sage_attention, the_alu_and_nax_kernels_agree_at_qwen_image_shape)
   EXPECT_TRUE(c_nax > 0.999);
   EXPECT_TRUE(c_nax > c_alu - 1e-4);
 }
+
+// A PARTIAL LEND, which is the case private_bytes() exists for and the
+// one H3's preflight actually hits: Sol takes the forward arena whenever
+// it is on, so what is left for Sage is either the whole buffer or
+// nothing -- and the estimate has to be right in the middle too, or the
+// first geometry that half-fits reports a number nobody can trust.
+//
+// Lend a region big enough for some of the plan and not all of it, and
+// require the DEVICE's growth to be exactly what private_bytes()
+// predicted. A bound would pass an estimate that was merely the right
+// order of magnitude.
+TEST(metal_sage_attention, the_private_estimate_matches_a_partial_lend)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  std::string err;
+  std::unique_ptr<MetalSageAttention> sage =
+      MetalSageAttention::load(mc, /*bf16=*/false, &err);
+  ASSERT_TRUE(sage != nullptr);
+  if (!sage) { return; }
+
+  const int H = 8, T = 2048;
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+  const std::size_t all =
+      MetalSageAttention::scratch_bytes(H, H, T, T, kD, bq, bk);
+  ASSERT_TRUE(all > 0);
+  if (all == 0) { return; }
+
+  // Three lends: nothing, a third, and everything. The middle one is
+  // the point; the outer two pin the ends the other tests already cover
+  // so a regression cannot pass by getting only those right.
+  for (const int frac : {0, 3, 1}) {
+    const std::size_t lend = frac == 0 ? 0 : all / (std::size_t)frac;
+    const std::size_t want = MetalSageAttention::private_bytes(
+        H, H, T, T, kD, bq, bk, lend, 0);
+    SharedBuffer arena;
+    if (lend > 0) {
+      arena = mc->make_shared_buffer(lend);
+      ASSERT_TRUE(!arena.empty());
+      if (arena.empty()) { return; }
+    }
+    // Cleared first: a stale lend would keep the previous arm's windows.
+    sage->set_arena(SharedBuffer{}, SharedBuffer{});
+    sage->set_arena(arena, SharedBuffer{});
+
+    SharedBuffer q = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    SharedBuffer k = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!q.empty() && !k.empty());
+    if (k.empty()) { return; }
+    MetalSageAttention::Operand qo{&q, 0, kD, T * kD};
+    MetalSageAttention::Operand ko{&k, 0, kD, T * kD};
+    sage::Config cfg;
+    cfg.enabled = true;
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        EXPECT_TRUE(sage->prepare(e, qo, ko, H, H, T, T, kD, bq, bk, cfg,
+                                  &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+    // ASKED OF THE OBJECT, not of the device: currentAllocatedSize() is
+    // process-wide and moves with every other Metal object, so it can
+    // bound this but cannot equal it.
+    const std::size_t got = sage->private_held();
+    std::printf("[sage-drv] lend %6zu KB: private predicted %6zu KB, "
+                "held %6zu KB%s\n", lend >> 10, want >> 10, got >> 10,
+                got == want ? "" : "   MISMATCH");
+    EXPECT_TRUE(got == want);
+  }
+}

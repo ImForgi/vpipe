@@ -3831,6 +3831,11 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   if (_vdn) { _vdn->set_arena(metal_compute::SharedBuffer{}); }
   // Sol borrows two of these buffers for the length of each of its
   // calls, and its windows hold them alive; same rule.
+  // Sage's windows hold the same arena alive; same rule, same reason.
+  if (_sage) {
+    _sage->set_arena(metal_compute::SharedBuffer{},
+                     metal_compute::SharedBuffer{});
+  }
   if (_sol) {
     _sol->set_arena(metal_compute::SharedBuffer{},
                     metal_compute::SharedBuffer{});
@@ -3969,6 +3974,7 @@ MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
   dims.head_dim = _cfg.head_dim;
   dims.hidden   = _cfg.hidden;
   dims.n_layers = _cfg.n_layers;
+  dims.matrix_cores = _mc != nullptr && _mc->supports_matrix_cores();
   std::unique_ptr<minimax_h3::MetalVdnBranch> br =
       minimax_h3::MetalVdnBranch::load(ws, _mc, _vdn_cfg, dims, err);
   if (!br) { return false; }
@@ -4016,6 +4022,36 @@ MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq) const
       _sol->uses_matrix_cores(), 3 * win, win);
 }
 
+std::size_t
+MetalMiniMaxH3Transformer::sage_lend_bytes_(int seq) const
+{
+  if (seq <= 0) { return 0; }
+  // SOL TAKES `_s.qkv` WHENEVER IT IS ON -- three attention windows of
+  // it, which at video geometry is the whole thing -- and the fused
+  // attention spellings READ q/k/v out of it in place, so a Sage carve
+  // there would be quantizing the buffer the attention is reading.
+  // Spare in exactly one case, and this is the only place that says so.
+  const bool sol_on = (bool)_sol && _cfg.sol.dense_layers < _cfg.n_layers;
+  if (sol_on || (_fused_attn & kFusedAttnQkv) != 0) { return 0; }
+  return 3 * (std::size_t)seq * (std::size_t)_cfg.inner() * 2;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
+{
+  if (!_sage || seq <= 0) { return 0; }
+  // The same condition forward() applies: every layer dense means the
+  // int8 path is never reached and nothing is allocated for it.
+  if (_cfg.sage.dense_layers >= _cfg.n_layers) { return 0; }
+  // H3 is MHA, so the KV head count is the query head count. The blocks
+  // are the flash kernel's, not Sage's own choice: the scale arrays are
+  // one entry per its tiles.
+  return MetalSageAttention::private_bytes(
+      _cfg.n_heads, _cfg.n_heads, seq, seq, _cfg.head_dim,
+      MetalSageAttention::nax_query_block(),
+      MetalSageAttention::nax_key_block(), sage_lend_bytes_(seq), 0);
+}
+
 namespace {
 
 // The A/B for the arena carve. Set VPIPE_H3_NO_VDN_ARENA and the branch
@@ -4046,6 +4082,7 @@ MetalMiniMaxH3Transformer::vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
   dims.head_dim = _cfg.head_dim;
   dims.hidden   = _cfg.hidden;
   dims.n_layers = _cfg.n_layers;
+  dims.matrix_cores = _mc != nullptr && _mc->supports_matrix_cores();
   minimax_h3::MetalVdnBranch::Geometry g;
   g.frames   = L.num_video_rows / tpf;
   g.grid_h   = grid_h;
@@ -4674,6 +4711,16 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                         ? _s.attn.subview(4 * win, win)
                         : metal_compute::SharedBuffer{});
   }
+  // AND SAGE'S, out of the same buffer when Sol has not taken it. The
+  // size comes from sage_lend_bytes_ so the preflight and the carve
+  // agree; 0 there means it allocates its own and the estimate says so.
+  if (_sage) {
+    const std::size_t lend = sage_lend_bytes_(seq);
+    _sage->set_arena(lend > 0 && _s.qkv.byte_size() >= lend
+                         ? _s.qkv.subview(0, lend)
+                         : metal_compute::SharedBuffer{},
+                     metal_compute::SharedBuffer{});
+  }
   const bool steel_spans = vdn_linear && _steel_ok && !spans_off;
   // WHAT THE ROUTING KEPT, reported here and reset here, and both for
   // the same reason: this is the only point at which the counter is both
@@ -5136,6 +5183,37 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         sc.sink_start  = 0;
         sc.sink_tokens = main ? L.video_start : 0;
         std::string serr;
+        // SAGE ON SOL'S EXACT HALF. The two are orthogonal -- Sol picks
+        // which key blocks are attended, Sage how the ones that are get
+        // multiplied -- and before this they simply did not meet: the
+        // branch returns here, so a graph naming both ran Sage on the
+        // ONE block Sol leaves dense and nothing said so.
+        //
+        // The prologue goes into the same encoder ahead of Sol's own
+        // passes, over the head-major q/k Sol is about to read. Its
+        // blocks are the EXACT half's, asked of Sol rather than assumed:
+        // the scale arrays are one entry per that kernel's tiles.
+        const bool sage_here =
+            sage_on && _sage && layer >= c.sage.dense_layers &&
+            _sol->uses_matrix_cores();
+        bool sage_ok = false;
+        if (sage_here) {
+          const MetalSageAttention::Operand qo{&s.qh, 0, HD, rows * HD};
+          const MetalSageAttention::Operand ko{&s.kh, 0, HD, rows * HD};
+          std::string gerr;
+          // MetalSolAttention::compose, not c.sage: the key smoothing
+          // is exact under ONE softmax and Sol's row is split across
+          // two, so composing has to quantize K raw. See that function.
+          sage_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, HD,
+                                   _sol->query_block(),
+                                   _sol->key_block_unit(),
+                                   MetalSolAttention::compose(c.sage),
+                                   &gerr);
+          if (!sage_ok && sol_err.empty()) {
+            sol_err = "sage_attn: " + gerr;
+          }
+        }
+        _sol->set_sage(sage_ok ? _sage.get() : nullptr);
         if (!_sol->encode(enc, s.qh, s.kh, s.vh, s.oh, NH, rows, HD, scale,
                           sc, &serr)) {
           sol_err = "sol_attn: " + serr;

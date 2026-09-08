@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <vector>
 
 namespace vpipe {
 namespace genai {
@@ -138,31 +139,81 @@ MetalSageAttention::scratch_buffers_()
   return {&_km, &_kmp, &_q8, &_k8, &_qs, &_ks};
 }
 
-std::size_t
-MetalSageAttention::scratch_bytes(int heads, int kv_heads, int q_tokens,
-                                  int k_tokens, int d, int bq, int bk)
+namespace {
+
+// THE BUFFER LIST AS SIZES, in ensure_scratch_'s own order, padded the
+// way the carve pads. One list with two readers -- the total and the
+// carve simulation -- rather than two arithmetics that have to agree.
+bool
+sage_plan_(int heads, int kv_heads, int q_tokens, int k_tokens, int d,
+           int bq, int bk, std::vector<std::size_t>* out)
 {
+  out->clear();
   if (heads <= 0 || kv_heads <= 0 || q_tokens <= 0 || k_tokens <= 0 ||
       d <= 0 || bq <= 0 || bk <= 0) {
-    return 0;
+    return false;
   }
   const std::size_t H = (std::size_t)heads, D = (std::size_t)d;
   const std::size_t KH = (std::size_t)kv_heads;
   const std::size_t nq = (std::size_t)sage::query_blocks(q_tokens, bq);
   const std::size_t nk = (std::size_t)sage::key_blocks(k_tokens, bk);
-  // Summed with the SAME alignment the carve applies, so a caller that
-  // lends exactly this much finds every buffer fits. A bare sum is
-  // short by up to one alignment per buffer, which strands the tail in
+  // Padded per buffer, because the carve aligns each one: a bare sum is
+  // short by up to one alignment apiece, which strands the tail in
   // private allocations and reads as the lend not working.
   auto pad = [](std::size_t n) {
     return (n + kCarveAlign - 1) & ~(kCarveAlign - 1);
   };
-  return pad(KH * D * 4)                                  // km
-       + pad(KH * (std::size_t)sage::kMeanChunks * D * 4) // kmp
-       + pad(H * (std::size_t)q_tokens * D)               // q8
-       + pad(KH * (std::size_t)k_tokens * D)              // k8
-       + pad(H * nq * 4)                                  // qs
-       + pad(KH * nk * 4);                                // ks
+  out->push_back(pad(KH * D * 4));                                    // km
+  out->push_back(pad(KH * (std::size_t)sage::kMeanChunks * D * 4));   // kmp
+  out->push_back(pad(H * (std::size_t)q_tokens * D));                 // q8
+  out->push_back(pad(KH * (std::size_t)k_tokens * D));                // k8
+  out->push_back(pad(H * nq * 4));                                    // qs
+  out->push_back(pad(KH * nk * 4));                                   // ks
+  return true;
+}
+
+}  // namespace
+
+std::size_t
+MetalSageAttention::scratch_bytes(int heads, int kv_heads, int q_tokens,
+                                  int k_tokens, int d, int bq, int bk)
+{
+  std::vector<std::size_t> plan;
+  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, &plan)) {
+    return 0;
+  }
+  std::size_t n = 0;
+  for (std::size_t b : plan) { n += b; }
+  return n;
+}
+
+std::size_t
+MetalSageAttention::private_bytes(int heads, int kv_heads, int q_tokens,
+                                  int k_tokens, int d, int bq, int bk,
+                                  std::size_t lend_a, std::size_t lend_b)
+{
+  std::vector<std::size_t> plan;
+  if (!sage_plan_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, &plan)) {
+    return 0;
+  }
+  // THE SAME GREEDY CARVE ensure_scratch_ runs: first region that has
+  // room takes it, and anything that fits neither is the caller's own.
+  std::size_t used[2] = {0, 0};
+  const std::size_t cap[2] = {lend_a, lend_b};
+  std::size_t own = 0;
+  for (std::size_t b : plan) {
+    bool placed = false;
+    for (int i = 0; i < 2 && !placed; ++i) {
+      if (cap[i] == 0) { continue; }
+      const std::size_t off = (used[i] + kCarveAlign - 1) & ~(kCarveAlign - 1);
+      if (off < cap[i] && b <= cap[i] - off) {
+        used[i] = off + b;
+        placed = true;
+      }
+    }
+    if (!placed) { own += b; }
+  }
+  return own;
 }
 
 void
@@ -183,6 +234,7 @@ MetalSageAttention::set_arena(const SharedBuffer& a, const SharedBuffer& b)
   drop_residency_();
   for (SharedBuffer* p : scratch_buffers_()) { *p = SharedBuffer{}; }
   _heads = _qt = _kt = _d = 0;
+  _own = 0;
   _ready = false;
   _arena_used[0] = 0;
   _arena_used[1] = 0;
@@ -221,17 +273,24 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
 
   _arena_used[0] = 0;
   _arena_used[1] = 0;
+  _own = 0;
   auto mk = [&](std::size_t n) -> SharedBuffer {
+    // PADDED THE WAY THE PLAN PADS, and asked for at that size: the
+    // allocator rounds a private buffer to a page anyway, so charging
+    // the plan one figure and the carve another is how an estimate and
+    // an allocation come to differ by an alignment apiece.
+    const std::size_t need = (n + kCarveAlign - 1) & ~(kCarveAlign - 1);
     SharedBuffer* reg[2] = {&_arena_a, &_arena_b};
     for (int i = 0; i < 2; ++i) {
       if (reg[i]->empty()) { continue; }
       const std::size_t off =
           (_arena_used[i] + kCarveAlign - 1) & ~(kCarveAlign - 1);
-      if (off < reg[i]->byte_size() && n <= reg[i]->byte_size() - off) {
-        _arena_used[i] = off + n;
+      if (off < reg[i]->byte_size() && need <= reg[i]->byte_size() - off) {
+        _arena_used[i] = off + need;
         return reg[i]->subview(off, n);
       }
     }
+    _own += need;
     return _mc->make_shared_buffer(n);
   };
 
@@ -243,6 +302,7 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   _ks  = mk(KH * (std::size_t)nk * 4);
   if (_km.empty() || _kmp.empty() || _q8.empty() || _k8.empty() ||
       _qs.empty() || _ks.empty()) {
+    _own = 0;
     for (SharedBuffer* p : scratch_buffers_()) { *p = SharedBuffer{}; }
     if (err != nullptr) { *err = "sage_attn scratch allocation failed"; }
     return false;

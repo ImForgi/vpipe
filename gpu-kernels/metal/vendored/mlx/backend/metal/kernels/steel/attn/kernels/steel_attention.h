@@ -47,6 +47,35 @@ constant bool export_ml_set [[function_constant(304)]];
 constant bool export_ml =
     is_function_constant_defined(export_ml_set) ? export_ml_set : false;
 
+// vpipe: a per-(query block, KEY) byte mask, which is what lets this
+// kernel also run Sol-Attn's APPROXIMATE half.
+//
+// That half is an attention over the summary sequence -- one key per
+// routing block -- from which the blocks the routing kept exact must be
+// excluded, or they would be counted twice. The exclusion is decided
+// per query block and per key, which is exactly the routing's own flag
+// array, so nothing is materialised: `block_mask` IS that array, read
+// as [H][params->NQ][params->kL] with a nonzero byte meaning EXCLUDE.
+//
+// A per-element mask (has_mask) would be [qL, kL] -- 50 million bytes a
+// head at video geometry against the flag array's 100 thousand -- and a
+// span list cannot say it at all, the CSR's unit being 16 keys where
+// this decision is per key.
+//
+// A ROW WITH EVERY KEY EXCLUDED IS LEGITIMATE (tau low enough keeps
+// every block) and produces max_score == finite_min, since that is both
+// the initial value and what the mask writes. The caller reads that
+// sentinel and drops the half; see sol_merge_ml_mma.
+//
+// The matrix-core kernel beside this one has carried the same constant
+// at the same number since the Sol port; this is that path on the boxes
+// without matrix cores, and the two are deliberately spelled the same
+// so one driver drives both.
+constant bool has_block_mask_set [[function_constant(305)]];
+constant bool has_block_mask =
+    is_function_constant_defined(has_block_mask_set) ? has_block_mask_set
+                                                     : false;
+
 struct MaxOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
@@ -121,6 +150,9 @@ template <
     // vpipe: [B, H, qL] each, this pass's per-row max and denominator.
     device float* ml_max [[buffer(12), function_constant(export_ml)]],
     device float* ml_sum [[buffer(13), function_constant(export_ml)]],
+    // vpipe: [H, params->NQ, params->kL] bytes; nonzero EXCLUDES.
+    const device uchar* block_mask
+        [[buffer(14), function_constant(has_block_mask)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -439,6 +471,35 @@ template <
               ok = (kf == 0) || (kf == nf - 1);
             }
             if (!ok) { Stile.frag_at(i, j)[jj] = neg_inf; }
+          }
+        }
+      }
+    }
+
+    // vpipe: the routing's own exclusion, per query block and per key.
+    // Column-only -- every row of this query block obeys the same flag
+    // row -- so the row index never enters it, and the length mask
+    // above is repeated here because a key past kL has no flag byte.
+    if (has_block_mask) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      const device uchar* brow =
+          block_mask + (size_t(tid.y) * size_t(params->NQ) + size_t(tid.x)) *
+                           size_t(params->kL);
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            const int c = col_pos + jj;
+            if (c >= params->kL || brow[c] != 0) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
           }
         }
       }

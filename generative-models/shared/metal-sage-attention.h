@@ -90,6 +90,15 @@ class MetalSageAttention {
   static std::size_t scratch_bytes(int heads, int kv_heads, int q_tokens,
                                    int k_tokens, int d, int bq, int bk);
 
+  // ...and what it will still allocate for ITSELF once `lend_a` and
+  // `lend_b` bytes have been lent, which is the figure a caller's
+  // memory plan actually wants. Simulates the same greedy carve
+  // ensure_scratch_ runs, alignment included, so the two cannot
+  // disagree about which buffers fit.
+  static std::size_t private_bytes(int heads, int kv_heads, int q_tokens,
+                                   int k_tokens, int d, int bq, int bk,
+                                   std::size_t lend_a, std::size_t lend_b);
+
   // The steel NAX kernel's tiles at head_dim 128, which is what every
   // DiT in this tree runs. Named rather than open-coded at four call
   // sites: they are the kernel's, and a caller that guessed them wrong
@@ -110,6 +119,14 @@ class MetalSageAttention {
 
   // What this object is holding, arena windows included.
   std::size_t resident_bytes() const;
+
+  // ...and the part of that it allocated ITSELF, the lend having been
+  // too small or absent. This is what a memory plan is actually asking
+  // for, and it is TALLIED as the carve runs rather than inferred from
+  // the device's allocated size -- that figure is process-wide, moves
+  // with every other Metal object, and cannot answer a question about
+  // one object. private_bytes() predicts this number; they must agree.
+  std::size_t private_held() const noexcept { return _own; }
 
   // The prologue for ONE attention call: the key mean, then Q and K
   // quantized per block. Encoded into `e`, before the caller's own
@@ -190,6 +207,8 @@ class MetalSageAttention {
   metal_compute::SharedBuffer _arena_a, _arena_b;
   std::size_t                 _arena_used[2] = {0, 0};
   bool                        _res_added = false;
+  // Tallied by the carve: what did NOT fit in the lend.
+  std::size_t                 _own = 0;
 
   int  _heads = 0, _kvh = 0, _qt = 0, _kt = 0, _d = 0, _bq = 0, _bk = 0;
   bool _ready = false;

@@ -656,7 +656,10 @@ MetalVdnBranch::scratch_bytes(const Dims& dims, const vdn::Config& cfg,
   // The low-rank gate's intermediate, allocated fp32-wide either way.
   mk((std::size_t)tile * S * cfg.linear_head_dim);
   // The matrix-core route's landing buffers and expanded conv weights.
-  const bool mma = dims.bf16_features;   // the route's own precondition
+  // BOTH of the route's preconditions load() tests. The libraries
+  // validating is the third and is not knowable here, so this is an
+  // upper bound in exactly one direction.
+  const bool mma = dims.bf16_features && dims.matrix_cores;
   if (mma) {
     n += std::max(ntile, (std::size_t)Fi * S * H) * 2;   // _mmac
     n += ntile * 2;                                      // _roraw

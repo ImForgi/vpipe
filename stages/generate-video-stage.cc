@@ -1932,7 +1932,13 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // the real carve rather than a subtraction. Zero when Sol is off, and
   // zero before the DiT exists to be asked.
   const std::size_t sol = _h3_dit ? _h3_dit->sol_scratch_bytes(seq) : 0;
-  const std::size_t need = dit + vdn + sol;
+  // AND SAGE'S, which nothing counted until now: its int8 twins of q
+  // and k are one byte per element where the tensors are two, so at
+  // video geometry they are ~1.5 GB the plan had never heard of. Zero
+  // when the setting is off, and reduced by whatever the forward arena
+  // could lend -- see MetalMiniMaxH3Transformer::sage_lend_bytes_.
+  const std::size_t sage = _h3_dit ? _h3_dit->sage_scratch_bytes(seq) : 0;
+  const std::size_t need = dit + vdn + sol + sage;
 
   // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
   // inside the predicates.
@@ -1990,6 +1996,13 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
         vdn > 0 ? fmt(" ({} MB of it the VDN branch's, plus {} MB of arena "
                       "it shares with the attention)", vdn >> 20,
                       vdn_arena >> 20)()
+        // SAGE IS NAMED WHEN IT COSTS SOMETHING, because unlike Sol's
+        // it is not always borrowed: it fits in the forward arena only
+        // when Sol has not taken that buffer, and this is the figure
+        // that used to be missing from the sum entirely.
+        : sage > 0 ? fmt(" ({} MB of it SageAttention's int8 q/k; "
+                         "Sol-Attn's own scratch is borrowed, not added)",
+                         sage >> 20)()
         : _sol.enabled ? std::string(" (Sol-Attn's own scratch is "
                                      "borrowed, not added)")
                        : std::string()));

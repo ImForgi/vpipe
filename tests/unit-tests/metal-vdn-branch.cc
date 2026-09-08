@@ -1225,6 +1225,12 @@ TEST(metal_vdn_branch, the_scratch_estimate_matches_the_allocation)
   MetalVdnBranch::Dims dims;
   dims.heads = 56; dims.head_dim = 128; dims.hidden = 5376;
   dims.n_layers = 50;
+  // WHAT THIS BOX WILL ACTUALLY TAKE. The matrix-core route allocates
+  // three buffers the ALU one does not, so an estimate that assumed the
+  // route was available reported them on a GPU that never reserved
+  // them -- the estimate 67 MB over the allocation, and this test the
+  // only thing that said so.
+  dims.matrix_cores = mc->supports_matrix_cores();
   std::unique_ptr<MetalVdnBranch> br =
       MetalVdnBranch::load(ws, mc, cfg, dims, &err);
   ASSERT_TRUE(br != nullptr);
