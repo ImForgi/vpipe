@@ -2410,6 +2410,14 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
     return false;
   }
   if (!route_ok_(route, M, N, K)) { return false; }
+  // Accelerated mode, NATIVE: the int8 activation against the checkpoint's
+  // own codes, before any dequant exists. A shape it declines falls
+  // through to the dequant + requant form below, nothing encoded.
+  if (_i8 && l.quantized &&
+      _i8->gemm_affine(enc, x, x_off, l.codes, l.scales, l.qbias, l.bits, y,
+                       y_off, M, N, K)) {
+    return true;
+  }
   const SharedBuffer* wdense = nullptr;
   if (l.quantized) {
     const metal_compute::ComputeFunction& dq =

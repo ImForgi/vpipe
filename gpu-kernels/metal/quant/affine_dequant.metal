@@ -363,6 +363,48 @@ kernel void quant_f16_i8_g64_bfp(
   }
 }
 
+// EXPONENT-emitting twin of quant_f16_i8_g64_bfp, for the shift-aligned
+// integer-accumulate GEMMs (gemm_i8i8_sc_f16_n64_g64ri): the same
+// integer pipeline and the same q, but buffer 2 is the raw exponent
+// Emax - 21 as int8 (range [-21, 9]) instead of the f16 scale 2^(Emax-21).
+// Over a row-major [M, K] matrix with K % 64 == 0 the exponents land as
+// [M, K/64] row-major, which is the GEMM's sa layout.
+//   0:x[n] f16  1:q[n] i8  2:eexp[n/64] i8  3:n (n % 64 == 0)
+//   dispatch (threads): {n/2, 1, 1}, tg {128, 1, 1}
+kernel void quant_f16_i8_g64_bfpe(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device char*       eexp   [[buffer(2)]],
+    const constant int& n     [[buffer(3)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint base = tid * 2;
+  if (base + 1 >= (uint)n) { return; }
+  const half2 h = *reinterpret_cast<const device half2*>(x + base);
+  const ushort2 u = as_type<ushort2>(h);
+  const ushort e0 = (u.x >> 10) & 0x1F, e1 = (u.y >> 10) & 0x1F;
+  const ushort emax = simd_max(max(e0, e1));
+
+  char2 o;
+  {
+    const ushort m = (u.x & 0x3FF) | 0x400;
+    const ushort s = 4 + (emax - e0);
+    int v = (e0 == 0 || s > 14) ? 0 : (int)((m + (1 << (s - 1))) >> s);
+    v = min(v, 127);
+    o.x = (char)((u.x & 0x8000) ? -v : v);
+  }
+  {
+    const ushort m = (u.y & 0x3FF) | 0x400;
+    const ushort s = 4 + (emax - e1);
+    int v = (e1 == 0 || s > 14) ? 0 : (int)((m + (1 << (s - 1))) >> s);
+    v = min(v, 127);
+    o.y = (char)((u.y & 0x8000) ? -v : v);
+  }
+  *reinterpret_cast<device char2*>(q + base) = o;
+  if (lane == 0) { eexp[base / 64] = (char)((int)emax - 21); }
+}
+
 // Float amax baseline for the A/B: same block/grid contract.
 kernel void quant_f16_i8_g64_amax(
     const device half* x      [[buffer(0)]],
@@ -575,6 +617,198 @@ kernel void quant_f16_i8_row_g512_pad(
       scales[(int64_t)row * G + g] = (VPIPE_ELT)(am * (1.0f / 127.0f));
     }
   }
+}
+
+// GROUP-32 / 64 / 128 twins of quant_f16_i8_row_g512 / _pad, for the
+// register-resident int8 GEMM (gemm_i8i8_sc_f16_n64_g{32,64,128}rs),
+// which contracts in KC-wide groups on both operands. Same row dispatch
+// ({256, M, 1}, eight simdgroups per row), one simdgroup per group: 32
+// lanes x KC/32 elements. Scales layout [M, Kpad/KC]. The padding twin
+// zero-fills to Kpad, which is exact for the reason given at
+// quant_f16_i8_row_g512_pad.
+//   0:x[M,Ksrc] 1:q[M,Kpad] 2:scales[M,Kpad/KC] 3:Ksrc (4:Kpad, _pad)
+template <int KC, bool PAD>
+static inline void quant_row_gk_impl(
+    const device VPIPE_ELT* x, device char* q, device VPIPE_ELT* scales,
+    int Ksrc, int Kpad, uint2 tgid, uint sgid, uint lane)
+{
+  static_assert(KC == 32 || KC == 64 || KC == 128,
+                "one, two or four elements per lane");
+  constexpr int EPL = KC / 32;
+  const int row = (int)tgid.y;
+  const int G = Kpad / KC;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int col = g * KC + (int)lane * EPL;
+    const int64_t src = (int64_t)row * Ksrc + col;
+    const int64_t dst = (int64_t)row * Kpad + col;
+    float h[EPL];
+    if (!PAD || col + EPL - 1 < Ksrc) {
+      if constexpr (EPL == 1) {
+        h[0] = (float)x[src];
+      } else {
+        const vec<VPIPE_ELT, EPL> v =
+            *reinterpret_cast<const device vec<VPIPE_ELT, EPL>*>(x + src);
+        for (int i = 0; i < EPL; ++i) { h[i] = (float)v[i]; }
+      }
+    } else {
+      // The last group of a padded row straddles the source's end: per
+      // element, and zero past it.
+      for (int i = 0; i < EPL; ++i) {
+        h[i] = (col + i < Ksrc) ? (float)x[src + i] : 0.0f;
+      }
+    }
+    float am = 0.0f;
+    for (int i = 0; i < EPL; ++i) { am = max(am, fabs(h[i])); }
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    if constexpr (EPL == 1) {
+      q[dst] = (char)clamp((int)rint(h[0] * inv), -127, 127);
+    } else {
+      vec<char, EPL> o;
+      for (int i = 0; i < EPL; ++i) {
+        o[i] = (char)clamp((int)rint(h[i] * inv), -127, 127);
+      }
+      *reinterpret_cast<device vec<char, EPL>*>(q + dst) = o;
+    }
+    if (lane == 0) {
+      scales[(int64_t)row * G + g] = (VPIPE_ELT)(am * (1.0f / 127.0f));
+    }
+  }
+}
+
+#define VPIPE_QUANT_ROW_GK(NAME, KC)                                     \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      device char* q [[buffer(1)]],                                      \
+      device VPIPE_ELT* scales [[buffer(2)]],                            \
+      const constant int& K [[buffer(3)]],                              \
+      uint2 tgid [[threadgroup_position_in_grid]],                       \
+      uint sgid [[simdgroup_index_in_threadgroup]],                      \
+      uint lane [[thread_index_in_simdgroup]]) {                         \
+    quant_row_gk_impl<KC, false>(x, q, scales, K, K, tgid, sgid, lane);  \
+  }                                                                      \
+  kernel void NAME##_pad(                                                \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      device char* q [[buffer(1)]],                                      \
+      device VPIPE_ELT* scales [[buffer(2)]],                            \
+      const constant int& Ksrc [[buffer(3)]],                           \
+      const constant int& Kpad [[buffer(4)]],                           \
+      uint2 tgid [[threadgroup_position_in_grid]],                       \
+      uint sgid [[simdgroup_index_in_threadgroup]],                      \
+      uint lane [[thread_index_in_simdgroup]]) {                         \
+    quant_row_gk_impl<KC, true>(x, q, scales, Ksrc, Kpad, tgid, sgid,    \
+                                lane);                                   \
+  }
+
+VPIPE_QUANT_ROW_GK(quant_f16_i8_row_g64, 64)
+VPIPE_QUANT_ROW_GK(quant_f16_i8_row_g32, 32)
+VPIPE_QUANT_ROW_GK(quant_f16_i8_row_g128, 128)
+
+// UNSIGNED twin of quant_f16_i8_row_g64 for the native affine GEMM
+// (gemm_u8q_*): the same symmetric int8 code stored as q + 128 -- the
+// matrix units' unsigned x unsigned form -- plus, per (row, group), the
+// SUM of the signed codes the epilogue needs to take the offset back
+// out (|sum| <= 64 * 127, so int16). K % 64 == 0.
+// Buffer 5 is the same sum pre-scaled, u = scale * sum, in the element
+// type: the operand of the zero-point matmul (see gemm_u8q_impl).
+//   0:x[M,K] 1:q[M,K] u8 2:scales[M,K/64] 3:xsum[M,K/64] i16 4:K
+//   5:u[M,K/64]   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void quant_f16_u8_row_g64(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device uchar*           q      [[buffer(1)]],
+    device VPIPE_ELT*       scales [[buffer(2)]],
+    device short*           xsum   [[buffer(3)]],
+    const constant int& K     [[buffer(4)]],
+    device VPIPE_ELT*       u      [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = K / 64;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int64_t at = (int64_t)row * K + g * 64 + (int)lane * 2;
+    const vec<VPIPE_ELT, 2> h =
+        *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(x + at);
+    float am = max(fabs((float)h.x), fabs((float)h.y));
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    const int qx = clamp((int)rint((float)h.x * inv), -127, 127);
+    const int qy = clamp((int)rint((float)h.y * inv), -127, 127);
+    *reinterpret_cast<device uchar2*>(q + at) =
+        uchar2((uchar)(qx + 128), (uchar)(qy + 128));
+    const int sum = simd_sum(qx + qy);
+    if (lane == 0) {
+      const VPIPE_ELT sc = (VPIPE_ELT)(am * (1.0f / 127.0f));
+      scales[(int64_t)row * G + g] = sc;
+      xsum[(int64_t)row * G + g] = (short)sum;
+      u[(int64_t)row * G + g] = (VPIPE_ELT)((float)sc * (float)sum);
+    }
+  }
+}
+
+// Per-(channel, 64-group) sums of an affine weight's codes, for the
+// native GEMM's offset correction (see gemm_u8q_impl). One thread per
+// group: 16 words of 4 bytes (w8) or 8 words of 8 nibbles (w4). Sums
+// are <= 64 * 255, so int16. Buffers 4-6 add the scaled form the
+// CMODE=1 kernel reads instead.
+//   0:w(uint32) 1:wsum[N,K/64] i16 2:K 3:N 4:scales 5:c_hi 6:c_lo
+//   grid (threads) {K/64, N, 1}
+kernel void affine_group_sums_w8g64(
+    const device uint32_t* w    [[buffer(0)]],
+    device short*          wsum [[buffer(1)]],
+    const constant int& K [[buffer(2)]],
+    const constant int& N [[buffer(3)]],
+    const device VPIPE_ELT* scales [[buffer(4)]],
+    device VPIPE_ELT*       c_hi   [[buffer(5)]],
+    device VPIPE_ELT*       c_lo   [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int g = (int)gid.x, n = (int)gid.y;
+  const int G = K / 64;
+  if (n >= N || g >= G) { return; }
+  const device uint32_t* p = w + (int64_t)n * (K >> 2) + g * 16;
+  int sum = 0;
+  for (int i = 0; i < 16; ++i) {
+    const uint32_t v = p[i];
+    sum += (int)(v & 0xffu) + (int)((v >> 8) & 0xffu) +
+           (int)((v >> 16) & 0xffu) + (int)(v >> 24);
+  }
+  wsum[(int64_t)n * G + g] = (short)sum;
+  // -128 * s * Q as a two-term element-type expansion, for the CMODE=1
+  // kernel's post-loop matmul.
+  const float c = -128.0f * (float)scales[(int64_t)n * G + g] * (float)sum;
+  const VPIPE_ELT hi = (VPIPE_ELT)c;
+  c_hi[(int64_t)n * G + g] = hi;
+  c_lo[(int64_t)n * G + g] = (VPIPE_ELT)(c - (float)hi);
+}
+
+kernel void affine_group_sums_w4g64(
+    const device uint32_t* w    [[buffer(0)]],
+    device short*          wsum [[buffer(1)]],
+    const constant int& K [[buffer(2)]],
+    const constant int& N [[buffer(3)]],
+    const device VPIPE_ELT* scales [[buffer(4)]],
+    device VPIPE_ELT*       c_hi   [[buffer(5)]],
+    device VPIPE_ELT*       c_lo   [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int g = (int)gid.x, n = (int)gid.y;
+  const int G = K / 64;
+  if (n >= N || g >= G) { return; }
+  const device uint32_t* p = w + (int64_t)n * (K >> 3) + g * 8;
+  int sum = 0;
+  for (int i = 0; i < 8; ++i) {
+    uint32_t v = p[i];
+    for (int j = 0; j < 8; ++j) { sum += (int)(v & 0xfu); v >>= 4; }
+  }
+  wsum[(int64_t)n * G + g] = (short)sum;
+  // -128 * s * Q as a two-term element-type expansion, for the CMODE=1
+  // kernel's post-loop matmul.
+  const float c = -128.0f * (float)scales[(int64_t)n * G + g] * (float)sum;
+  const VPIPE_ELT hi = (VPIPE_ELT)c;
+  c_hi[(int64_t)n * G + g] = hi;
+  c_lo[(int64_t)n * G + g] = (VPIPE_ELT)(c - (float)hi);
 }
 
 // POW2-scale (block-floating-point) twin of quant_f16_i8_row_g512, for

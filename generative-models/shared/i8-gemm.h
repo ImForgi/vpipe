@@ -14,12 +14,48 @@ namespace genai {
 
 // Dynamic-int8 accelerated GEMM ("accelerated mode" for large matmuls --
 // DiT blocks, LLM prefill): the f16/bf16 activation is quantized ON THE FLY
-// to i8 with per-(row, 512-group) scales (quant_f16_i8_row_g512), the
-// f16/bf16 weight (dense, or a dequant scratch) is quantized per-(out-
-// channel, 512-group) into a reusable i8 scratch, and the product runs on
-// the matrix units' int8 pipe -- ~2x the matmul2d rate at qualifying shapes
-// -- accumulating each 512-deep group in f32 with its own scales
-// (gemm_i8i8_sc_f16_n64_g512) and storing the element type back.
+// to i8 with per-(row, group) scales, the f16/bf16 weight (dense, or a
+// dequant scratch) is quantized per-(out-channel, group) into a reusable
+// i8 scratch, and the product runs on the matrix units' int8 pipe -- ~2x
+// the matmul2d rate at qualifying shapes -- accumulating each group in f32
+// with its own pair of scales and storing the element type back.
+//
+// THE GROUP IS 64 on both operands (quant_f16_i8_row_g64 +
+// gemm_i8i8_sc_f16_n64_g64rs). It was 512, and the reason it could not be
+// finer was the kernel, not the quantization: the drained per-group kernel
+// paid a threadgroup round-trip per group, which MEASURED g64 at 6.4 TOP/s
+// against g512's 19.3 -- below f16. The register-resident kernel keeps the
+// partial in a cooperative tensor and stages each strip of scales once,
+// and at that design g64 runs 17.4 / 16.9 TOP/s (shallow / deep K) against
+// the same kernel's 21.3 / 19.3 at 512 -- so the finer group costs 12-18%
+// of the coarser one's rate and buys the precision a 64-wide group has
+// over a 512-wide one on every outlier channel (gemm_i8.group_size,
+// gemm_i8.g64_register_acc). VPIPE_I8_GROUP=512 selects the old pair for
+// an A/B, and 32 / 128 the same register design one step finer or
+// coarser; anything else is 64.
+//
+// THE WHOLE SET ON ONE DESIGN, MEASURED on the M5 (gemm_i8.group_size
+// at 4096x12288x4096 / 4096x4096x12288; gemm_i8.group_quality rel-L2
+// vs f64 on gaussian data and on data with one outlier channel in 64 at
+// 32x; the Krea-2 DiT forward against f16; VOSR's int8 tier, whose
+// plain matrix-core tier is 303 ms):
+//
+//   group   TOP/s          gaussian  outliers  Krea-2   VOSR
+//    32     14.0 / 13.6    7.6e-3    1.35e-2   5.6e-3   361 ms  4.40e-2
+//    64     17.3 / 16.4    8.4e-3    1.86e-2   8.3e-3   297 ms  4.72e-2
+//   128     19.3 / 18.5    9.2e-3    2.36e-2   7.5e-3   303 ms  5.81e-2
+//   512     20.3 / 19.2   10.6e-3    3.38e-2  11.3e-3   273 ms  7.12e-2
+//
+// The depth is never the cost: a 32-deep matmul into the cooperative
+// accumulator runs at the 512-deep rate (kaccr-32 19.6 against
+// kaccr-512 20.2). The cost is the epilogue, once per group per output,
+// so halving the group adds the same work again -- g32 sits 30% under
+// its ceiling, g64 13%, g128 4%. What a finer group buys is on the
+// outlier row, which is what real activations look like. 64 is the
+// default because 32 turns VOSR's int8 tier SLOWER than its plain
+// matrix-core tier and 128 gives back a third of the outlier-row
+// precision for 12% of rate. (Krea-2's 128 < 64 is a single forward's
+// rel-L2, not a trend; the unit rows are monotone.)
 //
 // The activation/weight/scale/output element type is chosen by `bf16`: the
 // f16 caller loads the `dense_gemm_mma`/`affine_dequant` metallibs, the bf16
@@ -45,7 +81,7 @@ class I8GemmContext {
   bool enabled() const { return _on; }
 
   // Shape gate: the win regime is big-M compute-bound GEMMs (measured
-  // crossover ~1k rows on M5). K must split into whole 512-groups, OR the
+  // crossover ~1k rows on M5). K must split into whole groups, OR the
   // padding quantizer must be available to make it so -- see kpad_() -- and
   // the padding must be CHEAP, which is the last clause.
   //
@@ -53,11 +89,11 @@ class I8GemmContext {
   // call, and the int8 rate has to beat bf16 by more than that for the mode
   // to still pay. Capped at _max_pad_pct (10 by default).
   //
-  // Where the cap bites: the pad is at most 511, so any K >= 10*512 = 5120
-  // passes whatever its remainder (511/5120 = 9.98%). Below that it depends
-  // entirely on K % 512 -- K=2816 pads 256 (9.1%, taken), K=1600 pads 448
-  // (28%, refused). So the rule reads as "shallow contractions must be
-  // nearly aligned already; deep ones need not care".
+  // Where the cap bites depends on the group. At 512 the pad is at most
+  // 511, so any K >= 5120 passes whatever its remainder and below that it
+  // depends on K % 512 -- K=2816 pads 256 (9.1%, taken), K=1600 pads 448
+  // (28%, refused). At 64 the pad is at most 63, which is under the cap
+  // for every K this gate admits, so the clause is dormant there.
   bool accepts(int M, int N, int K) const
   {
     if (!_on || M < _min_m || K < 1024 || N < 16) { return false; }
@@ -93,6 +129,92 @@ class I8GemmContext {
             const metal_compute::SharedBuffer& b,
             const metal_compute::SharedBuffer& y, std::size_t ye,
             int M, int N, int K);
+
+  // ---- NATIVE affine consumption -----------------------------------
+  //
+  // The checkpoint's own codes -- MLX affine, w = s*q + b, group 64, w4
+  // nibbles or w8 bytes, scales and biases [N, K/64] in the element type
+  // -- against the int8 activation, with no dequant scratch and no
+  // requant: the matrix units read the codes as they lie (uint8 x uint8
+  // or uint8 x uint4), and the scale and zero point are folded into the
+  // f32 epilogue exactly (gemm_u8q_impl). Per call it costs the u8
+  // activation quant and one pass over the codes for their group sums;
+  // it saves the dequant pass, the requant pass, the N*K*2 dense scratch
+  // and the second quantization of the weight.
+  //
+  // MEASURED on the M5 (gemm_i8.native_affine_rate, the whole route a
+  // caller pays, dequant + act quant + requant + GEMM against act quant
+  // + code sums + GEMM), time relative to the dequant + requant route:
+  //
+  //   w8  H3 fc2       1024 x 7168 x 14336   1.21x
+  //   w8  square       4096 x 4096 x 4096    1.01x
+  //   w4  FLUX.2 proj  4096 x 12288 x 4096   0.83x
+  //   w4  deep K       4096 x 4096 x 12288   0.83x
+  //
+  // and f32 quality 6.1e-3 against the round trip's 7.1e-3 at 256 x 512
+  // x 1024, both widths -- the weight is quantized once, not twice. The
+  // w4 loss is the matrix pipe's: uint8 x uint4 runs 17.6 TOP/s where
+  // int8 x int8 runs 22.2 (gemm_i8.native_affine_kernel_arms), and that
+  // 20% is more than the two passes it saves in isolation. A signed
+  // 4-bit code format (int8 x int4b, 18.8) measured 14.9 against the
+  // requant kernel's 17.3 and would not close it either.
+  //
+  // IN A MODEL the w4 gap is much smaller than that microbench: the
+  // round trip's two weight passes stream every weight twice more from
+  // DRAM per call, which the one-weight-cache-warm microbench under-
+  // prices. MEASURED, FLUX.2-klein-9B (w4) DiT step, i8 on:
+  //
+  //   768^2  (seq 2368)   requant 3007 ms   native 3014 ms   1.00x
+  //   1024^2 (seq 4160)   requant 5325 ms   native 5537 ms   0.96x
+  //
+  // with the DiT's drift against bf16 3.71e-2 -> 3.40e-2, and no dequant
+  // scratch (N*K*2) nor requant scratch (N*K) held for the run. MiniMax-
+  // H3 (w8): the LoRA test's "int8 alone moves" 1.02e-2 -> 9.7e-3 at
+  // 1.0-1.2x the route rate. So the DEFAULT is native for BOTH widths,
+  // at the price of up to 4% on a 1024^2 w4 DiT step: VPIPE_I8_NATIVE =
+  // 0 (off), 8 (w8 only, the fastest), 4 (w4 only), 1 or 12 (both, the
+  // default).
+  //
+  // Returns false with nothing encoded when the shape does not qualify
+  // (as accepts(), and K % 64 == 0 -- a g64 checkpoint's K always is),
+  // when bits is not 4 or 8, when the group is not 64, or when the
+  // policy above excludes the width; the caller then takes its dequant
+  // path and the requant gemm() above.
+  bool gemm_affine(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xe,
+                   const metal_compute::SharedBuffer& codes,
+                   const metal_compute::SharedBuffer& scales,
+                   const metal_compute::SharedBuffer& qbias, int bits,
+                   const metal_compute::SharedBuffer& y, std::size_t ye,
+                   int M, int N, int K)
+  {
+    return gemm_affine(enc, x, xe, codes, scales, qbias, bits,
+                       metal_compute::SharedBuffer{}, y, ye, M, N, K);
+  }
+  bool gemm_affine(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xe,
+                   const metal_compute::SharedBuffer& codes,
+                   const metal_compute::SharedBuffer& scales,
+                   const metal_compute::SharedBuffer& qbias, int bits,
+                   const metal_compute::SharedBuffer& b,
+                   const metal_compute::SharedBuffer& y, std::size_t ye,
+                   int M, int N, int K);
+
+  // Whether gemm_affine can run at all for this bit width.
+  bool native_available(int bits) const
+  {
+    if (!_on || _group != 64 || !_fn_quant_u8.valid()) { return false; }
+    if (bits == 8) {
+      return (_native & 8) != 0 && _fn_u8q_w8.valid() && _fn_wsum8.valid();
+    }
+    if (bits == 4) {
+      return (_native & 4) != 0 && _fn_u8q_w4.valid() && _fn_wsum4.valid();
+    }
+    return false;
+  }
+  // The native policy mask (8 | 4), and a way for a test to set it.
+  int native_policy() const { return _native; }
+  void set_native_policy(int mask) { _native = mask & 12; }
 
   // Drop the grow-only act/weight scratches (they re-grow on demand at the
   // next gemm()). Call between generations on a memory-bounded box so the
@@ -219,9 +341,35 @@ class I8GemmContext {
   // wants to know the tuner's answer took effect has to ask.
   int plan_for_test(int M, int N, int K) const { return plan_(M, N, K); }
 
+  // The quantization group on both operands (64; 32, 128 or 512 under
+  // the A/B).
+  int group() const { return _group; }
+
  private:
   metal_compute::MetalCompute* _mc = nullptr;
   bool _on = false;
+  int _group = 64;                   // VPIPE_I8_GROUP: 32|64|128|512
+  int _native = 12;                  // VPIPE_I8_NATIVE: 8 | 4 mask
+  metal_compute::ComputeFunction _fn_quant_u8, _fn_wsum8, _fn_wsum4;
+  metal_compute::ComputeFunction _fn_u8q_w8, _fn_u8q_w4;
+  metal_compute::ComputeFunction _fn_u8q_w8_sk, _fn_u8q_w4_sk;
+  // Native-path scratches: u8 activations [M,K], their row-group sums
+  // [M,G] i16, and the weight's group sums [N,G] i16 (the activation
+  // scales share _as).
+  metal_compute::SharedBuffer _xu, _xs, _wsum, _uf, _chi, _clo;
+  int _cmode = 1;                    // VPIPE_I8_NATIVE_CMODE (0 | 1)
+  metal_compute::ComputeFunction _fn_u8q_w8_cm, _fn_u8q_w4_cm;
+  metal_compute::ComputeFunction _fn_u8q_w8_cm_sk, _fn_u8q_w4_cm_sk;
+
+ public:
+  // The form of the -128*Q correction: 0 = per group in integer, 1 =
+  // folded into the post-loop matmul as an f16 hi/lo pair. 1 is the
+  // default -- MEASURED never slower, 4-8% faster where the staged
+  // column it drops was the last one. Test knob.
+  void set_native_cmode(int m) { _cmode = m == 1 ? 1 : 0; }
+  int native_cmode() const { return _cmode; }
+
+ private:
   int _min_m = 1024;
   int _max_pad_pct = 10;   // VPIPE_I8_MAX_PAD_PCT
   metal_compute::ComputeLibrary _lib_q, _lib_g;
@@ -273,12 +421,16 @@ class I8GemmContext {
   // else the measured-safe default. See the note on `tune`.
   int plan_(int M, int N, int K) const;
 
-  // K rounded up to a whole number of 512-groups. The int8 GEMM contracts
-  // in 512-wide chunks, so a K that is not a multiple of 512 has no chunk
-  // to sit in; the quantizer zero-fills up to here instead, which is exact
-  // (zeros add nothing to the dot product and cannot move an absmax scale)
-  // and costs (kpad-K)/K extra int8 MACs -- 4.8% at H3's hidden 5376.
-  static int kpad_(int K) { return ((K + 511) / 512) * 512; }
+  // K rounded up to a whole number of groups. The int8 GEMM contracts in
+  // group-wide chunks, so a K that is not a multiple of the group has no
+  // chunk to sit in; the quantizer zero-fills up to here instead, which is
+  // exact (zeros add nothing to the dot product and cannot move an absmax
+  // scale) and costs (kpad-K)/K extra int8 MACs -- 4.8% at H3's hidden
+  // 5376 under the 512 group, none at all under 64.
+  int kpad_(int K) const
+  {
+    return ((K + _group - 1) / _group) * _group;
+  }
   // Grow-only scratches: xq[M,K] i8 + as[M,G] scales (activations),
   // wq[N,K] i8 + ws[N,G] scales (per-call weight re-quant). Scales are the
   // element type (2 bytes either way), so the byte sizes are format-agnostic.

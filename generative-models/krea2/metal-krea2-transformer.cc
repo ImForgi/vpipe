@@ -1551,6 +1551,14 @@ MetalKrea2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
   // GEMM for a resolution nothing can allocate is not the same trade.
   // See shared/mma-tile.h.
   if (M > mma_row_band(N, K)) { return false; }
+  // Accelerated mode, NATIVE: the int8 activation against the checkpoint's
+  // own codes, before any dequant exists. A shape it declines falls
+  // through to the dequant + requant form below, nothing encoded.
+  if (_i8 && w.quantized &&
+      _i8->gemm_affine(enc, xin, 0, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
   const SharedBuffer* wdense;
   if (w.quantized) {
     const metal_compute::ComputeFunction& dq =

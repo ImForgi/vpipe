@@ -892,30 +892,50 @@ TEST(mlp_fuse, i8_kpad)
   if (mc == nullptr || !mc->valid() || !mc->supports_matrix_cores()) {
     return;
   }
-  genai::I8GemmContext i8(mc, /*want=*/true, /*bf16=*/false);
-  if (!i8.enabled()) {
-    std::printf("[mlp_i8pad] i8 gemm unavailable -- skip\n");
-    return;
-  }
-  // The padding-cost gate: exact K is always in, a small pad on a deep K is
-  // in, the same pad on a shallow K is out. 511 is the largest pad there
-  // is, so everything at or above 10*512 = 5120 passes regardless.
+  // The padding-cost gate depends on the group. At 512: exact K is always
+  // in, a small pad on a deep K is in, the same pad on a shallow K is out
+  // -- 511 is the largest pad there is, so everything at or above 10*512
+  // = 5120 passes regardless. At 64 the largest pad is 63, under the 10%
+  // cap for every K the gate admits, so the clause is dormant and every
+  // shape here is in. Both are run: 64 ships, 512 is the A/B pair.
   struct Gate { int K; bool want; const char* why; };
-  const Gate gates[] = {
+  const Gate gates512[] = {
       {5120, true,  "exact, no pad"},
       {5376, true,  "pad 256 of 5376 = 4.8%"},
       {2816, true,  "pad 256 of 2816 = 9.1%"},
       {1600, false, "pad 448 of 1600 = 28%"},
       {1088, false, "pad 448 of 1088 = 41%"},
   };
-  for (const Gate& g : gates) {
+  const Gate gates64[] = {
+      {5120, true,  "exact, no pad"},
+      {5376, true,  "exact at 64 (84 groups)"},
+      {1600, true,  "exact at 64 (25 groups)"},
+      {1030, true,  "pad 58 of 1030 = 5.6%, under the cap"},
+  };
+  struct Unset { ~Unset() { ::unsetenv("VPIPE_I8_GROUP"); } } unset;
+  for (int grp : {64, 512}) {
+  ::setenv("VPIPE_I8_GROUP", grp == 64 ? "64" : "512", 1);
+  genai::I8GemmContext i8(mc, /*want=*/true, /*bf16=*/false);
+  if (!i8.enabled()) {
+    std::printf("[mlp_i8pad] i8 gemm unavailable -- skip\n");
+    return;
+  }
+  EXPECT_TRUE(i8.group() == grp);
+  std::printf("[mlp_i8pad] ---- group %d ----\n", grp);
+  const Gate* gates = grp == 64 ? gates64 : gates512;
+  const int n_gates = grp == 64 ? 4 : 5;
+  for (int gi = 0; gi < n_gates; ++gi) {
+    const Gate& g = gates[gi];
     const bool got = i8.accepts(4096, 512, g.K);
     std::printf("[mlp_i8pad] accepts(K=%4d) = %-5s (want %-5s) -- %s\n",
                 g.K, got ? "true" : "false", g.want ? "true" : "false",
                 g.why);
     EXPECT_TRUE(got == g.want);
   }
-  const int M = 1024, N = 512, K = 5376, KP = 5632;
+  // A K that actually pads under this group: 5376 -> 5632 at 512, and
+  // 5400 -> 5440 at 64 (5376 is exact there).
+  const int M = 1024, N = 512;
+  const int K = grp == 64 ? 5400 : 5376, KP = grp == 64 ? 5440 : 5632;
   if (!i8.accepts(M, N, K)) {
     std::printf("[mlp_i8pad] K=%d still rejected -- padding not wired\n", K);
     EXPECT_TRUE(false);
@@ -970,6 +990,7 @@ TEST(mlp_fuse, i8_kpad)
   std::printf("[mlp_i8pad] K=%d vs explicit KP=%d: %zu/%d differ, max|d| "
               "%.3e\n", K, KP, ndiff, M * N, maxabs);
   EXPECT_TRUE(ndiff == 0);
+  }  // for grp
 }
 
 // The band/split interaction for the H3 video VAE's encoder convs.

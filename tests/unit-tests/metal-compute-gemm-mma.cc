@@ -3702,8 +3702,16 @@ TEST(gemm_i8, context_split_matches_single_op) {
     ~Unset() {
       ::unsetenv("VPIPE_I8_GEMM_MIN_M");
       ::unsetenv("VPIPE_I8_SPLITK_MAX_MB");
+      ::unsetenv("VPIPE_I8_GROUP");
     }
   } unset;
+
+  // BOTH GROUPS: 64 is what ships, 512 is the drained pair kept for the
+  // A/B, and each has its own split-K twin to get right.
+  for (int grp : {32, 64, 128, 512}) {
+  ::setenv("VPIPE_I8_GROUP", std::to_string(grp).c_str(), 1);
+  ::unsetenv("VPIPE_I8_SPLITK_MAX_MB");
+  std::printf("[gemm_i8ctx] ---- group %d ----\n", grp);
 
   auto run = [&](vpipe::genai::I8GemmContext& ctx, SharedBuffer& dst) {
     CommandStream st = mc->make_command_stream();
@@ -3714,16 +3722,21 @@ TEST(gemm_i8, context_split_matches_single_op) {
 
   vpipe::genai::I8GemmContext base(mc, /*want=*/true, /*bf16=*/false);
   if (!base.enabled()) { return; }
+  EXPECT_TRUE(base.group() == grp);
   base.bypass_split = true;                 // the single-op reference
   run(base, y0);
 
-  // Every balanced split this shape admits (G = 8), each forced, and each
-  // at a plane budget that makes the row blocking do real work: 8 MB of
-  // planes at S=8 is 256 rows, so M=512 becomes two bands.
+  // Every balanced split this shape admits (G = 8 at 512, 64 at 64),
+  // each forced, and each at a plane budget that makes the row blocking
+  // do real work: 8 MB of planes at S=8 is 256 rows, so M=512 becomes
+  // two bands.
   ::setenv("VPIPE_I8_SPLITK_MAX_MB", "8", 1);
   vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  // A vacuous pass is what hid a deleted split kernel once: the split
+  // twins are part of the contract now, not optional here.
+  EXPECT_TRUE(ctx.split_available());
   if (!ctx.split_available()) {
-    std::printf("[gemm_i8ctx] split kernels unavailable -- skip\n");
+    std::printf("[gemm_i8ctx] split kernels unavailable\n");
     return;
   }
   const std::vector<int> cands = ctx.split_candidates(M, N, K);
@@ -3739,8 +3752,17 @@ TEST(gemm_i8, context_split_matches_single_op) {
     // wherever the output happens to land near zero, and with half a
     // million outputs one always does. The dense split-K reports its
     // drift the same way (mma-splitk.h: "differ by at most one f16 ulp").
-    std::size_t diff = 0, worst_ulp = 0;
-    double worst_abs = 0.0, num = 0.0, den = 0.0;
+    //
+    // ...GATED BY MAGNITUDE, because an f16 ulp near zero is tiny in
+    // absolute terms and the f32 reassociation noise is not: with 64
+    // float adds per output (group 64) instead of 8, a cancelling output
+    // of ~1e-3 can sit 9 of ITS ulps from the single op while the two
+    // f32 sums differ by 1e-5. So the bound is asked of outputs at or
+    // above 1/16, where one f16 ulp (6e-5) exceeds that noise and only
+    // rounding-boundary flips remain; the worst ulp overall is reported
+    // with the magnitude it occurred at.
+    std::size_t diff = 0, worst_ulp = 0, worst_ulp_big = 0;
+    double worst_abs = 0.0, num = 0.0, den = 0.0, worst_at = 0.0;
     for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
       const double va = (double)a[i], vb = (double)b[i];
       const double d = std::fabs(va - vb);
@@ -3757,14 +3779,19 @@ TEST(gemm_i8, context_split_matches_single_op) {
       // that means anything.
       if ((ba & 0x8000u) == (bb & 0x8000u)) {
         const std::size_t u = (std::size_t)(ba > bb ? ba - bb : bb - ba);
-        worst_ulp = std::max(worst_ulp, u);
+        if (u > worst_ulp) { worst_ulp = u; worst_at = std::fabs(va); }
+        if (std::fabs(va) >= 0.0625) {
+          worst_ulp_big = std::max(worst_ulp_big, u);
+        }
       }
     }
-    std::printf("[gemm_i8ctx] S=%-2d bands %d: %5.2f%% differ, worst %zu ulp, "
-                "max |d| %.2e, rel-L2 %.2e\n", S, (M + 255) / 256,
-                100.0 * (double)diff / (double)(M * N), worst_ulp, worst_abs,
+    std::printf("[gemm_i8ctx] S=%-2d bands %d: %5.2f%% differ, worst %zu ulp "
+                "(at |y| %.1e; %zu ulp at |y| >= 1/16), max |d| %.2e, "
+                "rel-L2 %.2e\n", S, (M + 255) / 256,
+                100.0 * (double)diff / (double)(M * N), worst_ulp, worst_at,
+                worst_ulp_big, worst_abs,
                 den > 0.0 ? std::sqrt(num / den) : 0.0);
-    EXPECT_TRUE(worst_ulp <= 2);
+    EXPECT_TRUE(worst_ulp_big <= 2);
     EXPECT_TRUE(den > 0.0 && std::sqrt(num / den) < 1e-4);
   }
   // THE TUNER ITSELF, which is the templated code every caller
@@ -3821,17 +3848,19 @@ TEST(gemm_i8, context_split_matches_single_op) {
         // bias EXACTLY -- a fold that added it S times lands S-1 biases
         // away and a missing one lands one bias away.
         const auto* g = static_cast<const _Float16*>(y1.contents());
-        double worst = 0.0;
+        double worst = 0.0, ymax = 0.0;
         for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
           const double want =
               (double)a[i] + (double)(float)bias[(std::size_t)(i % N)];
           worst = std::max(worst, std::fabs(want - (double)g[i]));
+          ymax = std::max(ymax, std::fabs(want));
         }
-        std::printf("[gemm_i8ctx] bias S=%d: worst |got - (y0+b)| %.2e\n",
-                    S, worst);
-        // One f16 ulp at these magnitudes, plus the reassociation the
+        std::printf("[gemm_i8ctx] bias S=%d: worst |got - (y0+b)| %.2e at "
+                    "max|y| %.2f\n", S, worst, ymax);
+        // Two f16 ulps of the largest output (the reference rounds y0
+        // before adding b, the kernel after), plus the reassociation the
         // split is entitled to.
-        EXPECT_TRUE(worst < 4e-3);
+        EXPECT_TRUE(worst <= 2.0 * ymax * 0.001 + 1e-3);
       }
     }
   }
@@ -3896,4 +3925,1179 @@ TEST(gemm_i8, context_split_matches_single_op) {
   }
   std::printf("[gemm_i8ctx] untuned default vs single-op: %.2f%% differ\n",
               100.0 * (double)ddiff / (double)(M * N));
+  }  // for grp
+}
+
+// THE SPLIT'S WORTH UNDER EACH GROUP, through the class. gemm_i8.splitk
+// prices the drained g512 kernels by hand; this prices what a caller gets
+// -- quantize passes included -- at H3's fc2 shape, for the register g64
+// pair and the drained g512 one: every split each admits against its own
+// single op. What it decides is plan_()'s untuned default, which was
+// measured on the drained kernel and need not carry over: the register
+// kernel has much less of the deep-K cliff the split exists to fix.
+TEST(gemm_i8, context_split_rate) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  struct Unset {
+    ~Unset() {
+      ::unsetenv("VPIPE_I8_GEMM_MIN_M");
+      ::unsetenv("VPIPE_I8_GROUP");
+    }
+  } unset;
+  const int N = 7168, K = 14336;
+  SharedBuffer w = mc->make_shared_buffer((std::size_t)N * K * 2);
+  if (w.empty()) { return; }
+  {
+    auto* pw = static_cast<_Float16*>(w.contents());
+    for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+      pw[i] = (_Float16)(0.05f * (float)((int)(i % 7) - 3));
+    }
+  }
+  for (int grp : {32, 64, 128, 512}) {
+    ::setenv("VPIPE_I8_GROUP", std::to_string(grp).c_str(), 1);
+    vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+    if (!ctx.enabled() || !ctx.split_available()) {
+      std::printf("[gemm_i8rate] group %d unavailable -- skip\n", grp);
+      continue;
+    }
+    for (int M : {256, 1024}) {
+      SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+      SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+      if (x.empty() || y.empty()) { continue; }
+      auto* px = static_cast<_Float16*>(x.contents());
+      for (std::size_t i = 0; i < (std::size_t)M * K; ++i) {
+        px[i] = (_Float16)(0.5f * (float)((int)(i % 5) - 2));
+      }
+      std::vector<int> cands{0};
+      for (int S : ctx.split_candidates(M, N, K)) { cands.push_back(S); }
+      std::printf("[gemm_i8rate] group %d  M=%d N=%d K=%d (G=%d)\n", grp, M,
+                  N, K, ctx.group() > 0 ? K / ctx.group() : 0);
+      const double gflop = 2.0 * M * (double)N * K * 1e-9;
+      const int iters = 3;
+      double base = 0.0;
+      for (int S : cands) {
+        ctx.bypass_split = (S == 0);
+        ctx.force_splits = S;
+        auto one = [&](ComputeEncoder& e) {
+          EXPECT_TRUE(ctx.gemm(e, x, 0, w, y, 0, M, N, K));
+        };
+        for (int wu = 0; wu < 2; ++wu) {
+          CommandStream st = mc->make_command_stream();
+          { ComputeEncoder e = st.begin_compute(); one(e); }
+          st.commit().wait();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder e = st.begin_compute();
+            for (int i = 0; i < iters; ++i) { one(e); } }
+          st.commit().wait(); }
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count() /
+                          iters;
+        const double tops = gflop / ms;
+        if (S == 0) { base = tops; }
+        std::printf("[gemm_i8rate]   S=%-2d %7.2f ms  %5.2f TOP/s  %.2fx\n",
+                    S, ms, tops, base > 0 ? tops / base : 0.0);
+      }
+      ctx.bypass_split = false;
+      ctx.force_splits = 0;
+    }
+  }
+}
+
+// NATIVE AFFINE CONSUMPTION (I8GemmContext::gemm_affine): the int8
+// activation against the checkpoint's own w4 / w8 codes, no dequant
+// scratch and no requant. Three things are checked per bit width: the
+// GPU matches a CPU replica of the exact integer algorithm (which also
+// settles the 4-bit nibble order -- a wrong one is not subtle); its f32
+// quality against the dequant + requant path on the SAME weight, which
+// it should beat, having quantized the weight zero extra times; and the
+// split-K and bias forms against the single op.
+static void pack_affine_(int bits, int N, int K, std::mt19937& rng,
+                         std::vector<std::uint8_t>* packed,
+                         std::vector<_Float16>* scales,
+                         std::vector<_Float16>* biases,
+                         std::vector<float>* deq, std::vector<int>* q)
+{
+  const int G = K / 64;
+  const int qmax = (bits == 8) ? 255 : 15;
+  const std::size_t row_bytes =
+      (bits == 8) ? (std::size_t)K : (std::size_t)(K / 2);
+  std::uniform_int_distribution<int> qd(0, qmax);
+  std::uniform_real_distribution<float> sd(0.003f, 0.02f);
+  std::uniform_real_distribution<float> bd(-0.1f, 0.1f);
+  packed->assign((std::size_t)N * row_bytes, 0);
+  scales->resize((std::size_t)N * G);
+  biases->resize((std::size_t)N * G);
+  deq->resize((std::size_t)N * K);
+  q->resize((std::size_t)N * K);
+  for (int n = 0; n < N; ++n) {
+    for (int g = 0; g < G; ++g) {
+      (*scales)[(std::size_t)n * G + g] = (_Float16)sd(rng);
+      (*biases)[(std::size_t)n * G + g] = (_Float16)bd(rng);
+    }
+    for (int k = 0; k < K; ++k) {
+      const int v = qd(rng);
+      (*q)[(std::size_t)n * K + k] = v;
+      if (bits == 8) {
+        (*packed)[(std::size_t)n * row_bytes + k] = (std::uint8_t)v;
+      } else {
+        const std::size_t bi = (std::size_t)n * row_bytes + (k >> 1);
+        if (k & 1) { (*packed)[bi] |= (std::uint8_t)(v << 4); }
+        else       { (*packed)[bi] |= (std::uint8_t)v; }
+      }
+      const int g = k / 64;
+      (*deq)[(std::size_t)n * K + k] =
+          (float)(*scales)[(std::size_t)n * G + g] * (float)v +
+          (float)(*biases)[(std::size_t)n * G + g];
+    }
+  }
+}
+
+TEST(gemm_i8, native_affine_matches_oracle) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  struct Unset { ~Unset() { ::unsetenv("VPIPE_I8_GEMM_MIN_M"); } } unset;
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeFunction f_dq4 = lib_dq.function("affine_dequant_w4g64");
+  ComputeFunction f_dq8 = lib_dq.function("affine_dequant_w8g64");
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  if (!ctx.enabled()) { return; }
+  ctx.set_native_policy(12);   // both widths, whatever the default
+  EXPECT_TRUE(ctx.native_available(4) && ctx.native_available(8));
+  if (!ctx.native_available(4) || !ctx.native_available(8)) {
+    std::printf("[gemm_i8nat] native kernels unavailable\n");
+    return;
+  }
+
+  const int M = 256, N = 512, K = 1024, G = K / 64;
+  std::mt19937 rng(515u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<_Float16> x((std::size_t)M * K);
+  for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+  SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+  std::memcpy(xb.contents(), x.data(), x.size() * 2);
+  // The CPU's copy of the quantizer: the same f32 ops, so the codes and
+  // scales are what the GPU made.
+  std::vector<int> xq((std::size_t)M * K);
+  std::vector<float> xa((std::size_t)M * G);
+  std::vector<int> xsum((std::size_t)M * G, 0);
+  for (int m = 0; m < M; ++m) {
+    for (int g = 0; g < G; ++g) {
+      float am = 0.0f;
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        am = std::max(am, std::fabs((float)x[(std::size_t)m * K + k]));
+      }
+      const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+      xa[(std::size_t)m * G + g] = (float)(_Float16)(am * (1.0f / 127.0f));
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        int v = (int)std::rint((float)x[(std::size_t)m * K + k] * inv);
+        v = std::max(-127, std::min(127, v));
+        xq[(std::size_t)m * K + k] = v;
+        xsum[(std::size_t)m * G + g] += v;
+      }
+    }
+  }
+
+  for (int cmode : {0, 1}) {
+  ctx.set_native_cmode(cmode);
+  std::printf("[gemm_i8nat] ---- cmode %d ----\n", cmode);
+  for (int bits : {8, 4}) {
+    std::vector<std::uint8_t> packed;
+    std::vector<_Float16> scales, biases;
+    std::vector<float> deq;
+    std::vector<int> q;
+    pack_affine_(bits, N, K, rng, &packed, &scales, &biases, &deq, &q);
+    SharedBuffer wb = mc->make_shared_buffer(packed.size());
+    SharedBuffer sb = mc->make_shared_buffer(scales.size() * 2);
+    SharedBuffer bb = mc->make_shared_buffer(biases.size() * 2);
+    SharedBuffer wdq = mc->make_shared_buffer((std::size_t)N * K * 2);
+    const std::size_t ybytes = (std::size_t)M * N * 2;
+    SharedBuffer y_nat = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_sk = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_rq = mc->make_shared_buffer(ybytes);
+    SharedBuffer y_b = mc->make_shared_buffer(ybytes);
+    if (y_b.empty() || wdq.empty()) { return; }
+    std::memcpy(wb.contents(), packed.data(), packed.size());
+    std::memcpy(sb.contents(), scales.data(), scales.size() * 2);
+    std::memcpy(bb.contents(), biases.data(), biases.size() * 2);
+
+    // Native, single op.
+    ctx.bypass_split = true;
+    ctx.force_splits = 0;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_nat, 0,
+                                    M, N, K)); }
+      st.commit().wait(); }
+    // The requant path on the same weight: dequant, then gemm().
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(bits == 8 ? f_dq8 : f_dq4);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, wdq);
+        e.set_constant(4, K); e.set_constant(5, N);
+        e.dispatch({(unsigned)(bits == 8 ? K / 4 : K / 8), (unsigned)N, 1},
+                   {64, 1, 1});
+        EXPECT_TRUE(ctx.gemm(e, xb, 0, wdq, y_rq, 0, M, N, K)); }
+      st.commit().wait(); }
+
+    // The replica, and f32 truth.
+    const auto* pn = static_cast<const _Float16*>(y_nat.contents());
+    const auto* pr = static_cast<const _Float16*>(y_rq.contents());
+    double n_or = 0, d_or = 0, n_nat = 0, n_rq = 0, d_f = 0;
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        float facc = 0.0f, ub = 0.0f;
+        double truth = 0.0;
+        for (int g = 0; g < G; ++g) {
+          long long P = 0, Q = 0;
+          for (int k = g * 64; k < (g + 1) * 64; ++k) {
+            P += (long long)xq[(std::size_t)m * K + k] *
+                 (long long)q[(std::size_t)n * K + k];
+            Q += q[(std::size_t)n * K + k];
+          }
+          (void)Q;   // the GPU adds 128*sum(q) and takes it back exactly
+          const float a = xa[(std::size_t)m * G + g];
+          // u is stored in the element type by the quantizer.
+          const float u = (float)(_Float16)(a * (float)xsum[(std::size_t)m * G + g]);
+          const float sc = (float)scales[(std::size_t)n * G + g];
+          const float bi = (float)biases[(std::size_t)n * G + g];
+          facc += a * sc * (float)P;
+          ub += u * bi;
+        }
+        facc += ub;
+        for (int k = 0; k < K; ++k) {
+          truth += (double)x[(std::size_t)m * K + k] *
+                   (double)deq[(std::size_t)n * K + k];
+        }
+        const std::size_t o = (std::size_t)m * N + n;
+        const double ref = (double)(_Float16)facc;
+        const double vn = (double)pn[o], vr = (double)pr[o];
+        n_or += (vn - ref) * (vn - ref); d_or += ref * ref;
+        n_nat += (vn - truth) * (vn - truth);
+        n_rq += (vr - truth) * (vr - truth);
+        d_f += truth * truth;
+      }
+    }
+    const double r_or = std::sqrt(n_or / d_or);
+    const double q_nat = std::sqrt(n_nat / d_f), q_rq = std::sqrt(n_rq / d_f);
+    std::printf("[gemm_i8nat] w%d: replica rel-L2 %.3e %s | vs f32: native "
+                "%.4e, dequant+requant %.4e (%dx%dx%d)\n", bits, r_or,
+                r_or < 1e-4 ? "MATCH" : "(BAD)", q_nat, q_rq, M, N, K);
+    EXPECT_TRUE(r_or < (cmode == 1 ? 1e-3 : 1e-4));
+    EXPECT_TRUE(q_nat < q_rq);
+
+    // Split-K forms against the single op, and the bias form.
+    for (int S : {2, 4}) {
+      ctx.bypass_split = false;
+      ctx.force_splits = S;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, y_sk, 0,
+                                      M, N, K)); }
+        st.commit().wait(); }
+      const auto* ps = static_cast<const _Float16*>(y_sk.contents());
+      double n2 = 0, d2 = 0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        n2 += ((double)ps[i] - (double)pn[i]) * ((double)ps[i] - (double)pn[i]);
+        d2 += (double)pn[i] * (double)pn[i];
+      }
+      std::printf("[gemm_i8nat] w%d: S=%d vs single rel-L2 %.2e\n", bits, S,
+                  std::sqrt(n2 / d2));
+      EXPECT_TRUE(std::sqrt(n2 / d2) < 1e-4);
+    }
+    ctx.bypass_split = false;
+    ctx.force_splits = 0;
+    {
+      std::vector<_Float16> cb((std::size_t)N);
+      for (auto& v : cb) { v = (_Float16)(nd(rng) * 0.25f); }
+      SharedBuffer cbb = mc->make_shared_buffer(cb.size() * 2);
+      std::memcpy(cbb.contents(), cb.data(), cb.size() * 2);
+      ctx.bypass_split = true;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, cbb, y_b,
+                                      0, M, N, K)); }
+        st.commit().wait(); }
+      ctx.bypass_split = false;
+      const auto* pb = static_cast<const _Float16*>(y_b.contents());
+      double worst = 0.0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        const double want = (double)pn[i] + (double)(float)cb[i % N];
+        worst = std::max(worst, std::fabs(want - (double)pb[i]));
+      }
+      double ymax = 0.0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        ymax = std::max(ymax, std::fabs((double)pn[i]));
+      }
+      std::printf("[gemm_i8nat] w%d: bias worst |got - (y+b)| %.2e at "
+                  "max|y| %.1f\n", bits, worst, ymax);
+      // Two f16 ulps of the largest output: the reference rounds y before
+      // adding b, the kernel after.
+      EXPECT_TRUE(worst <= 2.0 * ymax * 0.001);
+    }
+  }
+  }  // cmode
+  ctx.set_native_cmode(0);
+}
+
+// THE NATIVE PATH'S WORTH: per call, what a DiT pays for a quantized
+// projection on each route -- dequant + act quant + weight requant + GEMM
+// against act quant + code sums + GEMM -- at FLUX.2's and H3's shapes,
+// w4 and w8, single op and the default split. Rates count the GEMM's
+// FLOPs only, so the passes each route adds are in the time and not in
+// the numerator.
+TEST(gemm_i8, native_affine_rate) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  struct Unset { ~Unset() { ::unsetenv("VPIPE_I8_GEMM_MIN_M"); } } unset;
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeFunction f_dq4 = lib_dq.function("affine_dequant_w4g64");
+  ComputeFunction f_dq8 = lib_dq.function("affine_dequant_w8g64");
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  if (ctx.enabled()) { ctx.set_native_policy(12); }
+  if (!ctx.enabled() || !ctx.native_available(4) ||
+      !ctx.native_available(8)) {
+    std::printf("[gemm_i8natr] unavailable -- skip\n");
+    return;
+  }
+  struct Shape { int M, N, K, bits; const char* what; };
+  const Shape shapes[] = {
+      {4096, 12288, 4096, 4, "flux2 block proj, w4"},
+      {4096, 4096, 12288, 4, "deep K, w4"},
+      {1024, 7168, 14336, 8, "H3 fc2, w8"},
+      {4096, 4096, 4096, 8, "square, w8"},
+  };
+  for (const Shape& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K, bits = sh.bits, G = K / 64;
+    const std::size_t row_bytes = bits == 8 ? (std::size_t)K : (std::size_t)K / 2;
+    SharedBuffer xb = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer wb = mc->make_shared_buffer((std::size_t)N * row_bytes);
+    SharedBuffer sb = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer bb = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer wdq = mc->make_shared_buffer((std::size_t)N * K * 2);
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    if (y.empty() || wdq.empty() || wb.empty()) {
+      std::printf("[gemm_i8natr] alloc failed at %s -- skip\n", sh.what);
+      continue;
+    }
+    // Patterned operands: the rates are data-independent, the bytes only
+    // have to be finite.
+    auto* px = static_cast<_Float16*>(xb.contents());
+    for (std::size_t i = 0; i < (std::size_t)M * K; ++i) {
+      px[i] = (_Float16)(0.25f * (float)((int)(i % 7) - 3));
+    }
+    std::memset(wb.contents(), 0x5a, wb.byte_size());
+    auto* ps = static_cast<_Float16*>(sb.contents());
+    auto* pbias = static_cast<_Float16*>(bb.contents());
+    for (std::size_t i = 0; i < (std::size_t)N * G; ++i) {
+      ps[i] = (_Float16)0.01f;
+      pbias[i] = (_Float16)-0.05f;
+    }
+    const double gflop = 2.0 * M * (double)N * K * 1e-9;
+    const int iters = 3;
+    std::printf("[gemm_i8natr] %s  M=%d N=%d K=%d\n", sh.what, M, N, K);
+    struct ArmC { const char* name; bool native; int S; int cmode; };
+    const ArmC arms[] = {
+        {"dequant+requant", false, 0, 0},
+        {"dequant+requant S=2", false, 2, 0},
+        {"native cm0", true, 0, 0},
+        {"native cm0 S=2", true, 2, 0},
+        {"native cm1", true, 0, 1},
+        {"native cm1 S=2", true, 2, 1},
+    };
+    double base = 0.0;
+    for (const ArmC& a : arms) {
+      ctx.set_native_cmode(a.cmode);
+      ctx.bypass_split = (a.S == 0);
+      ctx.force_splits = a.S;
+      auto one = [&](ComputeEncoder& e) {
+        if (a.native) {
+          EXPECT_TRUE(ctx.gemm_affine(e, xb, 0, wb, sb, bb, bits, y, 0, M,
+                                      N, K));
+          return;
+        }
+        e.set_function(bits == 8 ? f_dq8 : f_dq4);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, wdq);
+        e.set_constant(4, K); e.set_constant(5, N);
+        e.dispatch({(unsigned)(bits == 8 ? K / 4 : K / 8), (unsigned)N, 1},
+                   {64, 1, 1});
+        EXPECT_TRUE(ctx.gemm(e, xb, 0, wdq, y, 0, M, N, K));
+      };
+      for (int wu = 0; wu < 2; ++wu) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); one(e); }
+        st.commit().wait();
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          for (int i = 0; i < iters; ++i) { one(e); } }
+        st.commit().wait(); }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count() /
+                        iters;
+      if (base == 0.0) { base = ms; }
+      std::printf("[gemm_i8natr]   %-20s %7.2f ms  %5.2f TOP/s  %.2fx\n",
+                  a.name, ms, gflop / ms, base / ms);
+    }
+    ctx.bypass_split = false;
+    ctx.force_splits = 0;
+  }
+}
+
+// WHERE THE NATIVE KERNEL'S TIME GOES: kernel-level arms at the FLUX.2
+// block shape, direct dispatch, no quant passes. The unsigned MMA
+// ceilings (no epilogue) bound what uint8 x uint4 and uint8 x uint8 can
+// do at all; the strip variants price the staging footprint; g64rs is
+// the requant kernel the native one has to beat.
+TEST(gemm_i8, native_affine_kernel_arms) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma");
+  struct Arm { const char* name; const char* fn; int kind; int bits;
+               ComputeFunction f; };
+  // kind: 0 = kaccr ceiling (0:xu 1:codes 2:y 3:K 4:N 5:M), 1 = native
+  // (the 13-buffer contract), 2 = g64rs (the i8 contract).
+  std::vector<Arm> arms;
+  auto add = [&](const char* name, const char* fn, int kind, int bits) {
+    Arm a{name, fn, kind, bits, lib.function(fn)};
+    if (!a.f.valid()) { std::printf("[gemm_i8arm] %s missing\n", fn); }
+    arms.push_back(std::move(a));
+  };
+  add("kaccr i8xi8",   "gemm_i8i8_sc_f16_n64_kaccr_k64", 0, 8);
+  add("kaccr u8xu8",   "gemm_u8u8_kaccr_k64", 0, 8);
+  add("kaccr u8xu4",   "gemm_u8u4_kaccr_k64", 0, 4);
+  add("kaccr i8xi4",   "gemm_i8i4_kaccr_k64", 0, 4);
+  add("g64rs (requant)", "gemm_i8i8_sc_f16_n64_g64rs", 2, 8);
+  add("native w8 cm0", "gemm_u8q_w8g64", 1, 8);
+  add("native w8 cm1", "gemm_u8q_w8g64_cm", 1, 8);
+  add("native w8 v1",  "gemm_u8q_w8g64_v1", 1, 8);
+  add("signed w8",     "gemm_i8q_w8g64s", 3, 8);
+  add("native w4 cm0", "gemm_u8q_w4g64", 1, 4);
+  add("native w4 cm1", "gemm_u8q_w4g64_cm", 1, 4);
+  add("native w4 v1",  "gemm_u8q_w4g64_v1", 1, 4);
+  add("signed w4",     "gemm_i8q_w4g64s", 3, 4);
+  for (const Arm& a : arms) { if (!a.f.valid()) { return; } }
+
+  auto sweep = [&](int M, int N, int K) {
+    const int G = K / 64;
+    SharedBuffer xu = mc->make_shared_buffer((std::size_t)M * K);
+    SharedBuffer w8 = mc->make_shared_buffer((std::size_t)N * K);
+    SharedBuffer as = mc->make_shared_buffer((std::size_t)M * G * 2);
+    SharedBuffer xs = mc->make_shared_buffer((std::size_t)M * G * 2);
+    SharedBuffer ws = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer wb = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer wsum = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    if (y.empty() || w8.empty()) { return; }
+    std::memset(xu.contents(), 0x81, xu.byte_size());
+    std::memset(w8.contents(), 0x5a, w8.byte_size());
+    std::memset(as.contents(), 0, as.byte_size());
+    std::memset(xs.contents(), 0, xs.byte_size());
+    std::memset(ws.contents(), 0, ws.byte_size());
+    std::memset(wb.contents(), 0, wb.byte_size());
+    std::memset(wsum.contents(), 0, wsum.byte_size());
+    const double gflop = 2.0 * M * (double)N * K * 1e-9;
+    const unsigned nx = (unsigned)(((N + 63) / 64) * 128);
+    std::printf("[gemm_i8arm] M=%d N=%d K=%d\n", M, N, K);
+    for (const Arm& a : arms) {
+      auto one = [&](ComputeEncoder& e) {
+        e.set_function(a.f);
+        if (a.kind == 0) {
+          e.set_buffer(0, xu); e.set_buffer(1, w8); e.set_buffer(2, y);
+          e.set_constant(3, K); e.set_constant(4, N); e.set_constant(5, M);
+        } else if (a.kind == 1) {
+          e.set_buffer(0, xu); e.set_buffer(1, w8); e.set_buffer(2, as);
+          e.set_buffer(3, xs); e.set_buffer(4, ws); e.set_buffer(5, wb);
+          e.set_buffer(6, wsum); e.set_buffer(7, y);
+          e.set_constant(8, K); e.set_constant(9, N); e.set_constant(10, M);
+          e.set_buffer(11, ws); e.set_constant(12, 0);
+          e.set_buffer(13, xs); e.set_buffer(14, ws); e.set_buffer(15, wb);
+        } else if (a.kind == 3) {
+          e.set_buffer(0, xu); e.set_buffer(1, w8); e.set_buffer(2, as);
+          e.set_buffer(3, ws); e.set_buffer(4, wb); e.set_buffer(5, xs);
+          e.set_buffer(6, y);
+          e.set_constant(7, K); e.set_constant(8, N); e.set_constant(9, M);
+        } else {
+          e.set_buffer(0, xu); e.set_buffer(1, w8); e.set_buffer(2, as);
+          e.set_buffer(3, ws); e.set_buffer(4, y);
+          e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+          e.set_buffer(8, ws); e.set_constant(9, 0);
+        }
+        e.dispatch({nx, (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+      };
+      for (int wu = 0; wu < 2; ++wu) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); one(e); }
+        st.commit().wait();
+      }
+      const int iters = 4;
+      const auto t0 = std::chrono::steady_clock::now();
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          for (int i = 0; i < iters; ++i) { one(e); } }
+        st.commit().wait(); }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count() /
+                        iters;
+      std::printf("[gemm_i8arm]   %-16s %7.2f ms  %5.2f TOP/s\n", a.name,
+                  ms, gflop / ms);
+    }
+  };
+  sweep(4096, 12288, 4096);
+  sweep(4096, 4096, 4096);
+}
+
+// WHAT A FINER GROUP BUYS, and on which data. Both operands quantized
+// per group at 32, 64 and 512 on the CPU (amax), the register kernels
+// run on the GPU, rel-L2 against f64 truth -- on gaussian data, where
+// per-group scales barely matter, and on data with a few OUTLIER
+// channels (x scaled 32x on 1 channel in 64), which is what real
+// activations look like and where a group's width decides how many
+// neighbours an outlier's scale crushes.
+TEST(gemm_i8, group_quality) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma");
+  struct Arm { const char* name; int kc; ComputeFunction f; };
+  std::vector<Arm> arms;
+  auto add = [&](const char* name, int kc, const char* fn) {
+    Arm a{name, kc, lib.function(fn)};
+    arms.push_back(std::move(a));
+  };
+  add("g32rs", 32, "gemm_i8i8_sc_f16_n64_g32rs");
+  add("g64rs", 64, "gemm_i8i8_sc_f16_n64_g64rs");
+  add("g128rs", 128, "gemm_i8i8_sc_f16_n64_g128rs");
+  add("g512rs", 512, "gemm_i8i8_sc_f16_n64_g512rs");
+  for (const Arm& a : arms) { if (!a.f.valid()) { return; } }
+
+  const int M = 256, N = 512, K = 2048;
+  for (int outliers : {0, 1}) {
+    std::mt19937 rng(9u + (unsigned)outliers);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<_Float16> x((std::size_t)M * K), w((std::size_t)N * K);
+    for (int m = 0; m < M; ++m) {
+      for (int k = 0; k < K; ++k) {
+        float v = nd(rng) * 0.5f;
+        if (outliers && (k % 64) == 17) { v *= 32.0f; }
+        x[(std::size_t)m * K + k] = (_Float16)v;
+      }
+    }
+    for (auto& v : w) { v = (_Float16)(nd(rng) * 0.05f); }
+    std::vector<double> truth((std::size_t)M * N, 0.0);
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k < K; ++k) {
+          acc += (double)x[(std::size_t)m * K + k] *
+                 (double)w[(std::size_t)n * K + k];
+        }
+        truth[(std::size_t)m * N + n] = acc;
+      }
+    }
+    std::printf("[gemm_i8q] %s (%dx%dx%d)\n",
+                outliers ? "outlier channels (1 in 64, x32)" : "gaussian",
+                M, N, K);
+    for (const Arm& a : arms) {
+      const int kc = a.kc, G = K / kc;
+      std::vector<std::int8_t> xq((std::size_t)M * K), wq((std::size_t)N * K);
+      std::vector<_Float16> xs((std::size_t)M * G), ws((std::size_t)N * G);
+      auto quant = [&](const std::vector<_Float16>& src, int rows,
+                       std::vector<std::int8_t>* q, std::vector<_Float16>* sc) {
+        for (int r = 0; r < rows; ++r) {
+          for (int g = 0; g < G; ++g) {
+            float am = 0.0f;
+            for (int k = g * kc; k < (g + 1) * kc; ++k) {
+              am = std::max(am, std::fabs((float)src[(std::size_t)r * K + k]));
+            }
+            const float inv = am > 0 ? 127.0f / am : 0.0f;
+            (*sc)[(std::size_t)r * G + g] = (_Float16)(am / 127.0f);
+            for (int k = g * kc; k < (g + 1) * kc; ++k) {
+              const float v = std::rint((float)src[(std::size_t)r * K + k] * inv);
+              (*q)[(std::size_t)r * K + k] =
+                  (std::int8_t)std::max(-127.0f, std::min(127.0f, v));
+            }
+          }
+        }
+      };
+      quant(x, M, &xq, &xs);
+      quant(w, N, &wq, &ws);
+      SharedBuffer xqb = mc->make_shared_buffer(xq.size());
+      SharedBuffer wqb = mc->make_shared_buffer(wq.size());
+      SharedBuffer xsb = mc->make_shared_buffer(xs.size() * 2);
+      SharedBuffer wsb = mc->make_shared_buffer(ws.size() * 2);
+      SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
+      if (yb.empty()) { return; }
+      std::memcpy(xqb.contents(), xq.data(), xq.size());
+      std::memcpy(wqb.contents(), wq.data(), wq.size());
+      std::memcpy(xsb.contents(), xs.data(), xs.size() * 2);
+      std::memcpy(wsb.contents(), ws.data(), ws.size() * 2);
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          e.set_function(a.f);
+          e.set_buffer(0, xqb); e.set_buffer(1, wqb);
+          e.set_buffer(2, xsb); e.set_buffer(3, wsb);
+          e.set_buffer(4, yb);
+          e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+          e.set_buffer(8, wsb); e.set_constant(9, 0);
+          e.dispatch({(unsigned)((N / 64) * 128), (unsigned)(M / 64), 1},
+                     {128, 1, 1}); }
+        st.commit().wait(); }
+      const auto* py = static_cast<const _Float16*>(yb.contents());
+      double num = 0.0, den = 0.0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        const double d = (double)py[i] - truth[i];
+        num += d * d;
+        den += truth[i] * truth[i];
+      }
+      const double r = std::sqrt(num / den);
+      std::printf("[gemm_i8q]   %-7s rel-L2 %.4e\n", a.name, r);
+      EXPECT_TRUE(std::isfinite(r) && r < 0.1);
+    }
+  }
+}
+
+// GROUP SIZE AGAINST RATE, and the two costs it hides.
+//
+// In the per-group kernel the group width IS the chunk depth: one
+// matmul2d per group, drained and scaled before the next. So a finer
+// group makes the calls shallower AND multiplies the drains, and those
+// are different costs that a single sweep reports as one number.
+//
+// This separates them. The `kacc` arms chunk K at the same widths with
+// RAW i32 accumulation -- no scales, no drain -- so they price the DEPTH
+// alone. The `g` arms are the same widths with per-group scales, so the
+// gap between the two rows at one width is the GROUP TAX at that width.
+//
+// The question this answers: is 64 a usable group for an int8 GEMM, or
+// does the depth fall off before it.
+TEST(gemm_i8, group_size) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma");
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeFunction f_q = lib_dq.function("quant_f16_i8_row_g512");
+  // grouped: the per-group twins. shift: the register twins that read
+  // int8 EXPONENTS at 2/3 instead of f16 scales -- and whose shift path
+  // is data-dependent, so they get exponents that actually vary.
+  struct Arm { const char* name = nullptr; int kc = 0;
+               bool grouped = false; bool shift = false; bool f16 = false;
+               ComputeFunction fn; };
+  // ComputeFunction is move-only, so the arms are pushed rather than
+  // brace-initialised.
+  std::vector<Arm> arms;
+  auto add = [&](const char* name, int kc, bool grouped, bool shift,
+                 const char* fn) {
+    Arm a;
+    a.name = name; a.kc = kc; a.grouped = grouped; a.shift = shift;
+    a.fn = lib_mma.function(fn);
+    arms.push_back(std::move(a));
+  };
+  add("kacc-512", 512, false, false, "gemm_i8i8_sc_f16_n64_kacc");
+  add("kacc-256", 256, false, false, "gemm_i8i8_sc_f16_n64_kacc_k256");
+  add("kacc-128", 128, false, false, "gemm_i8i8_sc_f16_n64_kacc_k128");
+  add("kacc-64",   64, false, false, "gemm_i8i8_sc_f16_n64_kacc_k64");
+  add("kacc-32",   32, false, false, "gemm_i8i8_sc_f16_n64_kacc_k32");
+  add("g512",     512, true,  false, "gemm_i8i8_sc_f16_n64_g512");
+  add("g128",     128, true,  false, "gemm_i8i8_sc_f16_n64_g128");
+  add("g64",       64, true,  false, "gemm_i8i8_sc_f16_n64_g64");
+  add("g32",       32, true,  false, "gemm_i8i8_sc_f16_n64_g32");
+  // Register-resident twins: float accumulate (r) and shift-aligned
+  // integer accumulate (ri), no drain between groups.
+  add("g512r",    512, false, false, "gemm_i8i8_sc_f16_n64_g512r");
+  add("g512ri",   512, false, true,  "gemm_i8i8_sc_f16_n64_g512ri");
+  add("g128r",    128, false, false, "gemm_i8i8_sc_f16_n64_g128r");
+  add("g128ri",   128, false, true,  "gemm_i8i8_sc_f16_n64_g128ri");
+  add("g64r",      64, false, false, "gemm_i8i8_sc_f16_n64_g64r");
+  add("g64ri",     64, false, true,  "gemm_i8i8_sc_f16_n64_g64ri");
+  // The cooperative-destination ceiling (no per-group work at all).
+  add("kaccr-512", 512, false, false, "gemm_i8i8_sc_f16_n64_kaccr_k512");
+  add("kaccr-64",   64, false, false, "gemm_i8i8_sc_f16_n64_kaccr_k64");
+  add("kaccr-32",   32, false, false, "gemm_i8i8_sc_f16_n64_kaccr_k32");
+  add("kaccr-128", 128, false, false, "gemm_i8i8_sc_f16_n64_kaccr_k128");
+  // Staged scales (one tgmem strip per 8 groups), and the per-row-
+  // activation twins that stage only the weight side.
+  add("g512rs",   512, false, false, "gemm_i8i8_sc_f16_n64_g512rs");
+  add("g512rsi",  512, false, true,  "gemm_i8i8_sc_f16_n64_g512rsi");
+  add("g64rs",     64, false, false, "gemm_i8i8_sc_f16_n64_g64rs");
+  add("g64rsi",    64, false, true,  "gemm_i8i8_sc_f16_n64_g64rsi");
+  add("g32rs",     32, false, false, "gemm_i8i8_sc_f16_n64_g32rs");
+  add("g128rs",   128, false, false, "gemm_i8i8_sc_f16_n64_g128rs");
+  add("w64rs",     64, false, false, "gemm_i8i8_sc_f16_n64_w64rs");
+  add("w64rsi",    64, false, true,  "gemm_i8i8_sc_f16_n64_w64rsi");
+  add("w64rsf",    64, false, true,  "gemm_i8i8_sc_f16_n64_w64rsf");
+  // The f16 twin of the kacc loop -- same tile, same chunking, same
+  // accumulate mode -- so the int8 rates have a like-for-like dtype
+  // baseline in the same run.
+  add("f16-k512", 512, false, false, "dense_gemm_mma_kacc_k512_f16");
+  arms.back().f16 = true;
+  if (!f_q.valid()) { return; }
+  for (const Arm& a : arms) {
+    if (!a.fn.valid()) {
+      std::printf("[gemm_i8g] %s unavailable -- skip\n", a.name);
+      return;
+    }
+  }
+
+  auto sweep = [&](int M, int N, int K, int iters) {
+    std::mt19937 rng(31u + (unsigned)(M + N + K));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<_Float16> x((std::size_t)M * K);
+    for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+    SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+    SharedBuffer xq = mc->make_shared_buffer((std::size_t)M * K);
+    SharedBuffer wq = mc->make_shared_buffer((std::size_t)N * K);
+    SharedBuffer y  = mc->make_shared_buffer((std::size_t)M * N * 2);
+    // Scales at the FINEST width, so one buffer serves every arm: an arm
+    // at a coarser group reads a prefix of it. Only the TRAFFIC has to be
+    // right here -- an int8 GEMM's time does not depend on its data, and
+    // correctness at each width is gemm_i8.k512_chunked's job.
+    const std::size_t gmax = (std::size_t)K / 32;
+    SharedBuffer as = mc->make_shared_buffer((std::size_t)M * gmax * 2);
+    SharedBuffer ws = mc->make_shared_buffer((std::size_t)N * gmax * 2);
+    SharedBuffer ea = mc->make_shared_buffer((std::size_t)M * gmax);
+    SharedBuffer ew = mc->make_shared_buffer((std::size_t)N * gmax);
+    SharedBuffer wh = mc->make_shared_buffer((std::size_t)N * K * 2);
+    if (y.empty() || ws.empty() || wq.empty() || ew.empty() || wh.empty()) {
+      std::printf("[gemm_i8g] alloc failed -- skip\n");
+      return;
+    }
+    std::memcpy(xb.contents(), x.data(), x.size() * 2);
+    std::memset(wq.contents(), 1, wq.byte_size());
+    std::memset(wh.contents(), 0, wh.byte_size());
+    {
+      // Exponents that move by a few binades group to group, which is
+      // what real activations do and what makes the shift path run its
+      // align branches rather than the cheap equal-exponent one.
+      std::uniform_int_distribution<int> ud(-24, -18);
+      auto* pa = static_cast<std::int8_t*>(ea.contents());
+      for (std::size_t i = 0; i < ea.byte_size(); ++i) {
+        pa[i] = (std::int8_t)ud(rng);
+      }
+      auto* pw = static_cast<std::int8_t*>(ew.contents());
+      for (std::size_t i = 0; i < ew.byte_size(); ++i) {
+        pw[i] = (std::int8_t)ud(rng);
+      }
+    }
+    for (std::size_t i = 0; i < as.byte_size() / 2; ++i) {
+      static_cast<_Float16*>(as.contents())[i] = (_Float16)0.01f;
+    }
+    for (std::size_t i = 0; i < ws.byte_size() / 2; ++i) {
+      static_cast<_Float16*>(ws.contents())[i] = (_Float16)0.01f;
+    }
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(f_q);
+        e.set_buffer(0, xb); e.set_buffer(1, xq); e.set_buffer(2, as);
+        e.set_constant(3, K);
+        e.dispatch({256, (unsigned)M, 1}, {256, 1, 1}); }
+      st.commit().wait(); }
+
+    const double gflop = 2.0 * (double)M * N * K * 1e-9;
+    std::printf("[gemm_i8g] M=%d N=%d K=%d\n", M, N, K);
+    double base = 0.0;
+    for (const Arm& a : arms) {
+      if (K % a.kc != 0) { continue; }
+      auto one = [&](ComputeEncoder& e) {
+        e.set_function(a.fn);
+        if (a.f16) {
+          e.set_buffer(0, xb); e.set_buffer(1, wh); e.set_buffer(2, ws);
+          e.set_buffer(3, y);
+          e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+          e.set_constant(7, 0);
+          e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                      (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+          return;
+        }
+        e.set_buffer(0, xq); e.set_buffer(1, wq);
+        if (a.shift) {
+          e.set_buffer(2, ea); e.set_buffer(3, ew);
+        } else {
+          e.set_buffer(2, as); e.set_buffer(3, ws);
+        }
+        e.set_buffer(4, y);
+        e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+        // Bias slots, bound for every arm: the drained and staged twins
+        // read has_bias, the rest declare no buffer there and ignore it.
+        e.set_buffer(8, ws); e.set_constant(9, 0);
+        e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                    (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+      };
+      for (int w = 0; w < 2; ++w) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); one(e); }
+        st.commit().wait();
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          for (int i = 0; i < iters; ++i) { one(e); } }
+        st.commit().wait(); }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      const double tops = gflop * iters / ms;
+      if (base == 0.0) { base = tops; }
+      std::printf("[gemm_i8g]   %-9s %6.1f TOP/s  %.2fx of kacc-512\n",
+                  a.name, tops, tops / base);
+    }
+  };
+  // The block-projection shape the int8 path was built for, and a deep-K
+  // one where the drains compete with a longer weight stream.
+  sweep(4096, 12288, 4096, 4);
+  sweep(4096, 4096, 12288, 4);
+}
+
+// Register-resident per-group accumulation (gemm_i8i8_sc_f16_n64_g64r /
+// _g64ri): the matmul2d partial stays in a cooperative tensor and is
+// folded into per-thread registers, with no threadgroup drain between
+// groups. (1) probe the destination layout the kernel's CAP assumes;
+// (2) oracle the shift-aligned twin against an exact CPU replica of the
+// accumulate on the GPU's own quantized operands; (3) quality of both
+// register twins against f32, and the float twin against the tgmem
+// kernel it re-implements. The perf curve is gemm_i8.group_size.
+TEST(gemm_i8, g64_register_acc) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma");
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeFunction f_probe = lib_mma.function("gemm_i8i8_coop_probe");
+  ComputeFunction f_ri = lib_mma.function("gemm_i8i8_sc_f16_n64_g64ri");
+  ComputeFunction f_r = lib_mma.function("gemm_i8i8_sc_f16_n64_g64r");
+  ComputeFunction f_t = lib_mma.function("gemm_i8i8_sc_f16_n64_g64");
+  ComputeFunction f_qe = lib_dq.function("quant_f16_i8_g64_bfpe");
+  ComputeFunction f_qa = lib_dq.function("quant_f16_i8_g64_amax");
+  if (!f_probe.valid() || !f_ri.valid() || !f_r.valid() || !f_t.valid() ||
+      !f_qe.valid() || !f_qa.valid()) {
+    std::printf("[gemm_i8r] kernels unavailable -- skip\n");
+    return;
+  }
+
+  // (1) The layout probe: 32 valid elements per thread, and the 128
+  // threads' coordinates cover the 64x64 tile exactly once. Region 2 is
+  // the f16 x f16 -> f32 destination of the same tile, compared element
+  // by element with the int8 one.
+  {
+    const std::size_t n_out = 2 * (1 + 128 * 64 * 3);
+    SharedBuffer ob = mc->make_shared_buffer(n_out * sizeof(int));
+    std::memset(ob.contents(), 0, ob.byte_size());
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(f_probe);
+        e.set_buffer(0, ob);
+        e.dispatch({128, 1, 1}, {128, 1, 1}); }
+      st.commit().wait(); }
+    const int* o = static_cast<const int*>(ob.contents());
+    const int cap = o[0];
+    std::vector<int> cover(64 * 64, 0);
+    int valid = 0, bad = 0;
+    for (int t = 0; t < 128; ++t) {
+      for (int i = 0; i < 64 && i < cap; ++i) {
+        const int* e = o + 1 + (t * 64 + i) * 3;
+        if (e[0] != 1) { continue; }
+        ++valid;
+        if (e[1] < 0 || e[1] >= 64 || e[2] < 0 || e[2] >= 64) {
+          ++bad;
+          continue;
+        }
+        cover[e[2] * 64 + e[1]]++;
+      }
+    }
+    int once = 0;
+    for (int c : cover) { once += (c == 1) ? 1 : 0; }
+    // Thread 0's first few elements, so a layout change is legible.
+    std::printf("[gemm_i8r] coop layout: capacity %d, %d valid, %d/4096 "
+                "cells covered once%s; t0: (%d,%d) (%d,%d) (%d,%d) (%d,%d)\n",
+                cap, valid, once, bad ? " OUT-OF-TILE" : "",
+                o[1 + 0 * 3 + 1], o[1 + 0 * 3 + 2], o[1 + 1 * 3 + 1],
+                o[1 + 1 * 3 + 2], o[1 + 2 * 3 + 1], o[1 + 2 * 3 + 2],
+                o[1 + 3 * 3 + 1], o[1 + 3 * 3 + 2]);
+    EXPECT_TRUE(cap == 32);
+    EXPECT_TRUE(valid == 128 * 32);
+    EXPECT_TRUE(once == 64 * 64 && bad == 0);
+    if (cap != 32 || once != 64 * 64) { return; }
+    const int* o2 = o + 1 + 128 * 64 * 3;
+    int same = 0, total = 0;
+    for (int t = 0; t < 128; ++t) {
+      for (int i = 0; i < 64 && i < cap && i < o2[0]; ++i) {
+        const int* e = o + 1 + (t * 64 + i) * 3;
+        const int* f = o2 + 1 + (t * 64 + i) * 3;
+        ++total;
+        same += (e[0] == f[0] && e[1] == f[1] && e[2] == f[2]) ? 1 : 0;
+      }
+    }
+    std::printf("[gemm_i8r] f16->f32 destination layout: capacity %d, "
+                "%d/%d elements at the int8 layout's coordinates\n",
+                o2[0], same, total);
+    // gemm_u8q_impl adds its post-loop matmul in registers on the
+    // strength of this; it silently misplaces every term if it changes.
+    EXPECT_TRUE(o2[0] == 32 && same == total && total == 128 * 32);
+  }
+
+  ComputeFunction f_rs = lib_mma.function("gemm_i8i8_sc_f16_n64_g64rs");
+  ComputeFunction f_rsi = lib_mma.function("gemm_i8i8_sc_f16_n64_g64rsi");
+  ComputeFunction f_wrs = lib_mma.function("gemm_i8i8_sc_f16_n64_w64rs");
+  ComputeFunction f_wrsi = lib_mma.function("gemm_i8i8_sc_f16_n64_w64rsi");
+  ComputeFunction f_wrsf = lib_mma.function("gemm_i8i8_sc_f16_n64_w64rsf");
+  if (!f_rs.valid() || !f_rsi.valid() || !f_wrs.valid() || !f_wrsi.valid() ||
+      !f_wrsf.valid()) {
+    std::printf("[gemm_i8r] staged kernels unavailable -- skip\n");
+    return;
+  }
+
+  const int M = 256, N = 512, K = 1024, G = K / 64;
+  std::mt19937 rng(41u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<_Float16> x((std::size_t)M * K), w((std::size_t)N * K);
+  for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+  for (auto& v : w) { v = (_Float16)(nd(rng) * 0.05f); }
+  // Offline weight quant per (channel, 64-group): pow2 (exponent
+  // Emax16 - 21, the activation scheme's mirror) for the shift twins,
+  // amax f16 scales for the float twins.
+  std::vector<std::int8_t> wqp((std::size_t)N * K), wqa((std::size_t)N * K);
+  std::vector<std::int8_t> ewv((std::size_t)N * G);
+  std::vector<_Float16> wsg((std::size_t)N * G);
+  auto exp_field = [](_Float16 v) {
+    std::uint16_t u;
+    std::memcpy(&u, &v, 2);
+    return (int)((u >> 10) & 0x1F);
+  };
+  auto q8 = [](float v) {
+    return (std::int8_t)std::max(-127.0f, std::min(127.0f, std::rint(v)));
+  };
+  for (int n = 0; n < N; ++n) {
+    for (int g = 0; g < G; ++g) {
+      int em = 0;
+      float am = 0.0f;
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        em = std::max(em, exp_field(w[(std::size_t)n * K + k]));
+        am = std::max(am, std::fabs((float)w[(std::size_t)n * K + k]));
+      }
+      ewv[(std::size_t)n * G + g] = (std::int8_t)(em - 21);
+      wsg[(std::size_t)n * G + g] = (_Float16)(am / 127.0f);
+      const float ig = std::ldexp(1.0f, 21 - em);
+      const float ia = am > 0 ? 127.0f / am : 0.0f;
+      for (int k = g * 64; k < (g + 1) * 64; ++k) {
+        const float wv = (float)w[(std::size_t)n * K + k];
+        wqp[(std::size_t)n * K + k] = q8(wv * ig);
+        wqa[(std::size_t)n * K + k] = q8(wv * ia);
+      }
+    }
+  }
+  // Per-ROW activation quant for the w64 twins, on the CPU: amax f16
+  // scale and pow2 exponent, one each per token.
+  std::vector<std::int8_t> xqr((std::size_t)M * K), xqre((std::size_t)M * K);
+  std::vector<std::int8_t> ear(M);
+  std::vector<_Float16> asr(M);
+  for (int m = 0; m < M; ++m) {
+    int em = 0;
+    float am = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      em = std::max(em, exp_field(x[(std::size_t)m * K + k]));
+      am = std::max(am, std::fabs((float)x[(std::size_t)m * K + k]));
+    }
+    ear[m] = (std::int8_t)(em - 21);
+    asr[m] = (_Float16)(am / 127.0f);
+    const float ig = std::ldexp(1.0f, 21 - em);
+    const float ia = am > 0 ? 127.0f / am : 0.0f;
+    for (int k = 0; k < K; ++k) {
+      const float xv = (float)x[(std::size_t)m * K + k];
+      xqre[(std::size_t)m * K + k] = q8(xv * ig);
+      xqr[(std::size_t)m * K + k] = q8(xv * ia);
+    }
+  }
+
+  auto buf = [&](std::size_t bytes) { return mc->make_shared_buffer(bytes); };
+  auto upload = [&](SharedBuffer& b, const void* src, std::size_t bytes) {
+    std::memcpy(b.contents(), src, bytes);
+  };
+  SharedBuffer xb = buf(x.size() * 2);
+  SharedBuffer xqe = buf((std::size_t)M * K), xqa = buf((std::size_t)M * K);
+  SharedBuffer xqrb = buf(xqr.size()), xqreb = buf(xqre.size());
+  SharedBuffer eab = buf((std::size_t)M * G), asb = buf((std::size_t)M * G * 2);
+  SharedBuffer earb = buf(ear.size()), asrb = buf(asr.size() * 2);
+  SharedBuffer wqpb = buf(wqp.size()), wqab = buf(wqa.size());
+  SharedBuffer ewb = buf(ewv.size()), wsb = buf(wsg.size() * 2);
+  const std::size_t ybytes = (std::size_t)M * N * 2;
+  SharedBuffer yri = buf(ybytes), yr = buf(ybytes), yt = buf(ybytes);
+  SharedBuffer yrs = buf(ybytes), yrsi = buf(ybytes);
+  SharedBuffer ywrs = buf(ybytes), ywrsi = buf(ybytes), ywrsf = buf(ybytes);
+  if (ywrsi.empty() || ywrsf.empty() || wqpb.empty() || wqab.empty() || xqreb.empty()) {
+    std::printf("[gemm_i8r] alloc failed -- skip\n");
+    return;
+  }
+  upload(xb, x.data(), x.size() * 2);
+  upload(xqrb, xqr.data(), xqr.size());
+  upload(xqreb, xqre.data(), xqre.size());
+  upload(earb, ear.data(), ear.size());
+  upload(asrb, asr.data(), asr.size() * 2);
+  upload(wqpb, wqp.data(), wqp.size());
+  upload(wqab, wqa.data(), wqa.size());
+  upload(ewb, ewv.data(), ewv.size());
+  upload(wsb, wsg.data(), wsg.size() * 2);
+
+  auto quant = [&](ComputeFunction& fq, SharedBuffer& xqdst,
+                   SharedBuffer& scl) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute();
+      enc.set_function(fq);
+      enc.set_buffer(0, xb); enc.set_buffer(1, xqdst); enc.set_buffer(2, scl);
+      enc.set_constant(3, M * K);
+      enc.dispatch({(unsigned)(M * K / 2), 1, 1}, {128, 1, 1}); }
+    st.commit().wait();
+  };
+  auto gemm = [&](ComputeFunction& fg, SharedBuffer& xqsrc,
+                  SharedBuffer& scl, SharedBuffer& wqx, SharedBuffer& wsx,
+                  SharedBuffer& yb, bool bias_slots) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute();
+      enc.set_function(fg);
+      enc.set_buffer(0, xqsrc); enc.set_buffer(1, wqx);
+      enc.set_buffer(2, scl); enc.set_buffer(3, wsx);
+      enc.set_buffer(4, yb);
+      enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
+      // No bias here, but the slots must be bound: the drained and the
+      // staged twins both read has_bias.
+      (void)bias_slots;
+      enc.set_buffer(8, wsx); enc.set_constant(9, 0);
+      enc.dispatch({(unsigned)((N / 64) * 128), (unsigned)(M / 64), 1},
+                   {128, 1, 1}); }
+    st.commit().wait();
+  };
+  // Each activation quantization gets its own buffer: the replica reads
+  // the pow2 one back, so nothing may overwrite it.
+  quant(f_qe, xqe, eab);
+  quant(f_qa, xqa, asb);
+  gemm(f_ri, xqe, eab, wqpb, ewb, yri, false);
+  gemm(f_rsi, xqe, eab, wqpb, ewb, yrsi, false);
+  gemm(f_r, xqa, asb, wqab, wsb, yr, false);
+  gemm(f_rs, xqa, asb, wqab, wsb, yrs, false);
+  gemm(f_t, xqa, asb, wqab, wsb, yt, true);
+  gemm(f_wrs, xqrb, asrb, wqab, wsb, ywrs, false);
+  gemm(f_wrsi, xqreb, earb, wqpb, ewb, ywrsi, false);
+  gemm(f_wrsf, xqreb, earb, wqpb, ewb, ywrsf, false);
+
+  // (2) The oracles: the same accumulate on the CPU, on the GPU's own
+  // xq/ea (or the CPU's row quant) and the CPU's wq/ew, in the same
+  // group order with the same rounded shifts. (3) f32 quality of every
+  // arm.
+  auto shift_acc = [](std::int64_t& acc, int& ae, std::int64_t p, int eg) {
+    const int d = eg - ae;
+    if (d > 0) {
+      acc = (d >= 31) ? 0 : ((acc + (1ll << (d - 1))) >> d);
+      acc += p;
+      ae = eg;
+    } else if (d < 0) {
+      const int dd = -d;
+      p = (dd >= 31) ? 0 : ((p + (1ll << (dd - 1))) >> dd);
+      acc += p;
+    } else {
+      acc += p;
+    }
+  };
+  const auto* xqep = static_cast<const std::int8_t*>(xqe.contents());
+  const auto* eap = static_cast<const std::int8_t*>(eab.contents());
+  struct Out { const char* name; const _Float16* p; double n = 0; };
+  Out outs[] = {
+      {"g64ri", static_cast<const _Float16*>(yri.contents())},
+      {"g64rsi", static_cast<const _Float16*>(yrsi.contents())},
+      {"g64r", static_cast<const _Float16*>(yr.contents())},
+      {"g64rs", static_cast<const _Float16*>(yrs.contents())},
+      {"g64(tgmem)", static_cast<const _Float16*>(yt.contents())},
+      {"w64rs", static_cast<const _Float16*>(ywrs.contents())},
+      {"w64rsi", static_cast<const _Float16*>(ywrsi.contents())},
+      {"w64rsf", static_cast<const _Float16*>(ywrsf.contents())},
+  };
+  double d_f = 0, n_or_ri = 0, n_or_rsi = 0, n_or_w = 0, n_or_f = 0,
+         d_or_g = 0, d_or_w = 0, d_or_f = 0, n_rt = 0;
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      std::int64_t accg = 0, accw = 0, accf = 0;
+      int aeg = -1000, aew = -1000, efix = -1000;
+      for (int g = 0; g < G; ++g) {
+        efix = std::max(efix, (int)ewv[(std::size_t)n * G + g]);
+      }
+      for (int g = 0; g < G; ++g) {
+        std::int64_t pg = 0, pw = 0;
+        for (int k = g * 64; k < (g + 1) * 64; ++k) {
+          pg += (std::int64_t)xqep[(std::size_t)m * K + k] *
+                (std::int64_t)wqp[(std::size_t)n * K + k];
+          pw += (std::int64_t)xqre[(std::size_t)m * K + k] *
+                (std::int64_t)wqp[(std::size_t)n * K + k];
+        }
+        const int ew = (int)ewv[(std::size_t)n * G + g];
+        shift_acc(accg, aeg, pg, (int)eap[(std::size_t)m * G + g] + ew);
+        shift_acc(accw, aew, pw, ew);
+        const int sf = std::min(std::max(efix - ew, 0), 31);
+        accf += (pw + ((1ll << sf) >> 1)) >> sf;
+      }
+      double fsum = 0.0;
+      for (int k = 0; k < K; ++k) {
+        fsum += (double)x[(std::size_t)m * K + k] *
+                (double)w[(std::size_t)n * K + k];
+      }
+      const double refg = (double)(_Float16)std::ldexp((float)accg, aeg);
+      const double refw =
+          (double)(_Float16)std::ldexp((float)accw, aew + (int)ear[m]);
+      const double reff =
+          (double)(_Float16)std::ldexp((float)accf, efix + (int)ear[m]);
+      const std::size_t o = (std::size_t)m * N + n;
+      for (Out& ot : outs) {
+        const double v = (double)ot.p[o];
+        ot.n += (v - fsum) * (v - fsum);
+      }
+      d_f += fsum * fsum;
+      const double vri = (double)outs[0].p[o], vrsi = (double)outs[1].p[o];
+      const double vw = (double)outs[6].p[o];
+      n_or_ri += (vri - refg) * (vri - refg);
+      n_or_rsi += (vrsi - refg) * (vrsi - refg);
+      d_or_g += refg * refg;
+      n_or_w += (vw - refw) * (vw - refw);
+      d_or_w += refw * refw;
+      const double vf = (double)outs[7].p[o];
+      n_or_f += (vf - reff) * (vf - reff);
+      d_or_f += reff * reff;
+      const double vr = (double)outs[2].p[o], vt = (double)outs[4].p[o];
+      n_rt += (vr - vt) * (vr - vt);
+    }
+  }
+  const double or_ri = std::sqrt(n_or_ri / d_or_g);
+  const double or_rsi = std::sqrt(n_or_rsi / d_or_g);
+  const double or_w = std::sqrt(n_or_w / d_or_w);
+  const double or_f = std::sqrt(n_or_f / d_or_f);
+  const double r_rt = std::sqrt(n_rt / d_f);
+  std::printf("[gemm_i8r] oracle rel-L2: g64ri %.4e %s  g64rsi %.4e %s  "
+              "w64rsi %.4e %s  w64rsf %.4e %s | g64r-vs-g64 %.4e "
+              "(%dx%dx%d)\n",
+              or_ri, or_ri < 1e-3 ? "MATCH" : "(BAD)",
+              or_rsi, or_rsi < 1e-3 ? "MATCH" : "(BAD)",
+              or_w, or_w < 1e-3 ? "MATCH" : "(BAD)",
+              or_f, or_f < 1e-3 ? "MATCH" : "(BAD)", r_rt, M, N, K);
+  std::printf("[gemm_i8r] vs f32:");
+  for (Out& ot : outs) {
+    std::printf("  %s %.3e", ot.name, std::sqrt(ot.n / d_f));
+    EXPECT_TRUE(std::sqrt(ot.n / d_f) < 3e-2);
+  }
+  std::printf("\n");
+  EXPECT_TRUE(or_ri < 1e-3 && or_rsi < 1e-3 && or_w < 1e-3 && or_f < 1e-3);
+  EXPECT_TRUE(r_rt < 1e-3);
 }
