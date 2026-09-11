@@ -1430,3 +1430,211 @@ TEST(sol_attention_mma, sage_composes_with_the_exact_half)
   // rejected the fix.
   EXPECT_TRUE(differ > both.size() / 100);
 }
+
+
+namespace {
+
+// Width-parameterised twins of the file's kD=128 helpers, for the
+// head_dim-64 test below. Kept local rather than templating the Rig:
+// the Rig carries a dozen kD-shaped buffers and only this one test
+// needs another width.
+float h2f_d_(std::uint16_t h)
+{
+  _Float16 v;
+  std::memcpy(&v, &h, 2);
+  return (float)v;
+}
+
+void clustered_d_(std::vector<float>& q, std::vector<float>& k,
+                  std::vector<float>& v, int H, int T, int D, int nclust,
+                  float spread, unsigned long seed)
+{
+  const std::size_t n = (std::size_t)H * T * D;
+  q.resize(n); k.resize(n); v.resize(n);
+  std::uint32_t s = (std::uint32_t)seed;
+  auto rnd = [&]() {
+    s = s * 1664525u + 1013904223u;
+    return (float)((s >> 8) & 0xffff) / 32768.0f - 1.0f;
+  };
+  // Clustered keys, so the routing has something to keep and something
+  // to drop -- a uniform field makes every block look alike and tau
+  // stops meaning anything.
+  std::vector<float> c((std::size_t)nclust * D);
+  for (auto& e : c) { e = rnd(); }
+  for (int h = 0; h < H; ++h) {
+    for (int t = 0; t < T; ++t) {
+      const int cl = (t * nclust) / T;
+      for (int d = 0; d < D; ++d) {
+        const std::size_t i =
+            ((std::size_t)h * T + (std::size_t)t) * D + (std::size_t)d;
+        const float base = c[(std::size_t)cl * D + (std::size_t)d];
+        q[i] = base + spread * rnd();
+        k[i] = base + spread * rnd();
+        v[i] = rnd();
+      }
+    }
+  }
+}
+
+SharedBuffer up_d_(MetalCompute* mc, const std::vector<float>& x)
+{
+  SharedBuffer b = mc->make_shared_buffer(x.size() * 2);
+  if (b.empty()) { return b; }
+  auto* p = static_cast<std::uint16_t*>(b.contents());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    const _Float16 h = (_Float16)x[i];
+    std::memcpy(&p[i], &h, 2);
+  }
+  return b;
+}
+
+// The dense bd64 attention, through the same kernel arm Sol's exact half
+// takes -- so the comparison isolates Sol and not the kernel.
+bool dense_bd64_(MetalCompute* mc, const SharedBuffer& q,
+                 const SharedBuffer& k, const SharedBuffer& v,
+                 SharedBuffer& out, int H, int T, float scale, bool nax)
+{
+  struct P {
+    int B, Hh, D, qL, kL, gqa;
+    float sc;
+    int NQ, NK, NQa, NKa, qL_rem, kL_rem, qL_off;
+    std::int64_t Qs[3], Ks[3], Vs[3], Os[3];
+  };
+  const int D = 64;
+  const int bq = nax ? 64 : 32, bk = nax ? 32 : 16;
+  ComputeLibrary lib =
+      mc->load_library(nax ? "attn_steel_nax" : "attn_steel");
+  if (!lib.valid()) { return false; }
+  FunctionConstants fc;
+  fc.set_bool(200, (T % bq) == 0).set_bool(201, (T % bk) == 0)
+      .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+      .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+      .set_bool(306, false);
+  ComputeFunction fn = lib.function(
+      nax ? "attn_steel_nax_h_bd64" : "attn_steel_h_bd64", fc);
+  if (!fn.valid()) { return false; }
+  SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
+  if (pb.empty()) { return false; }
+  auto* p = static_cast<P*>(pb.contents());
+  p->B = 1; p->Hh = H; p->D = D; p->qL = T; p->kL = T; p->gqa = 1;
+  p->sc = scale;
+  p->NQ = (T + bq - 1) / bq; p->NK = (T + bk - 1) / bk;
+  p->NQa = T / bq; p->NKa = T / bk;
+  p->qL_rem = T - p->NQa * bq; p->kL_rem = T - p->NKa * bk;
+  p->qL_off = 0;
+  const std::int64_t hm[3] = {(std::int64_t)H * T * D,
+                              (std::int64_t)T * D, D};
+  for (int i = 0; i < 3; ++i) {
+    p->Qs[i] = hm[i]; p->Ks[i] = hm[i]; p->Vs[i] = hm[i]; p->Os[i] = hm[i];
+  }
+  std::string err;
+  CommandStream st = mc->make_command_stream();
+  {
+    ComputeEncoder e = st.begin_compute();
+    e.set_function(fn);
+    e.set_buffer(0, q); e.set_buffer(1, k); e.set_buffer(2, v);
+    e.set_buffer(3, out); e.set_buffer(4, pb);
+    e.dispatch({32u * (unsigned)p->NQ, 4u * (unsigned)H, 1}, {32, 4, 1});
+  }
+  return st.commit().wait_ok(&err);
+}
+
+}  // namespace
+
+// SOL AT HEAD_DIM 64, which is VOSR's width and which Sol asserted
+// against from the day it shipped.
+//
+// Both flash kernels are instantiated at 64 and 128 with the SAME tiles
+// (ALU 32/16, NAX 64/32), so nothing about the routing, the CSR or the
+// block statistics moves with the width -- only the entry point's name
+// and the summaries' row length, and both were already parameters. What
+// really is 128-specialised is sol_approx_mma, whose register-tiled
+// output is built around SOL_D; that kernel left the default path when
+// the block-masked flash half replaced it, so the width is refused only
+// under VPIPE_SOL_NO_MASKED_APPROX.
+//
+// tau = -inf is the discriminator: with every block kept exact, Sol is
+// an identity over the dense attention, so a wrong entry point, a wrong
+// tile or a wrong stride shows up as a mismatch rather than as a
+// plausible approximation.
+TEST(sol_attention_mma, head_dim_64_is_a_supported_width)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  constexpr int D64 = 64;
+  const int H = 4, T = 2048, BLK = 64;
+
+  // Both arms, because the entry point differs on each and a box with
+  // matrix cores runs the one the ALU box never sees.
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool want_nax = (arm == 1);
+    if (want_nax && !mc->supports_matrix_cores()) { continue; }
+    if (want_nax) { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+    else          { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, /*bf16=*/false, &err);
+    ::unsetenv("VPIPE_SOL_NO_NAX");
+    if (!sol) { continue; }
+    if (sol->uses_matrix_cores() != want_nax) { continue; }
+
+    std::vector<float> q, k, v;
+    clustered_d_(q, k, v, H, T, D64, 8, 0.35f, 0x64d0uL + (unsigned)arm);
+    const std::size_t n = (std::size_t)H * T * D64;
+    SharedBuffer qb = up_d_(mc, q), kb = up_d_(mc, k), vb = up_d_(mc, v);
+    SharedBuffer o_sol = mc->make_shared_buffer(n * 2);
+    SharedBuffer o_den = mc->make_shared_buffer(n * 2);
+    if (qb.empty() || o_den.empty()) { return; }
+    const float scale = 1.0f / std::sqrt((float)D64);
+
+    // Dense reference through the SAME kernel Sol's exact half uses.
+    if (!dense_bd64_(mc, qb, kb, vb, o_den, H, T, scale, want_nax)) {
+      std::printf("[sol-d64] arm %d: dense bd64 unavailable -- skip\n", arm);
+      continue;
+    }
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = -std::numeric_limits<float>::infinity();
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, qb, kb, vb, o_sol, H, T, D64, scale, cfg,
+                                &err)); }
+      ASSERT_TRUE(st.commit().wait_ok(&err)); }
+
+    const auto* a = static_cast<const std::uint16_t*>(o_den.contents());
+    const auto* b = static_cast<const std::uint16_t*>(o_sol.contents());
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double x = h2f_d_(a[i]), y = h2f_d_(b[i]);
+      num += (x - y) * (x - y);
+      den += x * x;
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[sol-d64] %s arm, tau=-inf vs dense bd64: rel-L2 %.2e\n",
+                want_nax ? "nax" : "alu", rel);
+    // Every block kept exact means Sol IS the dense attention, modulo
+    // the merge's one extra rounding.
+    EXPECT_TRUE(std::isfinite(rel) && rel < 1e-3);
+
+    // ...and it still routes at this width.
+    cfg.tau = 1.0f;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, qb, kb, vb, o_sol, H, T, D64, scale, cfg,
+                                &err)); }
+      ASSERT_TRUE(st.commit().wait_ok(&err)); }
+    double n2 = 0.0, d2 = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double x = h2f_d_(a[i]), y = h2f_d_(b[i]);
+      n2 += (x - y) * (x - y);
+      d2 += x * x;
+    }
+    const double r2 = d2 > 0.0 ? std::sqrt(n2 / d2) : 0.0;
+    std::printf("[sol-d64] %s arm, tau=1.0  vs dense bd64: rel-L2 %.4f\n",
+                want_nax ? "nax" : "alu", r2);
+    EXPECT_TRUE(std::isfinite(r2) && r2 > 0.0 && r2 < 0.5);
+  }
+}

@@ -175,6 +175,22 @@ const MirrorEntry kMirrors[] = {
     {.source = "modelscope",
      .hf_path = "MiniMaxAI/MiniMax-H3",
      .path = "MiniMax/MiniMax-H3"},
+    // VOSR's authors publish the restorer under their own account on
+    // HuggingFace and under a lab account on ModelScope, with a repo
+    // name that says CKPT rather than the model's own. The tree is
+    // otherwise the same: every file the catalogue entry pins is present
+    // at an identical size, and the two `Qwen-Image-vae-2d/config.json`
+    // differ only in whitespace (754 bytes against 811, same keys, same
+    // values).
+    //
+    // Its CONDITIONER needs no row. `facebook/dinov2-large` is mirrored
+    // under the identical owner and repo, model.safetensors byte-size
+    // for byte-size, so the default carries it -- and the live tier asks
+    // anyway, because a mirror that works by default has nothing
+    // declaring it.
+    {.source = "modelscope",
+     .hf_path = "CSWRY/VOSR",
+     .path = "LULALULALU/VOSR_CKPT"},
     // Three Krea-2 adapters are individual-author uploads with no
     // ModelScope counterpart. Marked absent so the fetch says so instead
     // of handing back a 404 the user has to interpret.

@@ -21,6 +21,7 @@
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/grounded-encode-params.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/vosr/metal-dinov2-encoder.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-memory.h"
 #endif
@@ -145,6 +146,19 @@ public:
 private:
   std::string _hf_dir;
   std::string _enc_dir;
+  // VOSR only: the DINOv2 checkpoint, which is not under _hf_dir. Empty
+  // until initialize() resolves it.
+  std::string _venc_dir;
+  // How a reference image pairs with the conditioning beats. See the
+  // `reference_mode` config key: latching is right for an edit graph and
+  // wrong for a restoration one, and the two cannot share a default.
+  enum class RefMode { kAuto, kLatch, kPerBeat };
+  RefMode _ref_mode = RefMode::kAuto;
+  bool ref_per_beat_() const noexcept
+  {
+    return _ref_mode == RefMode::kPerBeat
+        || (_ref_mode == RefMode::kAuto && _family == "vosr");
+  }
   // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
   std::string _family = "krea2";
   // What the models DB recorded for this checkpoint, when a model-select
@@ -217,6 +231,11 @@ private:
   // class rather than another encoder_config_*() over _encoder.
   std::unique_ptr<genai::MiniMaxH3TextEncoder>   _h3_enc;
   std::unique_ptr<genai::Tokenizer>               _tokenizer;
+  // VOSR's conditioner: a DINOv2 ViT-L/14 and nothing else. It is the
+  // WHOLE conditioning -- there is no prompt, no tokenizer and no text
+  // encoder on this path, so every text member above stays null.
+  std::unique_ptr<genai::MetalDinov2Encoder>      _dinov2;
+  int _dino_size = 448;
   metal_compute::SharedBuffer                     _embed;      // encoder embeds
   mutable std::unique_ptr<genai::MetalQwen25Vision> _vision;   // QIE, lazy
   mutable std::unique_ptr<genai::MetalQwenVisionEncoder> _vision3;  // krea2, lazy
@@ -246,6 +265,11 @@ private:
   mutable int _img_n = 0;          // references the tower actually encoded
 
   bool load_encoder_(metal_compute::MetalCompute* mc);
+  // The VOSR path: one picture in, one conditioning beat out, driven by
+  // the ref_image iport rather than by a prompt.
+  bool load_dinov2_(metal_compute::MetalCompute* mc,
+                    const std::string& root);
+  Job  process_vosr_(RuntimeContext& ctx);
 
   // ---- idle unload -------------------------------------------------------
   // The text encoder is the second-largest resident block in a diffusion

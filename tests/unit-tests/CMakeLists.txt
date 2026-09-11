@@ -44,6 +44,8 @@ set(LOCAL_TEST_SOURCES
   path-sandbox.cc
   session-sandbox.cc
   model-catalog.cc
+  vosr.cc
+  vosr-reference.cc
   model-source.cc
   model-source-live.cc
   block-residency.cc

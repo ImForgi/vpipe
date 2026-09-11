@@ -166,9 +166,10 @@ A gated ModelScope repo takes `$MODELSCOPE_API_TOKEN` (or `hf_token` on the
 stage) the way HuggingFace takes `$HF_TOKEN`.
 
 Most repos are mirrored under the identical `owner/repo`; the handful that are
-not (MiniMax publishes as `MiniMaxAI` upstream and `MiniMax` on ModelScope) are
-mapped internally, so you still name the HuggingFace path either way. A repo
-with no ModelScope counterpart is refused by name rather than by HTTP code.
+not (MiniMax publishes as `MiniMaxAI` upstream and `MiniMax` on ModelScope;
+VOSR as `CSWRY/VOSR` upstream and `LULALULALU/VOSR_CKPT` here) are mapped
+internally, so you still name the HuggingFace path either way. A repo with no
+ModelScope counterpart is refused by name rather than by HTTP code.
 
 **As a spec.** The same fetch in spec form — here with the non-interactive
 `model_path` set so it runs without prompts (an interactively-built fetch with

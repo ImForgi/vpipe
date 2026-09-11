@@ -69,7 +69,7 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image-edit,"
-       "boogu-image,boogu-image-edit",
+       "boogu-image,boogu-image-edit,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
@@ -88,7 +88,8 @@ const ConfigKey kAttrs[] = {
    .doc = "output width, multiple of 16. Unset TOGETHER with height = infer "
           "from ref_latent0 (iport5); 256 if there is no reference either"},
   {.key = "steps", .type = ConfigType::Int, .required = false,
-   .doc = "turbo sampler steps (default 8)"},
+   .doc = "turbo sampler steps (default 8; 1 on a VOSR restorer, which is "
+          "distilled to one and gains nothing from more)"},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "initial-noise RNG seed (default 0)"},
   {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
@@ -242,6 +243,27 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: one "
           "adapter stays where it was trained while the other is swept. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  {.key = "reference_mode", .type = ConfigType::String, .required = false,
+   .doc = "how the reference latents pair with the conditioning beats. "
+          "\"latch\" holds the FIRST reference for the whole run, which is "
+          "what an edit graph wants: one source picture, many prompts. "
+          "\"per_beat\" reads a fresh reference for every beat, which is "
+          "what a RESTORATION graph wants: the reference IS the input and "
+          "changes every time, and latching it would restore a whole folder "
+          "from the first picture without ever saying so. \"auto\" (the "
+          "default) is per_beat for a restorer and latch for everything "
+          "else", .def_str = "auto"},
+  {.key = "tile_size", .type = ConfigType::Int, .required = false,
+   .doc = "VOSR only: tile the restorer in LATENT space, this many output "
+          "PIXELS per tile side (rounded to a multiple of 16; 0 = no "
+          "tiling, which is the default and the only path that matches the "
+          "reference exactly). Attention is quadratic in the token count, "
+          "so a 4x upscale of anything much past 512px wants this. "
+          "Overlapping tiles are Gaussian-blended and share one noise "
+          "field", .def_int = 0},
+  {.key = "tile_overlap", .type = ConfigType::Int, .required = false,
+   .doc = "VOSR only: overlap between tiles, in output pixels. Ignored "
+          "when tile_size is 0", .def_int = 32},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -375,10 +397,28 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
 {
   _hf_dir    = attr_str("hf_dir");
   _dit_dir   = attr_str("dit_dir");
+  _tile_size = (int)attr_int("tile_size");
+  _tile_overlap = (int)attr_int("tile_overlap");
+  {
+    const std::string rm = attr_str("reference_mode");
+    if (rm == "latch")         { _ref_mode = RefMode::kLatch; }
+    else if (rm == "per_beat") { _ref_mode = RefMode::kPerBeat; }
+    else if (!rm.empty() && rm != "auto") {
+      // Deferred-validated config: warn and take the default.
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): reference_mode '{}' is not "
+          "auto|latch|per_beat; using auto", this->id(), rm));
+    }
+  }
   _init_latents = attr_str("init_latents");
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
   _steps  = (int)attr_int("steps");
+  // Whether the GRAPH chose a step count, which the default
+  // below is about to make unknowable. A one-step distilled
+  // family needs to tell "8 because nobody said" apart from
+  // "8 because somebody did".
+  _steps_set = _steps > 0;
   _strength = attr_real("strength");
   _guidance_scale = attr_real("guidance_scale");
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 GEMMs for the DiT's
@@ -614,6 +654,31 @@ t2i_family_(const std::string& transformer_dir)
 // the conditioner and the VAE stages size the box the same way this one does.
 using model_memory::phys_ram;
 
+// The DiT weights directory for a checkpoint root, at PLANNING time --
+// before initialize() has resolved a family and while the two ledgers
+// still have to name the same bytes.
+//
+// `transformer/` for every diffusers tree, and VOSR's own `checkpoints/`
+// for the one family that ships no diffusers tree at all. Getting this
+// wrong is quiet in the worst way: a directory that does not exist
+// weighs zero, so the largest thing the graph loads is planned as
+// nothing and the box is admitted to a run it cannot hold.
+std::string
+planning_dit_dir_(const std::string& root)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path t = fs::path(root) / "transformer";
+  if (fs::is_directory(t, ec)) { return t.string(); }
+  genai::MetalVosrTransformer::Config vc;
+  if (genai::MetalVosrTransformer::read_config(root, &vc, nullptr)) {
+    const std::string w = genai::MetalVosrTransformer::weights_dir(root);
+    if (!w.empty()) { return w; }
+  }
+  return t.string();
+}
+
+
 // FLUX.2 VAE decode-peak channel count from <root>/vae/config.json. The top
 // up-block's FIRST resnet reads block_out_channels[1] (256) at FULL res (the
 // upsampled level-2 output) before it reduces to block_out_channels[0] (128),
@@ -809,7 +874,7 @@ GenerateImageStage::declare_memory() const
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  const std::string dit = (fs::path(root) / "transformer").string();
+  const std::string dit = planning_dit_dir_(root);
   // NAMED SEPARATELY, both of them. A DiT and an encoder have different
   // sizes, different streaming forms and -- on other stages -- different
   // lifetimes, and collapsing them to one number loses the distinction
@@ -882,7 +947,7 @@ GenerateImageStage::declare_resources() const
     }
     return pout;
   }
-  const std::string dit = (fs::path(root) / "transformer").string();
+  const std::string dit = planning_dit_dir_(root);
   std::vector<ResourceClaim> out{
       model_memory::weight_claim_streamable(dit, dit_floor_bytes_(dit))};
   for (auto& c : model_memory::weight_claims({enc})) {
@@ -1104,6 +1169,27 @@ GenerateImageStage::ensure_loaded_()
   }
   _family = _plugin_family != nullptr ? std::string(_plugin_family->tag())
                                       : t2i_family_(dit_dir);
+  // VOSR ships no diffusers tree -- an args.json beside a `checkpoints/`
+  // directory -- so `t2i_family_` cannot see it and falls through to the
+  // "krea2" default. Its own reader is the only thing that can identify
+  // it, and it refuses every variant this stage does not implement
+  // (multi-step, 0.5B/SD2, auxiliary time conditioning), which matters
+  // more here than usual: those load through the same tensor names and
+  // then compute the wrong answer rather than failing.
+  if (_plugin_family == nullptr && _family == "krea2") {
+    std::string vwhy;
+    genai::MetalVosrTransformer::Config vc;
+    if (genai::MetalVosrTransformer::read_config(root, &vc, &vwhy)) {
+      _family   = "vosr";
+      _vosr_cfg = vc;
+      // The FILE, not the directory: `ema_model.safetensors` is not a
+      // name the checkpoint opener globs for, so a directory here opens
+      // nothing.
+      _vosr_dir = _dit_dir.empty()
+          ? genai::MetalVosrTransformer::weights_path(root)
+          : dit_dir;
+    }
+  }
   // NO CONFIG AND NO CLAIM: `_family` above is the fall-through, not a
   // reading. Say so, because the alternative is a log line that names
   // "krea2" with the same confidence it would have had from a config --
@@ -1115,7 +1201,11 @@ GenerateImageStage::ensure_loaded_()
   // thing to point `dit_dir` at, and turning that into an error would
   // break a working path to improve a message. The families that are
   // recognised-but-absent are refused above; this is the residue.
-  if (_plugin_family == nullptr) {
+  //
+  // NOT for VOSR: the probe above READ its args.json, so the family is a
+  // reading and not a fall-through, and saying otherwise sends an
+  // operator looking for a plugin that does not exist.
+  if (_plugin_family == nullptr && _family != "vosr") {
     std::error_code cec;
     if (!fs::exists(fs::path(dit_dir) / "config.json", cec)) {
       session()->warn(fmt(
@@ -1196,7 +1286,28 @@ GenerateImageStage::ensure_loaded_()
       _family == "flux2" ? "FLUX.2"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "boogu-image" ? "Boogu-Image NextDiT"
-      : "Krea2 MMDiT", dit_dir));
+      : _family == "vosr" ? "VOSR LightningDiT"
+      : "Krea2 MMDiT", _family == "vosr" ? _vosr_dir : dit_dir));
+  if (_family == "vosr") {
+    if (_vosr_dir.empty()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): '{}' looks like a VOSR checkpoint but "
+          "holds no readable safetensors; inert", this->id(), root));
+      return;
+    }
+    if (!load_vosr_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the VOSR restorer from "
+          "'{}'; inert", this->id(), _vosr_dir));
+      return;
+    }
+    session()->info(fmt(
+        "GenerateImageStage('{}'): VOSR LightningDiT ready -- {} blocks at "
+        "{} wide, one-step, latent {} channels at 1/8 spatial (trained at "
+        "{}px)", this->id(), _vosr_cfg.depth, _vosr_cfg.dim,
+        _vosr_cfg.latent_ch, _vosr->train_grid() * 8));
+    return;
+  }
   if (_family == "flux2") {
     // Stream the DiT blocks when the box can't hold encoder + DiT together
     // (e.g. the 18 GB 9B DiT + a 16 GB encoder on a 16/32 GB box); ~2-3x slower
@@ -1283,8 +1394,8 @@ GenerateImageStage::ensure_loaded_()
         model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     genai::MetalQwenImageTransformer::Config qcfg;
-  qcfg.sage = _sage;
-    qcfg.sage = _sage;
+    qcfg.sage    = _sage;
+    qcfg.i8_gemm = _i8_gemm;
     _qie_dit = genai::MetalQwenImageTransformer::load(
         weight_set_(dit_dir), mc, qcfg, stream_blocks);
     if (!_qie_dit) {
@@ -1612,6 +1723,33 @@ GenerateImageStage::weight_set_(const std::string& dir) const
 }
 
 bool
+GenerateImageStage::load_vosr_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _vosr_dir.empty()) { return false; }
+  // No streaming decision: at 1.4B the restorer is 2.8 GB bf16, small
+  // enough that the block-streaming machinery would cost more than it
+  // saves on any box that can run the VAE at all. The conditioner's
+  // DINOv2 is another 0.6 GB and is dropped between beats by its own
+  // idle policy.
+  // The four accelerations, from the same stage keys every other family
+  // here reads. The restorer is head_dim 64 where the rest are 128,
+  // which is what Sol had to be generalised for.
+  genai::MetalVosrTransformer::Config vcfg = _vosr_cfg;
+  vcfg.i8_gemm = _i8_gemm;
+  vcfg.sage    = _sage;
+  vcfg.sol     = _sol;
+  std::string err;
+  _vosr = genai::MetalVosrTransformer::load(weight_set_(_vosr_dir), mc,
+                                            vcfg, &err);
+  if (!_vosr && !err.empty()) {
+    session()->error(fmt("GenerateImageStage('{}'): VOSR restorer: {}",
+                         this->id(), err));
+  }
+  return (bool)_vosr;
+}
+
+bool
 GenerateImageStage::load_boogu_dit_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -1705,7 +1843,16 @@ GenerateImageStage::load_qie_dit_()
   // Default-constructed, exactly as the first load was: everything that
   // varies (quantization, zero_cond_t, the block count) is read from the
   // checkpoint's config.json inside load().
+  //
+  // THE ACCELERATION SETTINGS BELONG HERE TOO. This is the RELOAD path --
+  // free_qie_dit_for_decode_ drops the DiT so a large VAE decode fits,
+  // and the next generation lands here. A config built fresh without
+  // them means the first image of a run is accelerated and every one
+  // after it is not, which reads as the setting working and then
+  // quietly stopping.
   genai::MetalQwenImageTransformer::Config qcfg;
+  qcfg.sage    = _sage;
+  qcfg.i8_gemm = _i8_gemm;
   _qie_dit = genai::MetalQwenImageTransformer::load(
       weight_set_(_qie_dit_dir), mc, qcfg, _qie_stream);
   return (bool)_qie_dit;
@@ -3042,6 +3189,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "flux2" ? (bool)_flux2_dit
       : _family == "qwen-image-edit" ? (bool)_qie_dit
       : _family == "boogu-image" ? (bool)_boogu_dit
+      : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
   if (!have_dit) {
     session()->warn(fmt(
@@ -3111,10 +3259,16 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // for every later prompt. FLUX.2 threads them as multi-reference conditioning
   // tokens (below); Krea-2 uses ref latent 0 as the img2img init and ignores
   // ref latent 1.
+  //
+  // ...UNLESS the graph said otherwise. A restoration graph hands this
+  // stage a new reference on every beat and the picture IS the input, so
+  // holding the first would restore a whole folder from it and never say
+  // so. See the `reference_mode` config key.
+  const bool ref_fresh = ref_per_beat_();
   for (int r = 0; r < 2; ++r) {
     const int port = 5 + r;
     if ((int)ctx.num_iports() > port && ctx.iport_connected(port) &&
-        _ref[r].empty()) {
+        (_ref[r].empty() || ref_fresh)) {
       auto rb = co_await ctx.read(port);
       const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
                           : nullptr;
@@ -3554,6 +3708,109 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // idle) -- and BEFORE the write, so the separate vae-decode stage
     // sees the freed room rather than racing it.
     free_qie_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- VOSR: RESTORE rather than generate ------------------------------
+  //
+  // The one family here whose output geometry is not a choice. The
+  // low-quality latent on ref_latent0 IS the grid, so `width`/`height`
+  // are read only to notice a disagreement; nothing upsamples inside the
+  // model. Everything a text-to-image run configures -- guidance, the
+  // negative beat, the sampler, `strength` -- has no meaning on this
+  // path and is not read.
+  if (_family == "vosr") {
+    const RefLatent& r0 = _ref[0];
+    if (r0.empty()) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): VOSR restores a picture and nothing was "
+          "wired to ref_latent0 -- feed it a vae-encode of the same pixels "
+          "the conditioner saw; dropping beat", this->id()));
+      co_return;
+    }
+    if (r0.c != _vosr_cfg.latent_ch) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): VOSR wants a {}-channel latent on "
+          "ref_latent0 and got {}; dropping beat", this->id(),
+          _vosr_cfg.latent_ch, r0.c));
+      co_return;
+    }
+    if (r0.h * 8 != gen_h || r0.w * 8 != gen_w) {
+      // Not an error: the size config is simply not in charge here, and
+      // a graph that set one deserves to be told which number won.
+      session()->log_debug(fmt(
+          "GenerateImageStage('{}'): VOSR takes its geometry from "
+          "ref_latent0 ({}x{}), not from the configured {}x{}",
+          this->id(), r0.w * 8, r0.h * 8, gen_w, gen_h));
+      gen_h = r0.h * 8;
+      gen_w = r0.w * 8;
+      lh = r0.h;
+      lw = r0.w;
+    }
+    genai::MetalVosrTransformer::RestoreRequest rr;
+    rr.lq        = r0.chw.data();
+    rr.lh        = r0.h;
+    rr.lw        = r0.w;
+    rr.cond      = ctb->as_u8();
+    rr.cond_rows = n_real;
+    // The distilled checkpoint is ONE step. A graph asking for more gets
+    // more -- the flow loop is the same recipe at any count -- but the
+    // default has to be the one the weights were distilled for, not this
+    // stage's text-to-image default of 20.
+    rr.steps     = _steps_set ? _scheduler_spec.steps : 1;
+    rr.seed      = _seed + (std::uint64_t)_latents_emitted;
+    if (_tile_size > 0) {
+      // Pixels in the config, latent cells in the request: one
+      // conversion, here, so the key means the same thing it means in
+      // the reference's command line.
+      rr.tile         = _tile_size / 8;
+      rr.tile_overlap = _tile_overlap / 8;
+    }
+    // The conditioning must be the bf16 DINOv2 grid the vosr
+    // conditioner emits. A beat of any other element type is a graph
+    // wired to the wrong conditioner, and reading bf16 as f16 gives
+    // values of the right magnitude and entirely the wrong content.
+    if (ctb->dtype != TensorBeat::DType::Bf16 ||
+        ctb->shape.size() != 2 ||
+        (int)ctb->shape.back() != _vosr_cfg.enc_dim) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): VOSR needs a bf16 [tokens, {}] "
+          "conditioning beat from a vosr diffusion-conditioner; got {}; "
+          "dropping beat", this->id(), _vosr_cfg.enc_dim, in->describe()));
+      co_return;
+    }
+    UiProgress vbar = session()->open_progress("restore");
+    DenoiseProgress vprog(&vbar, rr.steps, /*forwards_per_step=*/1);
+    rr.block_progress = vprog.block_fn();
+    rr.progress = [&vprog, &ctx](int step, int total) {
+      vprog.set_steps(total);
+      vprog.end_step(step - 1);
+      return !ctx.stop_requested();
+    };
+    std::vector<float> vout;
+    std::string verr;
+    const bool ok = _vosr->restore(rr, &vout, &verr);
+    if (!ok || vout.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): VOSR restore {}; dropping beat",
+          this->id(),
+          ctx.stop_requested() ? "stopped"
+                               : (verr.empty() ? "failed" : verr.c_str())));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {_vosr_cfg.latent_ch, lh, lw};
+    out->resize_contiguous(vout.size());
+    std::memcpy(out->as_f32(), vout.data(), vout.size() * sizeof(float));
+    tag_model_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): VOSR latent [{}, {}, {}] ({} step{} @ "
+        "{}x{}, {} conditioning tokens{})", this->id(), _vosr_cfg.latent_ch,
+        lh, lw, rr.steps, rr.steps == 1 ? "" : "s", gen_w, gen_h, n_real,
+        rr.tile > 0 ? ", tiled" : ""));
     co_await ctx.write(0, std::move(out));
     co_return;
   }

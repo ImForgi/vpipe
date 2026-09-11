@@ -169,6 +169,18 @@ TEST(model_source, mirror_paths) {
               == MirrorStatus::Same);
   EXPECT_TRUE(out == "krea/Krea-2-Turbo");
 
+  // Renamed: VOSR is CSWRY/VOSR upstream and LULALULALU/VOSR_CKPT here.
+  EXPECT_TRUE(mirror_repo("modelscope", "CSWRY/VOSR", out)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(out == "LULALULALU/VOSR_CKPT");
+  // ...but its conditioner is NOT renamed, and the two travel together.
+  // Stated here because the pair is the easy thing to get wrong: a row
+  // added for the restorer invites one for the tower, and the tower
+  // does not want one.
+  EXPECT_TRUE(mirror_repo("modelscope", "facebook/dinov2-large", out)
+              == MirrorStatus::Same);
+  EXPECT_TRUE(out == "facebook/dinov2-large");
+
   // Absent: known to have no counterpart, so the fetch can say so
   // instead of relaying a 404.
   EXPECT_TRUE(mirror_repo("modelscope", "mgwr/M87", out)

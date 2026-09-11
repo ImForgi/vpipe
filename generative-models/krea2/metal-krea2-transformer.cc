@@ -2022,6 +2022,12 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
          t_final = 0, t_ffup = 0, t_ffact = 0;
   std::chrono::steady_clock::time_point mark;
 
+  // The int8 split's width, for shapes an earlier forward recorded. HERE
+  // because it runs its own command streams and so needs no encoder open:
+  // step 1 records, step 2 measures, every step after reads the cache.
+  // No-op once the shapes are settled.
+  if (_i8) { _i8->tune_pending(_mc); }
+
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();

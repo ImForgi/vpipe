@@ -2564,6 +2564,12 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     _lora.ensure_scratch(_lora_scratch_rows * (std::size_t)_lora_rank_total);
   }
 
+  // The int8 split's width, for shapes an earlier forward recorded. HERE
+  // because it runs its own command streams and so needs no encoder open:
+  // step 1 records, step 2 measures, every step after reads the cache.
+  // No-op once the shapes are settled.
+  if (_i8) { _i8->tune_pending(_mc); }
+
   // ===== stream 1: conditioning + embed + double blocks =====
   if (prof) { mk = tnow(); }
   {

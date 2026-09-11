@@ -568,6 +568,26 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   return true;
 }
 
+metal_compute::ComputeFunction
+MetalSolAttention::_lib_for_width_(
+    const metal_compute::FunctionConstants& fc) const
+{
+  // ONE place that spells the entry point, because there are now four of
+  // them (two kernels x two widths) and both halves need the same one.
+  const bool d64 = (_d == 64);
+  if (_nax) {
+    return _lib_nax.function(
+        d64 ? (_bf16 ? "attn_steel_nax_h_bd64_bf16" : "attn_steel_nax_h_bd64")
+            : (_bf16 ? "attn_steel_nax_h_bd128_bf16"
+                     : "attn_steel_nax_h_bd128"),
+        fc);
+  }
+  return _lib_steel.function(
+      d64 ? (_bf16 ? "attn_steel_h_bd64_bf16" : "attn_steel_h_bd64")
+          : (_bf16 ? "attn_steel_h_bd128_bf16" : "attn_steel_h_bd128"),
+      fc);
+}
+
 bool
 MetalSolAttention::ensure_steel_(int tokens, std::string* err)
 {
@@ -579,8 +599,12 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
   // nothing else about the geometry does, so without it an A/B in one
   // process keeps whichever arm specialised first.
   const int want_sage = (_sage != nullptr) ? 1 : 0;
+  // ...AND ON THE HEAD WIDTH, which now selects the entry point. Two
+  // widths at one sequence length is not a shape anything runs today,
+  // but the cache would hand the second one the first one's kernel and
+  // the failure is a silent read past the shorter rows.
   if (_steel_seq == tokens && _steel_nk == _nk && _steel_sage == want_sage
-      && _fn_steel.valid()) {
+      && _steel_d == _d && _fn_steel.valid()) {
     return true;
   }
   FunctionConstants fc;
@@ -588,12 +612,7 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
       .set_bool(300, false).set_bool(301, false).set_bool(302, false)
       .set_bool(303, true).set_bool(304, true)
       .set_bool(sage::kQkInt8Constant, want_sage != 0);
-  _fn_steel = _nax
-      ? _lib_nax.function(
-            _bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128",
-            fc)
-      : _lib_steel.function(
-            _bf16 ? "attn_steel_h_bd128_bf16" : "attn_steel_h_bd128", fc);
+  _fn_steel = _lib_for_width_(fc);
   if (!_fn_steel.valid()) {
     if (err != nullptr) {
       *err = "the block-sparse steel attention did not specialise";
@@ -613,12 +632,7 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
     fa.set_bool(200, (tokens % 64) == 0).set_bool(201, (_nk % 32) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(303, false).set_bool(304, true).set_bool(305, true);
-    _fn_approx_masked = _nax
-        ? _lib_nax.function(
-              _bf16 ? "attn_steel_nax_h_bd128_bf16" : "attn_steel_nax_h_bd128",
-              fa)
-        : _lib_steel.function(
-              _bf16 ? "attn_steel_h_bd128_bf16" : "attn_steel_h_bd128", fa);
+    _fn_approx_masked = _lib_for_width_(fa);
     if (!_fn_approx_masked.valid()) {
       if (err != nullptr) {
         *err = "the block-masked flash attention did not specialise";
@@ -629,6 +643,7 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
   _steel_seq = tokens;
   _steel_nk = _nk;
   _steel_sage = want_sage;
+  _steel_d = _d;
   return true;
 }
 
@@ -644,9 +659,25 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return false;
   };
   if (heads <= 0 || tokens <= 0 || d <= 0) { return fail("empty geometry"); }
-  // Sol-Attn is specified at head_dim 128, and the steel entry point
-  // this leans on is instantiated for it alone.
-  if (d != kHeadDim) { return fail("sol_attn needs head_dim 128"); }
+  // HEAD DIM 64 OR 128, which is every width the steel entries are
+  // instantiated at. Both flash kernels tile these IDENTICALLY -- ALU
+  // 32/16, NAX 64/32 -- so nothing about the routing, the CSR or the
+  // block statistics moves with the width; only the entry point's name
+  // and the summaries' row length do, and those are already parameters.
+  //
+  // It used to assert 128 because 128 was all there was. The one piece
+  // that really is specialised is sol_approx_mma, whose register-tiled
+  // output is built around SOL_D -- and that kernel is no longer on the
+  // default path (the block-masked flash half replaced it on both arms),
+  // so a width it cannot serve is refused only when a caller asks for it
+  // back with VPIPE_SOL_NO_MASKED_APPROX.
+  if (d != 64 && d != kHeadDim) {
+    return fail("sol_attn needs head_dim 64 or 128");
+  }
+  if (!_masked && d != kHeadDim) {
+    return fail("VPIPE_SOL_NO_MASKED_APPROX is head_dim 128 only -- "
+                "sol_approx_mma's output tile is built around it");
+  }
   if (cfg.thresh != sol::Threshold::kDiag) {
     return fail("sol_attn on metal implements the 'diag' threshold only");
   }

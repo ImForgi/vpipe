@@ -700,6 +700,11 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   // that fell back to the ALU kernel runs dense and says so rather than
   // reporting a Sage run that never happened.
   {
+    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
+                                              /*bf16=*/true);
+    if (i8->enabled()) { m->_i8 = std::move(i8); }
+  }
+  {
     bool sage_fatal = false;
     m->_sage = MetalSageAttention::load_for_model(
         mc, /*bf16=*/true, cfg.sage, "MetalQwenImageTransformer",
@@ -1031,6 +1036,14 @@ MetalQwenImageTransformer::gemm_mma_(ComputeEncoder& enc,
   } else {
     wdense = &w.w;
   }
+  // Accelerated mode: int8 activations x int8 weight, quantized per call
+  // from the SAME dense operand the tiles below read -- so it sits after
+  // the dequant and before the tile choice, and a shape it does not
+  // accept falls through with nothing encoded. Biasless, like every arm
+  // in this function; gemm_bias_q adds the bias after either way.
+  if (_i8 && _i8->gemm(enc, xin, xe, *wdense, y, ye, M, N, K)) {
+    return true;
+  }
   // Split-K deep-reduction path (K a multiple of kSplitKC, >= 2 chunks): each
   // split gets its own threadgroup plane (grid.z); a residual_add fold sums the
   // planes into y. QIE's dims never trip this (kept for parity); falls through
@@ -1186,6 +1199,12 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   double t_embed = 0, t_mod = 0, t_norm = 0, t_qkv = 0, t_attn = 0,
          t_oproj = 0, t_ff = 0, t_final = 0;
   std::chrono::steady_clock::time_point mark;
+
+  // The int8 split's width, for shapes an earlier step recorded. BEFORE
+  // the stream below, because tune_pending runs its own command streams
+  // and every encoder in this forward is open from there to the end.
+  // Step 1 records, step 2 measures, every step after reads the cache.
+  if (_i8) { _i8->tune_pending(_mc); }
 
   CommandStream stream = _mc->make_command_stream();
   {

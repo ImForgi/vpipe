@@ -1,6 +1,7 @@
 #include "generative-models/shared/i8-gemm.h"
 
 #include <cstdlib>
+#include <vector>
 
 namespace vpipe {
 namespace genai {
@@ -25,6 +26,26 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16) : _mc(mc)
   _fn_quant_pad = _lib_q.function("quant_f16_i8_row_g512_pad");
   _fn_gemm = _lib_g.function("gemm_i8i8_sc_f16_n64_g512");
   _on = _fn_quant.valid() && _fn_gemm.valid();
+  // The split-K twin and the fold it drains through. Both optional: a
+  // missing one leaves the single-op path exactly as it was, which is
+  // why nothing below is guarded on `_on` alone.
+  _fn_gemm_sk = _lib_g.function("gemm_i8i8_sc_f16_n64_g512_sk");
+  _lib_elt = mc->load_library(bf16 ? "llm_elementwise_bf16"
+                                   : "llm_elementwise");
+  _fn_fold = _lib_elt.function("splitk_fold_f32_f16");
+  _fn_fold_bias = _lib_elt.function("splitk_fold_bias_f32_f16");
+  {
+    long mb = 512;
+    if (const char* e = std::getenv("VPIPE_I8_SPLITK_MAX_MB")) {
+      const long v = std::atol(e);
+      if (v > 0) { mb = v; }
+    }
+    _plane_budget = (std::size_t)mb * 1024u * 1024u;
+  }
+  if (const char* e = std::getenv("VPIPE_I8_SPLITK_MAX_S")) {
+    const int v = std::atoi(e);
+    _max_splits = v >= 0 ? v : 16;
+  }
   if (const char* e = std::getenv("VPIPE_I8_GEMM_MIN_M")) {
     _min_m = std::atoi(e);
   }
@@ -34,12 +55,58 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16) : _mc(mc)
   }
 }
 
+std::vector<int>
+I8GemmContext::split_candidates(int M, int N, int K) const
+{
+  std::vector<int> out;
+  if (!split_available()) { return out; }
+  const int G = kpad_(K) / 512;
+  // BALANCED PLANES ONLY. The kernel takes a ragged last plane happily,
+  // but an S that leaves one plane with a third of the groups is a
+  // straggler the fold waits on, and it never won a round here.
+  for (int S = 2; S <= _max_splits && S <= G; ++S) {
+    if (G % S != 0) { continue; }
+    if (rows_per_block_(S, N) < 64) { continue; }   // budget too tight
+    out.push_back(S);
+  }
+  (void)M;
+  return out;
+}
+
+int
+I8GemmContext::plan_(int M, int N, int K) const
+{
+  if (!split_available() || bypass_split) { return 0; }
+  if (force_splits > 0) { return force_splits; }
+  const int key = m_key_(M);
+  for (const Tuned& t : _tuned) {
+    if (t.N == N && t.K == K && t.M == key) { return t.splits; }
+  }
+  // UNTUNED: 2, when the shape admits it. Not 0, because a caller that
+  // never tunes should still get the part of this that is free, and not
+  // more, because 2 is the only width that won at every row count
+  // measured (1.23-1.44x) -- the wider ones win big at 256 rows and LOSE
+  // at 1024+. An untuned guess that can lose is worse than a small
+  // certain gain.
+  const std::vector<int> c = split_candidates(M, N, K);
+  for (int S : c) {
+    if (S == 2) { return 2; }
+  }
+  return 0;
+}
+
 bool
 I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
                     std::size_t xe, const SharedBuffer& w,
-                    const SharedBuffer& y, std::size_t ye,
-                    int M, int N, int K)
+                    const SharedBuffer& b, const SharedBuffer& y,
+                    std::size_t ye, int M, int N, int K)
 {
+  // A bias with no fold to add it in would be silently dropped on the
+  // split path, so the split is refused rather than the bias.
+  const bool bias = !b.empty();
+  if (bias && !_fn_fold_bias.valid() && plan_(M, N, K) > 0) {
+    return false;
+  }
   if (!accepts(M, N, K)) { return false; }
   // Everything below the quantizers works in the PADDED contraction: the
   // scratches, the group count and the GEMM's K. Only the two quantize
@@ -78,19 +145,183 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
   enc.set_constant(3, K);
   if (pad) { enc.set_constant(4, KP); }
   enc.dispatch({256u, (unsigned)N, 1}, {256, 1, 1});
-  // i8 x i8 GEMM, per-group f32 accumulate, f16 store.
-  enc.set_function(_fn_gemm);
-  enc.set_buffer(0, _xq);
-  enc.set_buffer(1, _wq);
-  enc.set_buffer(2, _as);
-  enc.set_buffer(3, _ws);
-  enc.set_buffer(4, y, ye * 2);
-  enc.set_constant(5, KP);
-  enc.set_constant(6, N);
-  enc.set_constant(7, M);
-  enc.dispatch({(unsigned)(((N + 63) / 64) * 128),
-                (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+  // RECORD, so a caller with no closure can tune this shape later. Only
+  // when a split is possible and this one is not settled: a shape the
+  // tuner has answered is never pending again.
+  if (split_available() && !bypass_split && force_splits == 0) {
+    const int key = m_key_(M);
+    bool known = false;
+    for (const Tuned& t : _tuned) {
+      if (t.N == N && t.K == K && t.M == key) { known = true; break; }
+    }
+    for (const Tuned& t : _pending) {
+      if (t.N == N && t.K == K && t.M == key) { known = true; break; }
+    }
+    if (!known && _pending.size() < 16) {
+      _pending.push_back(Tuned{N, K, key, 0});
+    }
+  }
+  const unsigned nx = (unsigned)(((N + 63) / 64) * 128);
+  const int S = plan_(M, N, K);
+  if (S <= 0) {
+    // i8 x i8 GEMM, per-group f32 accumulate, f16 store.
+    enc.set_function(_fn_gemm);
+    enc.set_buffer(0, _xq);
+    enc.set_buffer(1, _wq);
+    enc.set_buffer(2, _as);
+    enc.set_buffer(3, _ws);
+    enc.set_buffer(4, y, ye * 2);
+    enc.set_constant(5, KP);
+    enc.set_constant(6, N);
+    enc.set_constant(7, M);
+    enc.set_buffer(8, bias ? b : _ws);
+    enc.set_constant(9, bias ? 1 : 0);
+    enc.dispatch({nx, (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+    return true;
+  }
+  // SPLIT, in row blocks the plane budget admits. The planes are S f32
+  // copies of the block's output, so a deep split costs more DISPATCHES
+  // rather than more memory -- the same trade MmaSplitK makes, and the
+  // reason the budget constrains the search instead of vetoing after it.
+  const int rows = rows_per_block_(S, N);
+  const std::size_t plane_bytes =
+      (std::size_t)S * (std::size_t)rows * (std::size_t)N * 4u;
+  if (rows < 64 || !need(_planes, plane_bytes)) {
+    // Fall back rather than fail: the caller has no dense path left at
+    // this point (the quantize dispatches are already encoded), so the
+    // single op is the only correct answer.
+    enc.set_function(_fn_gemm);
+    enc.set_buffer(0, _xq);
+    enc.set_buffer(1, _wq);
+    enc.set_buffer(2, _as);
+    enc.set_buffer(3, _ws);
+    enc.set_buffer(4, y, ye * 2);
+    enc.set_constant(5, KP);
+    enc.set_constant(6, N);
+    enc.set_constant(7, M);
+    enc.set_buffer(8, bias ? b : _ws);
+    enc.set_constant(9, bias ? 1 : 0);
+    enc.dispatch({nx, (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+    return true;
+  }
+  const int gpp = (G + S - 1) / S;
+  for (int m0 = 0; m0 < M; m0 += rows) {
+    const int mb = (M - m0) < rows ? (M - m0) : rows;
+    enc.set_function(_fn_gemm_sk);
+    // Row-banded by OFFSET: xq is [M, KP] i8 and as is [M, G] scales, so
+    // a band is a plain stride in each. The weight side is not banded.
+    enc.set_buffer(0, _xq, (std::size_t)m0 * KP);
+    enc.set_buffer(1, _wq);
+    enc.set_buffer(2, _as, (std::size_t)m0 * G * 2);
+    enc.set_buffer(3, _ws);
+    enc.set_buffer(4, _planes);
+    enc.set_constant(5, KP);
+    enc.set_constant(6, N);
+    enc.set_constant(7, mb);
+    enc.set_constant(8, gpp);
+    enc.dispatch({nx, (unsigned)((mb + 63) / 64), (unsigned)S},
+                 {128, 1, 1});
+    enc.set_function(bias ? _fn_fold_bias : _fn_fold);
+    enc.set_buffer(0, _planes);
+    enc.set_buffer(1, y, (ye + (std::size_t)m0 * N) * 2);
+    const int n_el = mb * N;
+    enc.set_constant(2, n_el);
+    enc.set_constant(3, S);
+    if (bias) { enc.set_buffer(4, b); enc.set_constant(5, N); }
+    enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
+  }
   return true;
+}
+
+void
+I8GemmContext::encode_tuned_(ComputeEncoder& enc, int M, int N, int KP,
+                             int S)
+{
+  const unsigned nx = (unsigned)(((N + 63) / 64) * 128);
+  const int G = KP / 512;
+  if (S <= 0) {
+    enc.set_function(_fn_gemm);
+    enc.set_buffer(0, _xq); enc.set_buffer(1, _wq);
+    enc.set_buffer(2, _as); enc.set_buffer(3, _ws);
+    enc.set_buffer(4, _tune_y);
+    enc.set_constant(5, KP); enc.set_constant(6, N); enc.set_constant(7, M);
+    // No bias while TIMING: it is one add per output, identical across
+    // candidates, so including it would only add noise to the vote.
+    enc.set_buffer(8, _ws); enc.set_constant(9, 0);
+    enc.dispatch({nx, (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+    return;
+  }
+  const int rows = rows_per_block_(S, N);
+  if (rows < 64) { return; }
+  const int gpp = (G + S - 1) / S;
+  for (int m0 = 0; m0 < M; m0 += rows) {
+    const int mb = (M - m0) < rows ? (M - m0) : rows;
+    enc.set_function(_fn_gemm_sk);
+    enc.set_buffer(0, _xq, (std::size_t)m0 * KP);
+    enc.set_buffer(1, _wq);
+    enc.set_buffer(2, _as, (std::size_t)m0 * G * 2);
+    enc.set_buffer(3, _ws);
+    enc.set_buffer(4, _planes);
+    enc.set_constant(5, KP); enc.set_constant(6, N); enc.set_constant(7, mb);
+    enc.set_constant(8, gpp);
+    enc.dispatch({nx, (unsigned)((mb + 63) / 64), (unsigned)S}, {128, 1, 1});
+    enc.set_function(_fn_fold);
+    enc.set_buffer(0, _planes);
+    enc.set_buffer(1, _tune_y, (std::size_t)m0 * N * 2);
+    const int n_el = mb * N;
+    enc.set_constant(2, n_el); enc.set_constant(3, S);
+    enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
+  }
+}
+
+void
+I8GemmContext::tune_pending(MetalCompute* mc)
+{
+  if (_pending.empty() || mc == nullptr || !split_available()) { return; }
+  std::vector<Tuned> todo;
+  todo.swap(_pending);
+  for (const Tuned& p : todo) {
+    const int KP = kpad_(p.K);
+    const int M = p.M < kTuneRows ? p.M : kTuneRows;
+    std::vector<int> cands{0};
+    for (int S : split_candidates(M, p.N, p.K)) { cands.push_back(S); }
+    // The scratches must still cover the shape. They are grow-only and
+    // this shape ran, so they do -- unless release_scratch() intervened,
+    // in which case the honest answer is to drop the shape rather than
+    // measure a buffer that is not there.
+    if (cands.size() < 2 || _xq.empty() || _wq.empty() ||
+        _xq.byte_size() < (std::size_t)M * KP ||
+        _wq.byte_size() < (std::size_t)p.N * KP) {
+      _tuned.push_back(Tuned{p.N, p.K, p.M, 0});
+      continue;
+    }
+    const std::size_t ybytes = (std::size_t)M * p.N * 2;
+    if (_tune_y.empty() || _tune_y.byte_size() < ybytes) {
+      _tune_y = mc->make_shared_buffer(ybytes);
+    }
+    int smax = 0;
+    for (int S : cands) { smax = S > smax ? S : smax; }
+    const std::size_t pbytes = (std::size_t)smax *
+        (std::size_t)rows_per_block_(smax, p.N) * (std::size_t)p.N * 4u;
+    if (_planes.empty() || _planes.byte_size() < pbytes) {
+      _planes = mc->make_shared_buffer(pbytes);
+    }
+    if (_tune_y.empty() || _planes.empty()) {
+      _tuned.push_back(Tuned{p.N, p.K, p.M, 0});
+      continue;
+    }
+    const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
+        /*reps_for_us=*/1,
+        [&](int i) {
+          return autotune_time(mc, 1, [&](ComputeEncoder& e) {
+            encode_tuned_(e, M, p.N, KP, cands[(std::size_t)i]);
+          });
+        });
+    _tuned.push_back(Tuned{p.N, p.K, p.M, cands[(std::size_t)w]});
+  }
+  // Held only for the measurement: it is as large as an output and the
+  // forward that follows wants that room back.
+  _tune_y = {};
 }
 
 void
@@ -100,6 +331,8 @@ I8GemmContext::release_scratch()
   _as = {};
   _wq = {};
   _ws = {};
+  _planes = {};
+  _tune_y = {};
 }
 
 }  // namespace genai

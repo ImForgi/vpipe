@@ -170,6 +170,11 @@ TEST(model_source_live, pinned_files_resolve_on_modelscope) {
       // thing that can catch it going away is asking.
       "lightx2v/Minimax-h3-Turbo",
       "larryvrh/MiniMax-H3-Turbo-Lora",
+      "CSWRY/VOSR",                        // renamed on ModelScope
+      // VOSR's conditioner, mirrored under the IDENTICAL owner/repo and
+      // therefore declared nowhere. Listed for the same reason the two
+      // Turbo adapters above are.
+      "facebook/dinov2-large",
       "Lightricks/LTX-2.5",                // plugin, when loaded
       "sensenova/SenseNova-U1.5-8B-MoT",   // plugin, when loaded
   };
@@ -265,6 +270,11 @@ TEST(model_source_live, small_file_downloads_and_verifies) {
       {"black-forest-labs/FLUX.2-klein-9B", "model_index.json"},
       {"krea/Krea-2-Turbo", "scheduler/scheduler_config.json"},
       {"MiniMax/MiniMax-H3", "FL2VA/audio_vae/config.yaml"},
+      // VOSR under its ModelScope name. Its args.json is what decides
+      // whether a directory is a VOSR checkpoint AND which variant, so
+      // it is the one small file in that repo worth proving reaches the
+      // disk intact.
+      {"LULALULALU/VOSR_CKPT", "VOSR2/args.json"},
       {"sensenova/SenseNova-U1.5-8B-MoT", "config.json"},
       {"Lightricks/LTX-2.5",
        "model_patches/ltx-2.5-duration-head-bf16.safetensors"},

@@ -2914,18 +2914,26 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     // dispatcher, so the tuner compares the winning route against itself
     // with and without the split rather than against a stand-in. The route
     // has to be pinned first -- measuring both at once would confound them.
-    if (route_is_mma_(win)) {
-      // Keyed on the REAL M -- plan() matches the row count the forward
-      // asks with -- but MEASURED at tune_m like everything else. The
-      // split path already walks M in row blocks of its own choosing
-      // (MmaSplitK::rows_per_block), so above one block the decision no
-      // longer moves with M; tune_m is at least one such block at every
-      // shape here.
-      const int sp = _splitk.tune(_mc, sh.K, sh.N, M,
-          [&](ComputeEncoder& enc) {
-            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N,
-                                sh.K, win);
-          });
+    // Keyed on the REAL M -- plan() matches the row count the forward
+    // asks with -- but MEASURED at tune_m like everything else. Both
+    // split paths already walk M in row blocks of their own choosing, so
+    // above one block the decision no longer moves with M; tune_m is at
+    // least one such block at every shape here.
+    auto run_route = [&](ComputeEncoder& enc) {
+      dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N, sh.K,
+                          win);
+    };
+    // WHICH SPLIT TO TUNE FOLLOWS FROM WHICH ARM WILL RUN. gemm_ tries
+    // the int8 GEMM before MmaSplitK, so on a shape int8 accepts the
+    // dense split never runs -- and tuning it there would compare
+    // identical work and record a winner that means nothing. The two are
+    // mutually exclusive for exactly that reason, not merely by taste.
+    if (_i8 && _i8->accepts(tune_m, sh.N, sh.K) &&
+        _i8->split_available()) {
+      const int sp = _i8->tune(_mc, sh.K, sh.N, M, run_route);
+      if (sp > 0) { detail += "+i8split" + std::to_string(sp); }
+    } else if (route_is_mma_(win)) {
+      const int sp = _splitk.tune(_mc, sh.K, sh.N, M, run_route);
       if (sp > 0) { detail += "+split" + std::to_string(sp); }
     }
   }

@@ -18,6 +18,7 @@
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
+#include "generative-models/vosr/metal-vosr-transformer.h"
 #endif
 
 #include <array>
@@ -190,6 +191,9 @@ private:
   int         _height{};
   int         _width{};
   int         _steps{};
+  // True when `steps` came from the config rather than from the
+  // default applied in the constructor.
+  bool        _steps_set = false;
   double      _strength{};      // img2img: 0 => text-to-image (pure noise)
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
@@ -269,6 +273,11 @@ private:
   // Boogu-Image's 10B NextDiT (its own class: five block kinds and three
   // refiner stacks share nothing with the MMDiTs above).
   std::unique_ptr<genai::MetalBooguTransformer> _boogu_dit;
+  // VOSR's restorer. Not a generator: it takes the low-quality latent on
+  // ref_latent0 and the DINOv2 grid as its conditioning, and every
+  // knob this stage owns for a text-to-image run -- guidance, negative,
+  // sampler, strength -- is meaningless to it.
+  std::unique_ptr<genai::MetalVosrTransformer> _vosr;
   // On a memory-bounded box (DiT + the conditioner's resident encoder can't fit
   // a large decode too), drop the DiT's per-forward scratch after each
   // generation so it doesn't crowd out the downstream vae-decode. Set from the
@@ -372,8 +381,27 @@ private:
   // bf16, ~5.6 GB at 4-bit) and it shares the box with a resident Qwen3-VL
   // mllm, so on a 16 GB box it is freed for the decode even at 4-bit.
   std::string _boogu_dit_dir;
+  std::string _vosr_dir;
+  genai::MetalVosrTransformer::Config _vosr_cfg;
+  // Latent-space tiling for the restorer, in PIXELS as the reference
+  // spells it. 0 disables, which is the reference default.
+  int _tile_size = 0;
+  int _tile_overlap = 32;
   bool        _boogu_stream   = false;
   bool load_boogu_dit_();
+  bool load_vosr_dit_();
+
+  // How the reference latents pair with the conditioning beats. See the
+  // `reference_mode` config key: an edit graph latches one reference for
+  // many prompts, a restoration graph gets a new one every beat, and a
+  // latch on the second is a silent wrong answer rather than an error.
+  enum class RefMode { kAuto, kLatch, kPerBeat };
+  RefMode _ref_mode = RefMode::kAuto;
+  bool ref_per_beat_() const noexcept
+  {
+    return _ref_mode == RefMode::kPerBeat
+        || (_ref_mode == RefMode::kAuto && _family == "vosr");
+  }
   // The manager's shared view of a checkpoint's weights (weight-set.h).
   std::shared_ptr<genai::WeightSet> weight_set_(const std::string& dir) const;
   void free_boogu_dit_for_decode_(int gen_w, int gen_h);

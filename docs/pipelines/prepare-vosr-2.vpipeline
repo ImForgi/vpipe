@@ -1,0 +1,38 @@
+{
+  "id": "prepare-vosr-2",
+  "stages": [
+    {
+      "id": "fetch-vosr-2",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "CSWRY/VOSR",
+        "model_variant": "VOSR-2.0",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-dinov2",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-vosr-2",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "facebook/dinov2-large",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

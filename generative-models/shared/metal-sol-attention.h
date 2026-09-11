@@ -288,6 +288,9 @@ class MetalSolAttention {
   void drop_residency_();
   bool ensure_scratch_(int heads, int tokens, int d, std::string* err);
   bool ensure_steel_(int tokens, std::string* err);
+  // The steel entry point for this object's kernel arm AND head width.
+  metal_compute::ComputeFunction _lib_for_width_(
+      const metal_compute::FunctionConstants& fc) const;
 
   metal_compute::MetalCompute* _mc = nullptr;
   bool _bf16 = false;
@@ -321,6 +324,7 @@ class MetalSolAttention {
   // beside the sequence and the summary length, because turning Sage on
   // changes the function and nothing else about the geometry does.
   int                           _steel_sage = -1;
+  int                           _steel_d = 0;
   // Whether the approximate half takes that kernel. True unless
   // VPIPE_SOL_NO_MASKED_APPROX asks for the simdgroup one, which is the
   // A/B and the reason sol_approx_mma is still here.

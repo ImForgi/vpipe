@@ -2,6 +2,7 @@
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/block-slots.h"
@@ -66,6 +67,17 @@ class MetalQwenImageTransformer {
     // where a 0.4% frequency error is radians of phase -- leaving it fp32
     // knocked temb 7.6% off and cascaded into every block's modulation.
     bool  bf16_time_freqs = false;
+    // Dynamic-int8 GEMMs for the block matmuls (LOSSY, opt-in). This
+    // family reached matmul2d long before it reached int8, which is why
+    // the key existed on the stage and did nothing here.
+    //
+    // It sits INSIDE gemm_mma_, on the dense weight the dequant-once
+    // path already produced, so the caller's row-broadcast bias add
+    // follows it unchanged -- QIE's projections are all biased, and a
+    // biasless int8 GEMM plus that existing pass is the same shape
+    // flux2 and krea2 use.
+    bool i8_gemm = false;
+
     // SageAttention: the QK^T product in int8. It rides on the
     // matrix-core flash entry, which this family takes by default
     // wherever the GPU has matrix cores -- so on such a box this is the
@@ -398,6 +410,7 @@ class MetalQwenImageTransformer {
   // steel kernel.
   bool _use_attn_nax = false;
   std::unique_ptr<MetalSageAttention> _sage;
+  std::unique_ptr<I8GemmContext>      _i8;
   // Affine qmm (loaded only when quantized): w4g64 / w8g64 (bf16 variant) +
   // the row-broadcast bias add applied after the (bias-less) qmm.
   metal_compute::ComputeFunction _fn_qmm4, _fn_qmm8, _fn_bias_add;

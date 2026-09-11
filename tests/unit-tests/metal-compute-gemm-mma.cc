@@ -14,6 +14,7 @@
 // M5 tensor-core bring-up: GFLOP/s steel vs matrix-core at the
 // Qwen3.5-4B projection shapes.
 
+#include <algorithm>
 #include "minitest.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
@@ -3475,4 +3476,424 @@ TEST(attn_qk_i8, frag_rate)
   // not carry int8's advantage down to 16-deep, and an int8 QK would be
   // pointless however accurate it is.
   EXPECT_TRUE(g_f16 > 0.0 && g_i8 > 0.0);
+}
+
+// INT8 AND SPLIT-K AT THE SAME TIME, which is the combination neither
+// shipped path offers and the one H3's fc2 wants.
+//
+// The two accelerations answer different deficits. int8 doubles the
+// matrix pipe's rate; split-K fixes an OCCUPANCY problem -- a single-op
+// reduction over a deep K leaves only (M/64)*(N/64) threadgroups each
+// walking one long serial contraction, and the units stall with nothing
+// else in flight. Neither cures the other, so a deep-K int8 GEMM has
+// both problems and today can only be given one treatment: H3's helper
+// tries i8 first and split-K second, so on fc2 (K = ffn = 14336, which
+// is 28 whole 512-groups) the int8 arm wins the race and the split never
+// runs. The prototype record already flagged this -- ff-down at K=12288
+// measured 18.5 TOPS against 22.5-23.6 at K=4096, the same cliff the f16
+// path has.
+//
+// gemm_i8i8_sc_f16_n64_g512_sk is _g512 cut across grid.z planes, left in
+// f32 for the existing splitk_fold_f32_f16 to sum. The split is by GROUP
+// INDEX, so every plane boundary lands on a 512 multiple for free.
+TEST(gemm_i8, splitk) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma");
+  ComputeLibrary lib_dq = mc->load_library("affine_dequant");
+  ComputeLibrary lib_elt = mc->load_library("llm_elementwise");
+  ComputeFunction f_g5 = lib_mma.function("gemm_i8i8_sc_f16_n64_g512");
+  ComputeFunction f_sk = lib_mma.function("gemm_i8i8_sc_f16_n64_g512_sk");
+  ComputeFunction f_qg = lib_dq.function("quant_f16_i8_row_g512");
+  ComputeFunction f_fold = lib_elt.function("splitk_fold_f32_f16");
+  if (!f_g5.valid() || !f_sk.valid() || !f_qg.valid() || !f_fold.valid()) {
+    std::printf("[gemm_i8sk] kernels unavailable -- skip\n");
+    return;
+  }
+
+  auto run = [&](int M, int N, int K, const std::vector<int>& splits,
+                 bool check, int iters) {
+    const int G = K / 512;
+    std::mt19937 rng(77u + (unsigned)(M + N + K));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<_Float16> x((std::size_t)M * K), w((std::size_t)N * K);
+    for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+    for (auto& v : w) { v = (_Float16)(nd(rng) * 0.05f); }
+    std::vector<std::int8_t> wqg((std::size_t)N * K);
+    std::vector<_Float16> wsg((std::size_t)N * G);
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < G; ++g) {
+        float ag = 0.0f;
+        for (int k = g * 512; k < (g + 1) * 512; ++k) {
+          ag = std::max(ag, std::fabs((float)w[(std::size_t)n * K + k]));
+        }
+        const float ig = ag > 0 ? 127.0f / ag : 0.0f;
+        wsg[(std::size_t)n * G + g] = (_Float16)(ag / 127.0f);
+        for (int k = g * 512; k < (g + 1) * 512; ++k) {
+          const float qv = std::rint((float)w[(std::size_t)n * K + k] * ig);
+          wqg[(std::size_t)n * K + k] =
+              (std::int8_t)std::max(-127.0f, std::min(127.0f, qv));
+        }
+      }
+    }
+    SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+    SharedBuffer xqb = mc->make_shared_buffer((std::size_t)M * K);
+    SharedBuffer asgb = mc->make_shared_buffer((std::size_t)M * G * 2);
+    SharedBuffer wqgb = mc->make_shared_buffer(wqg.size());
+    SharedBuffer wsgb = mc->make_shared_buffer((std::size_t)N * G * 2);
+    SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
+    SharedBuffer yb2 = mc->make_shared_buffer((std::size_t)M * N * 2);
+    int smax = 1;
+    for (int s : splits) { smax = std::max(smax, s); }
+    SharedBuffer pl =
+        mc->make_shared_buffer((std::size_t)smax * M * N * 4);
+    if (yb.empty() || yb2.empty() || pl.empty() || wqgb.empty()) {
+      std::printf("[gemm_i8sk] alloc failed %dx%dx%d -- skip\n", M, N, K);
+      return;
+    }
+    std::memcpy(xb.contents(), x.data(), x.size() * 2);
+    std::memcpy(wqgb.contents(), wqg.data(), wqg.size());
+    std::memcpy(wsgb.contents(), wsg.data(), (std::size_t)N * G * 2);
+
+    auto quant = [&](ComputeEncoder& enc) {
+      enc.set_function(f_qg);
+      enc.set_buffer(0, xb); enc.set_buffer(1, xqb); enc.set_buffer(2, asgb);
+      enc.set_constant(3, K);
+      enc.dispatch({256, (unsigned)M, 1}, {256, 1, 1});
+    };
+    // S == 1 is the single-op kernel, so the sweep includes the baseline
+    // in the SAME interleaved loop rather than timing it separately --
+    // this box throttles enough that two loops can invert a ratio.
+    auto one = [&](ComputeEncoder& enc, int S) {
+      quant(enc);
+      if (S <= 1) {
+        enc.set_function(f_g5);
+        enc.set_buffer(0, xqb); enc.set_buffer(1, wqgb);
+        enc.set_buffer(2, asgb); enc.set_buffer(3, wsgb);
+        enc.set_buffer(4, yb);
+        enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
+        enc.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                      (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+        return;
+      }
+      const int gpp = (G + S - 1) / S;
+      enc.set_function(f_sk);
+      enc.set_buffer(0, xqb); enc.set_buffer(1, wqgb);
+      enc.set_buffer(2, asgb); enc.set_buffer(3, wsgb);
+      enc.set_buffer(4, pl);
+      enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
+      enc.set_constant(8, gpp);
+      enc.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                    (unsigned)((M + 63) / 64), (unsigned)S}, {128, 1, 1});
+      enc.set_function(f_fold);
+      enc.set_buffer(0, pl); enc.set_buffer(1, yb2);
+      const int n_el = M * N;
+      enc.set_constant(2, n_el); enc.set_constant(3, S);
+      enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
+    };
+
+    if (check) {
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); one(e, 1); }
+        st.commit().wait(); }
+      for (int S : splits) {
+        if (S <= 1) { continue; }
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder e = st.begin_compute(); one(e, S); }
+          st.commit().wait(); }
+        const auto* a = static_cast<const _Float16*>(yb.contents());
+        const auto* b = static_cast<const _Float16*>(yb2.contents());
+        std::size_t diff = 0;
+        double worst = 0.0;
+        for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+          const double d = std::fabs((double)a[i] - (double)b[i]);
+          if (d != 0.0) { ++diff; }
+          const double r = std::fabs((double)a[i]) > 0
+                               ? d / std::fabs((double)a[i]) : d;
+          worst = std::max(worst, r);
+        }
+        std::printf("[gemm_i8sk] S=%-2d vs single-op: %5.2f%% differ, worst "
+                    "rel %.2e\n", S,
+                    100.0 * (double)diff / (double)(M * N), worst);
+        // A REASSOCIATION, not an approximation: the per-group summands
+        // are bit-identical whichever plane owns them, so the only
+        // difference is the order of G float adds and one f16 rounding.
+        EXPECT_TRUE(worst < 5e-3);
+      }
+      return;
+    }
+
+    const double gflop = 2.0 * (double)M * N * K * 1e-9;
+    std::printf("[gemm_i8sk] M=%d N=%d K=%d (G=%d)\n", M, N, K, G);
+    double base = 0.0;
+    for (int S : splits) {
+      // Warm, then time -- and the arms run in one loop so a clock that
+      // drifts hits them all.
+      for (int w2 = 0; w2 < 2; ++w2) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute(); one(e, S); }
+        st.commit().wait();
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          for (int i = 0; i < iters; ++i) { one(e, S); } }
+        st.commit().wait(); }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      const double tops = gflop * iters / ms;
+      if (S <= 1) { base = tops; }
+      std::printf("[gemm_i8sk]   S=%-2d %7.2f ms  %6.2f TOP/s  %.2fx\n", S,
+                  ms / iters, tops, base > 0 ? tops / base : 1.0);
+    }
+  };
+
+  // Correctness small, where the CPU-free GPU-to-GPU comparison is the
+  // right one: split-K is a reassociation of the SAME kernel.
+  run(128, 256, 4096, {1, 2, 4, 8}, /*check=*/true, 1);
+  // H3's fc2: K = ffn = 14336, N = inner = 7168. M is one row block of
+  // what the split-K budget admits at video geometry (~2670 rows), so
+  // this is one dispatch round of the real thing.
+  //
+  // TWO ROW COUNTS, because the deficit split-K fixes is an OCCUPANCY
+  // one and M is half of what sets it: the base grid is (N/64)*(M/64)
+  // threadgroups, so a wide M already fills the machine and has less for
+  // a split to recover. 2560 is about the row block the 512 MB plane
+  // budget admits at video geometry; 256 is a short prefill.
+  run(256, 7168, 14336, {1, 2, 4, 7}, /*check=*/false, 4);
+  run(1024, 7168, 14336, {1, 2, 4, 7, 14}, /*check=*/false, 4);
+  run(2560, 7168, 14336, {1, 2, 4}, /*check=*/false, 3);
+}
+
+// THE SPLIT THROUGH I8GemmContext, which is what a model actually calls.
+//
+// gemm_i8.splitk above drives the kernels by hand; this drives the class,
+// including the parts the kernels know nothing about -- the K padding, the
+// per-call weight requant, the row blocking against the plane budget, and
+// the plan. A split that is right in the kernel and wrong in the row bands
+// produces a correct first block and garbage after it, which is exactly
+// what a single-shape test would miss, so the row budget is squeezed here
+// until the band count is forced above one.
+TEST(gemm_i8, context_split_matches_single_op) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+
+  const int M = 512, N = 1024, K = 4096;
+  std::mt19937 rng(4242u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<_Float16> x((std::size_t)M * K), w((std::size_t)N * K);
+  for (auto& v : x) { v = (_Float16)(nd(rng) * 0.5f); }
+  for (auto& v : w) { v = (_Float16)(nd(rng) * 0.05f); }
+  SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+  SharedBuffer wb = mc->make_shared_buffer(w.size() * 2);
+  SharedBuffer y0 = mc->make_shared_buffer((std::size_t)M * N * 2);
+  SharedBuffer y1 = mc->make_shared_buffer((std::size_t)M * N * 2);
+  if (y1.empty()) { return; }
+  std::memcpy(xb.contents(), x.data(), x.size() * 2);
+  std::memcpy(wb.contents(), w.data(), w.size() * 2);
+
+  // min_m below M so the shape qualifies at this size.
+  ::setenv("VPIPE_I8_GEMM_MIN_M", "64", 1);
+  struct Unset {
+    ~Unset() {
+      ::unsetenv("VPIPE_I8_GEMM_MIN_M");
+      ::unsetenv("VPIPE_I8_SPLITK_MAX_MB");
+    }
+  } unset;
+
+  auto run = [&](vpipe::genai::I8GemmContext& ctx, SharedBuffer& dst) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder e = st.begin_compute();
+      EXPECT_TRUE(ctx.gemm(e, xb, 0, wb, dst, 0, M, N, K)); }
+    st.commit().wait();
+  };
+
+  vpipe::genai::I8GemmContext base(mc, /*want=*/true, /*bf16=*/false);
+  if (!base.enabled()) { return; }
+  base.bypass_split = true;                 // the single-op reference
+  run(base, y0);
+
+  // Every balanced split this shape admits (G = 8), each forced, and each
+  // at a plane budget that makes the row blocking do real work: 8 MB of
+  // planes at S=8 is 256 rows, so M=512 becomes two bands.
+  ::setenv("VPIPE_I8_SPLITK_MAX_MB", "8", 1);
+  vpipe::genai::I8GemmContext ctx(mc, /*want=*/true, /*bf16=*/false);
+  if (!ctx.split_available()) {
+    std::printf("[gemm_i8ctx] split kernels unavailable -- skip\n");
+    return;
+  }
+  const std::vector<int> cands = ctx.split_candidates(M, N, K);
+  EXPECT_TRUE(!cands.empty());
+  const auto* a = static_cast<const _Float16*>(y0.contents());
+  for (int S : cands) {
+    ctx.force_splits = S;
+    run(ctx, y1);
+    ctx.force_splits = 0;
+    const auto* b = static_cast<const _Float16*>(y1.contents());
+    // ULP DISTANCE, not relative error. A reassociation moves an output
+    // by a last-place bit or two; measured RELATIVELY that is unbounded
+    // wherever the output happens to land near zero, and with half a
+    // million outputs one always does. The dense split-K reports its
+    // drift the same way (mma-splitk.h: "differ by at most one f16 ulp").
+    std::size_t diff = 0, worst_ulp = 0;
+    double worst_abs = 0.0, num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+      const double va = (double)a[i], vb = (double)b[i];
+      const double d = std::fabs(va - vb);
+      if (d != 0.0) { ++diff; }
+      worst_abs = std::max(worst_abs, d);
+      num += (va - vb) * (va - vb);
+      den += va * va;
+      std::uint16_t ba, bb;
+      std::memcpy(&ba, &a[i], 2);
+      std::memcpy(&bb, &b[i], 2);
+      // Same-sign f16 bit patterns are monotone in magnitude, so the
+      // pattern difference IS the ulp distance; opposite signs only
+      // happen at zero crossings, where the absolute figure is the one
+      // that means anything.
+      if ((ba & 0x8000u) == (bb & 0x8000u)) {
+        const std::size_t u = (std::size_t)(ba > bb ? ba - bb : bb - ba);
+        worst_ulp = std::max(worst_ulp, u);
+      }
+    }
+    std::printf("[gemm_i8ctx] S=%-2d bands %d: %5.2f%% differ, worst %zu ulp, "
+                "max |d| %.2e, rel-L2 %.2e\n", S, (M + 255) / 256,
+                100.0 * (double)diff / (double)(M * N), worst_ulp, worst_abs,
+                den > 0.0 ? std::sqrt(num / den) : 0.0);
+    EXPECT_TRUE(worst_ulp <= 2);
+    EXPECT_TRUE(den > 0.0 && std::sqrt(num / den) < 1e-4);
+  }
+  // THE TUNER ITSELF, which is the templated code every caller
+  // instantiates and the only part of this that runs its own command
+  // streams. What it must do: return a candidate (or 0), and return the
+  // SAME one next time -- a tuner free to answer differently per call
+  // makes the output irreproducible, since a split moves ~1 ulp.
+  {
+    vpipe::genai::I8GemmContext t(mc, /*want=*/true, /*bf16=*/false);
+    if (t.split_available()) {
+      auto encode_one = [&](ComputeEncoder& e) {
+        (void)t.gemm(e, xb, 0, wb, y1, 0, M, N, K);
+      };
+      const int pick = t.tune(mc, K, N, M, encode_one);
+      const std::vector<int> tc = t.split_candidates(M, N, K);
+      const bool legal =
+          pick == 0 || std::find(tc.begin(), tc.end(), pick) != tc.end();
+      const int again = t.tune(mc, K, N, M, encode_one);
+      std::printf("[gemm_i8ctx] tuner picked S=%d (legal %d, cached %d)\n",
+                  pick, legal ? 1 : 0, again == pick ? 1 : 0);
+      EXPECT_TRUE(legal);
+      EXPECT_TRUE(again == pick);
+      // ...and the flags it toggles are left clean, or the next GEMM
+      // through this context runs whatever the last candidate was.
+      EXPECT_TRUE(!t.bypass_split && t.force_splits == 0);
+    }
+  }
+
+  // THE BIAS, which VOSR needs and nothing else here has: every one of
+  // that model's projections carries one, so without a bias term the
+  // int8 path could not serve a single GEMM in it. Checked on BOTH arms,
+  // because the split adds it in the fold (once, over the summed planes)
+  // where the single op adds it in its own epilogue -- two different
+  // places to get the same answer, and multiplying it by S is exactly
+  // what a fold that added it per plane would do.
+  {
+    std::vector<_Float16> bias((std::size_t)N);
+    std::mt19937 br(99u);
+    std::normal_distribution<float> bn(0.0f, 1.0f);
+    for (auto& v : bias) { v = (_Float16)(bn(br) * 0.25f); }
+    SharedBuffer bb = mc->make_shared_buffer(bias.size() * 2);
+    if (!bb.empty()) {
+      std::memcpy(bb.contents(), bias.data(), bias.size() * 2);
+      for (int S : {0, 2, 4}) {
+        vpipe::genai::I8GemmContext bctx(mc, /*want=*/true, /*bf16=*/false);
+        if (!bctx.enabled()) { break; }
+        bctx.bypass_split = (S == 0);
+        bctx.force_splits = S;
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder e = st.begin_compute();
+            EXPECT_TRUE(bctx.gemm(e, xb, 0, wb, bb, y1, 0, M, N, K)); }
+          st.commit().wait(); }
+        // The no-bias reference is y0, so the difference must be the
+        // bias EXACTLY -- a fold that added it S times lands S-1 biases
+        // away and a missing one lands one bias away.
+        const auto* g = static_cast<const _Float16*>(y1.contents());
+        double worst = 0.0;
+        for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+          const double want =
+              (double)a[i] + (double)(float)bias[(std::size_t)(i % N)];
+          worst = std::max(worst, std::fabs(want - (double)g[i]));
+        }
+        std::printf("[gemm_i8ctx] bias S=%d: worst |got - (y0+b)| %.2e\n",
+                    S, worst);
+        // One f16 ulp at these magnitudes, plus the reassociation the
+        // split is entitled to.
+        EXPECT_TRUE(worst < 4e-3);
+      }
+    }
+  }
+
+  // THE DEFERRED PATH, which is what flux2, krea2 and qwen use: gemm()
+  // records the shape, and a later call with no encoder open measures it
+  // off the scratches that call left behind. The three of them have no
+  // closure to hand -- their weights may still be streaming when the
+  // shape is first known, and a quantized checkpoint's dense operand is a
+  // dequant scratch that exists only inside an encoder.
+  {
+    vpipe::genai::I8GemmContext d(mc, /*want=*/true, /*bf16=*/false);
+    if (d.split_available()) {
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(d.gemm(e, xb, 0, wb, y1, 0, M, N, K)); }
+        st.commit().wait(); }
+      // Nothing is tuned yet, so the run above used the default...
+      const int before = d.plan_for_test(M, N, K);
+      d.tune_pending(mc);
+      const int after = d.plan_for_test(M, N, K);
+      // ...and now the answer is the tuner's, whatever it is -- which
+      // may well be the same width the default picked, so the value is
+      // not the check. What IS checked: it is a legal candidate, it is
+      // stable across a second call, and the GEMM that follows is still
+      // right. `tune()` above is what proves a candidate gets chosen by
+      // measurement rather than by falling through.
+      const std::vector<int> dc = d.split_candidates(M, N, K);
+      const bool legal =
+          after == 0 || std::find(dc.begin(), dc.end(), after) != dc.end();
+      std::printf("[gemm_i8ctx] deferred: default S=%d -> tuned S=%d "
+                  "(legal %d)\n", before, after, legal ? 1 : 0);
+      EXPECT_TRUE(legal);
+      // Idempotent and cheap the second time: nothing pending, same answer.
+      d.tune_pending(mc);
+      EXPECT_TRUE(d.plan_for_test(M, N, K) == after);
+      // ...and the result is USED. Re-running the same GEMM must now go
+      // through whatever the tuner chose, which is only observable as the
+      // answer still being correct.
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          EXPECT_TRUE(d.gemm(e, xb, 0, wb, y1, 0, M, N, K)); }
+        st.commit().wait(); }
+      const auto* c2 = static_cast<const _Float16*>(y1.contents());
+      double n2 = 0.0, d2 = 0.0;
+      for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+        n2 += ((double)a[i] - (double)c2[i]) * ((double)a[i] - (double)c2[i]);
+        d2 += (double)a[i] * (double)a[i];
+      }
+      EXPECT_TRUE(d2 > 0.0 && std::sqrt(n2 / d2) < 1e-4);
+    }
+  }
+
+  // ...and the untuned default is a split, not the single op: a caller
+  // that never tunes should still get the part of this that is free.
+  vpipe::genai::I8GemmContext deflt(mc, /*want=*/true, /*bf16=*/false);
+  run(deflt, y1);
+  const auto* b = static_cast<const _Float16*>(y1.contents());
+  std::size_t ddiff = 0;
+  for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+    if ((double)a[i] != (double)b[i]) { ++ddiff; }
+  }
+  std::printf("[gemm_i8ctx] untuned default vs single-op: %.2f%% differ\n",
+              100.0 * (double)ddiff / (double)(M * N));
 }

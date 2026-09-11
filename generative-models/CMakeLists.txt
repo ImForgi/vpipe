@@ -87,6 +87,8 @@ set(LOCAL_SOURCES
   flux2/metal-flux2-calibration.cc
   boogu/metal-boogu-transformer.cc
   boogu/metal-boogu-calibration.cc
+  vosr/metal-dinov2-encoder.cc
+  vosr/metal-vosr-transformer.cc
   wan/metal-wan-vae.cc
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
@@ -168,6 +170,8 @@ set(LOCAL_HEADERS
   moss/metal-moss-rt-model.h
   boogu/metal-boogu-transformer.h
   boogu/metal-boogu-calibration.h
+  vosr/metal-dinov2-encoder.h
+  vosr/metal-vosr-transformer.h
   wan/metal-wan-vae.h
   wan/metal-umt5-encoder.h
   wan/metal-wan-transformer.h

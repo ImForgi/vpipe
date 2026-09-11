@@ -920,6 +920,14 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
     const constant int& M [[buffer(7)]],
+    // OPTIONAL BIAS, added in the epilogue that is already there. Zero at
+    // buffer(9) is the historical behaviour exactly -- the term is not
+    // computed, not merely added as zero -- so every caller that predates
+    // it is byte-identical. It exists because a model whose projections
+    // all carry one (VOSR) could otherwise reach none of this: the int8
+    // path computed x @ w^T and had nowhere to put the b.
+    const device VPIPE_ELT* bias [[buffer(8)]],
+    const constant int& has_bias [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]])
 {
@@ -963,7 +971,105 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
     const int e = (int)lid + t * (SG * 32);
     const int i = e / BN, j = e % BN;
     const int gm = m0 + i, gn = n0 + j;
-    if (gm < M && gn < N) { y[(int64_t)gm * N + gn] = (VPIPE_ELT)facc[t]; }
+    if (gm < M && gn < N) {
+      const float bv = has_bias != 0 ? (float)bias[gn] : 0.0f;
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)(facc[t] + bv);
+    }
+  }
+}
+
+// SPLIT-K twin of _g512: the same per-512-group accumulation, cut across
+// grid.z planes and left in f32 for splitk_fold_f32_f16 to sum.
+//
+// WHY IT IS THIS EASY, and why the deep-K case wanted it. _g512 already
+// walks K as a sequence of independent 512-groups, each scaled by its own
+// pair before it joins a float accumulator -- so a plane is nothing but a
+// contiguous RANGE of that loop, and the fold is the rest of the sum. The
+// float term for group g is computed identically whichever plane owns it,
+// so the only difference from the single-op kernel is the ORDER of the G
+// float adds: a reassociation, exactly the argument mma-splitk.h makes for
+// the dense f32 planes, and a weaker requirement than that one because
+// here the summands themselves are bit-identical either way.
+//
+// The split is by GROUP INDEX, not by K, which is what keeps every plane
+// boundary on a 512 multiple for free -- a chunk width in elements would
+// have had to be constrained to one.
+//
+// What it buys is what split-K always buys: a single-op reduction over a
+// deep K leaves only (M/BM)*(N/BN) threadgroups walking one long serial
+// contraction, and the matrix units stall with nothing else in flight.
+// The int8 pipe is not exempt -- the prototype measured the ff-down at
+// K=12288 running 18.5 TOPS against 22.5-23.6 at K=4096, the same deep-K
+// cliff the f16 path has and the reason this twin was flagged as the
+// obvious follow-up when i8 shipped.
+//
+// NO BIAS HERE, deliberately: a split writes S partial planes and the
+// bias must be added ONCE. splitk_fold_bias_f32_f16 does it in the fold.
+//   0:xq 1:wq 2:as 3:ws 4:planes (float [S, M, N]) 5:K 6:N 7:M 8:gpp
+// grid (N/BN, M/BM, S) THREADGROUPS. `gpp` is groups per plane; the last
+// plane takes the remainder, so S need not divide G.
+kernel void gemm_i8i8_sc_f16_n64_g512_sk(
+    const device int8_t*    xq [[buffer(0)]],
+    const device int8_t*    wq [[buffer(1)]],
+    const device VPIPE_ELT* as [[buffer(2)]],
+    const device VPIPE_ELT* ws [[buffer(3)]],
+    device float*           planes [[buffer(4)]],
+    const constant int& K   [[buffer(5)]],
+    const constant int& N   [[buffer(6)]],
+    const constant int& M   [[buffer(7)]],
+    const constant int& gpp [[buffer(8)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  constexpr int EPT = (BM * BN) / (SG * 32);
+  threadgroup int Ys[BM * BN];
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  using TY = tensor<threadgroup int, dextents<int32_t, 2>, tensor_inline>;
+  TY tY(Ys, dextents<int32_t, 2>(BN, BM));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, GI8_KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G  = K / GI8_KC;
+  const int p  = (int)tgid.z;
+  const int g0 = p * gpp;
+  const int g1 = min(G, g0 + gpp);
+
+  float facc[EPT] = {0.0f};
+  for (int g = g0; g < g1; ++g) {
+    auto mX = tX.slice(g * GI8_KC, m0);
+    auto mW = tW.slice(g * GI8_KC, n0);
+    op.run(mX, mW, tY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int t = 0; t < EPT; ++t) {
+      const int e = (int)lid + t * (SG * 32);
+      const int i = e / BN, j = e % BN;
+      const int gm = m0 + i, gn = n0 + j;
+      if (gm < M && gn < N) {
+        facc[t] += (float)Ys[e] * (float)as[(int64_t)gm * G + g] *
+                   (float)ws[(int64_t)gn * G + g];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  // A plane whose range is empty still writes: the fold sums S planes
+  // unconditionally, and leaving one uninitialised is the kind of bug
+  // that only shows up when S stops dividing G.
+  for (int t = 0; t < EPT; ++t) {
+    const int e = (int)lid + t * (SG * 32);
+    const int i = e / BN, j = e % BN;
+    const int gm = m0 + i, gn = n0 + j;
+    if (gm < M && gn < N) {
+      planes[((int64_t)p * M + gm) * N + gn] = facc[t];
+    }
   }
 }
 

@@ -972,6 +972,53 @@ builtin_catalog_()
      .inputs = {"text", "image"}, .outputs = {"image"},
      .files = kBooguFiles,
      .needs_tokenizer_json = false},
+    // ---- VOSR (image -> image, RESTORATION rather than generation) -----
+    // VOSR 2.0 (PolyU / OPPO, CVPR 2026): a one-step, VISION-ONLY image
+    // super-resolution model. It is the first entry here that conditions
+    // on no text at all -- there is no prompt, no tokenizer and no text
+    // encoder anywhere in it. What the DiT cross-attends to is a DINOv2
+    // feature grid over the low-quality picture itself, which is why the
+    // `diffusion-conditioner` on this family loads a vision tower and
+    // nothing else. Sub-models:
+    //   VOSR2/checkpoints/ = LightningDiT, 1.4B: 36 blocks at 1536 wide,
+    //     24 heads x head_dim 64, patch 2, RMSNorm + qk-norm + SwiGLU,
+    //     2D EVA-style RoPE whose positions are RESCALED into the 32x32
+    //     grid it trained on rather than extrapolated. The patch
+    //     projection reads 32 channels: the low-quality latent
+    //     concatenated with the noise. Distilled to ONE flow step.
+    //   Qwen-Image-vae-2d/ = the Qwen-Image VAE with its temporal axis
+    //     removed (`AutoencoderKLQwenImage2D`) -- same 16 latent
+    //     channels, same 8x spatial, same whitening statistics, one
+    //     axis fewer on every conv. The stock 3D checkpoint decodes a
+    //     single frame to the same numbers; this one just does not pay
+    //     for the axis. Served by the same code either way.
+    // The DINOv2 tower is NOT in this repo in a form anything here can
+    // read (the release ships torch.hub's pickle); fetch the entry below.
+    {.family = "VOSR", .version = "2.0", .param_class = "1.4B",
+     .variant = "one-step fp32 (PolyU/OPPO)",
+     .hf_path = "CSWRY/VOSR",
+     .model_type = "vosr",
+     .inputs = {"image"}, .outputs = {"image"},
+     .files = {"VOSR2/args.json",
+               "VOSR2/checkpoints/ema_model.safetensors",
+               "Qwen-Image-vae-2d/config.json",
+               "Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "VOSR-2.0"},
+    // DINOv2 ViT-L/14 (Meta), the conditioner VOSR cross-attends to. A
+    // SUPPLEMENT, not a model: it generates nothing on its own, and it
+    // is listed apart from VOSR because the restorer's own repo ships it
+    // only as a torch.hub pickle. These are the same weights in
+    // safetensors, published by Meta.
+    {.family = "DINOv2", .version = "1", .param_class = "L/14",
+     .variant = "ViT-L/14 (Meta)",
+     .hf_path = "facebook/dinov2-large",
+     .model_type = "dinov2",
+     .inputs = {"image"}, .outputs = {},
+     .parent_model_type = "vosr",
+     .files = {"config.json", "model.safetensors",
+               "preprocessor_config.json"},
+     .needs_tokenizer_json = false},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
     // that outputs anything but text / images / audio. Same diffusers

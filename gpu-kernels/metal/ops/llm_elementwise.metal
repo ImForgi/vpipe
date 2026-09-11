@@ -570,6 +570,29 @@ kernel void splitk_fold_f32_f16(
   out[gid] = VPIPE_ELT(acc);
 }
 
+// The fold, with a per-COLUMN bias added once at the end.
+//
+// A split-K GEMM writes S partial planes and the bias belongs to the sum,
+// not to any plane -- adding it per plane would multiply it by S. The
+// plain fold above stays for the callers that have no bias.
+//   0:planes 1:out 2:n (= M*N) 3:splits 4:bias [N] 5:N.  grid (n).
+kernel void splitk_fold_bias_f32_f16(
+    const device float*     planes [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    constant int&           n      [[buffer(2)]],
+    constant int&           splits [[buffer(3)]],
+    const device VPIPE_ELT* bias   [[buffer(4)]],
+    constant int&           N      [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    acc += planes[(uint)s * (uint)n + gid];
+  }
+  out[gid] = VPIPE_ELT(acc + (float)bias[(int)gid % N]);
+}
+
 // GELU (tanh approximation), the QwenImage FeedForward activation. VPIPE_ELT
 // storage so a bf16 metallib exists (the vision gelu_tanh_f16 is half-only).
 //   0:x 1:out 2:n.  grid (n).

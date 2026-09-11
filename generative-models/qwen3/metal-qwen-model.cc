@@ -5954,6 +5954,12 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const float eps = c.rms_eps;
   const float scale = 1.0f / std::sqrt((float)D);
   ensure_decode_scratch_();   // also tunes the decode + prefill attention sets
+  // The int8 split's width, for prefill shapes an earlier chunk recorded.
+  // HERE because it runs its own command streams and so needs no encoder
+  // open, and because a decode step (n == 1) never reaches the i8 gate --
+  // so the first prefill records and the next one measures. No-op once
+  // the shapes are settled, and on a model that never turned i8 on.
+  if (_i8) { _i8->tune_pending(_mc); }
 
   // Reserve KV slots (chunked into pages), build the page table.
   struct Chunk { std::size_t page_off; int slot; int src_off; int cnt; };

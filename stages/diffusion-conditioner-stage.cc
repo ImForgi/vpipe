@@ -21,6 +21,8 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/video-model-registry.h"
+#include "generative-models/vosr/metal-dinov2-encoder.h"
+#include "generative-models/vosr/metal-vosr-transformer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -52,8 +54,27 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va",
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
+  {.key = "encoder_dir", .type = ConfigType::String, .required = false,
+   .doc = "VOSR only: the DINOv2 checkpoint, which is a SEPARATE download "
+          "from the restorer's own weights (facebook/dinov2-large, or the "
+          "same tensors converted out of the reference's torch-hub pickle). "
+          "Unset, `<hf_dir>/dinov2` is tried and then the registry key. "
+          "Every other family's encoder lives inside hf_dir and ignores this",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "dinov2"},
+  {.key = "reference_mode", .type = ConfigType::String, .required = false,
+   .doc = "how a reference image on the ref_image iports pairs with the "
+          "prompts. \"latch\" holds the FIRST picture for the whole run, "
+          "which is what an edit graph wants: one source image, many "
+          "instructions. \"per_beat\" reads a fresh picture for every "
+          "conditioning, which is what a RESTORATION graph wants: the "
+          "picture IS the input and changes every time, and latching it "
+          "would quietly restore a folder of images from the first one. "
+          "\"auto\" (default) is per_beat for a vision-only family and "
+          "latch for the rest",
+   .def_str = "auto"},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
           "oport1 -- a GROUNDED encode of the (possibly empty) negative prompt "
@@ -689,7 +710,20 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   // instead, so "no model at all" is reported at initialize()/process() time
   // (when iport connectivity is known), not at construction.
   _hf_dir    = attr_str("hf_dir");
+  _venc_dir  = attr_str("encoder_dir");
   _grounded_negative = attr_bool("grounded_negative");
+  {
+    const std::string rm = attr_str("reference_mode");
+    if (rm == "latch")         { _ref_mode = RefMode::kLatch; }
+    else if (rm == "per_beat") { _ref_mode = RefMode::kPerBeat; }
+    else if (rm.empty() || rm == "auto") { _ref_mode = RefMode::kAuto; }
+    else {
+      // Deferred-validated config: warn and take the default.
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): reference_mode '{}' is not "
+          "auto|latch|per_beat; using auto", this->id(), rm));
+    }
+  }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -730,6 +764,77 @@ DiffusionConditionerStage::apply_constant(unsigned iport, const FlexData& beat)
 Job DiffusionConditionerStage::initialize(RuntimeContext&) { co_return; }
 Job DiffusionConditionerStage::process(RuntimeContext&) { co_return; }
 #else
+
+bool
+DiffusionConditionerStage::load_dinov2_(metal_compute::MetalCompute* mc,
+                                        const std::string& root)
+{
+  namespace fs = std::filesystem;
+  // Three places to look, in the order an operator would expect: what
+  // the graph named, a copy beside the restorer, and the catalogue entry
+  // model-fetch writes. The tower is a SEPARATE download -- the VOSR
+  // release ships its own weights and lets torch.hub fetch DINOv2 -- so
+  // there is no fourth place where it might be hiding.
+  std::string dir;
+  if (!_venc_dir.empty()) {
+    dir = resolve_model_dir(session(), _venc_dir);
+    if (dir.empty()) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): encoder_dir '{}' does not "
+          "resolve", this->id(), _venc_dir));
+      return false;
+    }
+  }
+  std::error_code ec;
+  if (dir.empty() && fs::is_directory(fs::path(root) / "dinov2", ec)) {
+    dir = (fs::path(root) / "dinov2").string();
+  }
+  if (dir.empty()) {
+    dir = resolve_model_dir(session(), "facebook/dinov2-large");
+  }
+  if (dir.empty()) {
+    session()->error(fmt(
+        "DiffusionConditionerStage('{}'): VOSR needs a DINOv2 checkpoint and "
+        "none was found. Fetch facebook/dinov2-large, or set encoder_dir",
+        this->id()));
+    return false;
+  }
+  _venc_dir = dir;
+
+  genai::MetalDinov2Encoder::Config dcfg;
+  if (!genai::MetalDinov2Encoder::read_config(dir, &dcfg)) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): no readable DINOv2 config.json in "
+        "'{}'; assuming ViT-L/14", this->id(), dir));
+  }
+  // WHICH LAYER is the restorer's business, not the tower's: the
+  // checkpoint was trained against one intermediate layer and reading
+  // any other is a silently different conditioning. The blocks past it
+  // are then never built.
+  genai::MetalVosrTransformer::Config vcfg;
+  if (genai::MetalVosrTransformer::read_config(root, &vcfg, nullptr)) {
+    dcfg.out_layer = vcfg.enc_layer;
+    _dino_size = vcfg.dinov2_size;
+    if (vcfg.enc_dim != dcfg.hidden) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): the restorer wants a {}-wide "
+          "vision encoder and '{}' is {} wide", this->id(), vcfg.enc_dim,
+          dir, dcfg.hidden));
+      return false;
+    }
+  }
+  _enc_ws = genai::open_weight_set(dir, session());
+  if (!_enc_ws) {
+    session()->error(fmt(
+        "DiffusionConditionerStage('{}'): cannot open the DINOv2 checkpoint: "
+        "{}", this->id(), dir));
+    return false;
+  }
+  _dinov2 = genai::MetalDinov2Encoder::load(_enc_ws, mc, dcfg);
+  if (!_dinov2) { return false; }
+  _enc_hidden = dcfg.hidden;
+  return true;
+}
 
 bool
 DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
@@ -997,6 +1102,28 @@ DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
         genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
     if (!d.empty() && d != root) { dit = d; }
   }
+  // VOSR is the family whose ENCODER is not under `root` at all: DINOv2
+  // is a separate download, so the text_encoder path above resolves to
+  // nothing and the claim would be 0 bytes -- exactly the under-count
+  // this function exists to prevent, and here it hides the whole
+  // conditioner rather than part of it.
+  {
+    genai::MetalVosrTransformer::Config vc;
+    if (genai::MetalVosrTransformer::read_config(root, &vc, nullptr)) {
+      const std::string w = genai::MetalVosrTransformer::weights_dir(root);
+      if (!w.empty()) { dit = w; }
+      std::string venc = _venc_dir;
+      if (venc.empty() && fs::is_directory(fs::path(root) / "dinov2", ec)) {
+        venc = (fs::path(root) / "dinov2").string();
+      }
+      if (venc.empty()) {
+        venc = resolve_model_dir(session(), "facebook/dinov2-large");
+      } else {
+        venc = resolve_model_dir(session(), venc);
+      }
+      if (!venc.empty()) { enc = venc; }
+    }
+  }
   if (enc_out != nullptr) { *enc_out = std::move(enc); }
   if (dit_out != nullptr) { *dit_out = std::move(dit); }
 }
@@ -1216,6 +1343,20 @@ DiffusionConditionerStage::ensure_loaded_()
       apply_model_config_();
     }
   }
+  // VOSR, on the same terms: it ships no diffusers tree at all -- an
+  // args.json beside a `checkpoints/` directory -- so nothing above can
+  // see it, and its own reader is the only thing that can. It refuses a
+  // checkpoint that is not the one-step VOSR 2.0, which matters here
+  // more than usual: the multi-step and 0.5B variants would load
+  // through the same names and compute the wrong answer.
+  if (_family == "krea2") {
+    genai::MetalVosrTransformer::Config vprobe;
+    if (genai::MetalVosrTransformer::read_config(root, &vprobe, nullptr)) {
+      _family = "vosr";
+      _dino_size = vprobe.dinov2_size;
+      apply_model_config_();
+    }
+  }
   // A REGISTERED family, asked LAST and only when everything above fell
   // through to the "krea2" default.
   //
@@ -1331,6 +1472,31 @@ DiffusionConditionerStage::ensure_loaded_()
   // planning, so the declaration is real and this second site is gone.
   // Do not restore it: two places stating one intent means only one of
   // them is exercised by any given graph shape.
+
+  // ---- VOSR: a vision tower and nothing else --------------------------
+  //
+  // Short-circuits everything below. There is no prompt on this path, so
+  // there is no tokenizer to load and no text encoder to configure --
+  // the conditioning IS the DINOv2 feature grid, and the blocks of the
+  // restorer cross-attend to it exactly where another family's blocks
+  // cross-attend to text.
+  if (_family == "vosr") {
+    if (!load_dinov2_(mc, root)) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): DINOv2 load failed; inert",
+          this->id()));
+      return;
+    }
+    _root_dir  = root;
+    _enc_dir   = _venc_dir;
+    _peer_dirs = {_venc_dir,
+                  genai::MetalVosrTransformer::weights_dir(root)};
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): family vosr encoder (DINOv2 "
+        "ViT-L/14 at {}px, layer {}), hidden {} -- vision only, no prompt",
+        this->id(), _dino_size, _dinov2->config().out_layer, _enc_hidden));
+    return;
+  }
 
   namespace fs = std::filesystem;
   std::string tok_path = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
@@ -1516,7 +1682,7 @@ DiffusionConditionerStage::release_encoder_when_idle_()
 void
 DiffusionConditionerStage::unload_encoder_()
 {
-  if (!_encoder && !_umt5 && !_h3_enc) { return; }
+  if (!_encoder && !_umt5 && !_h3_enc && !_dinov2) { return; }
   // Everything weight-sized: the LM (or the wan family's umT5 tower),
   // either vision tower, and the embedding table. The tokenizer stays
   // (kilobytes, and it is pure CPU state).
@@ -1534,6 +1700,7 @@ DiffusionConditionerStage::unload_encoder_()
   _encoder.reset();
   _umt5.reset();
   _h3_enc.reset();
+  _dinov2.reset();
   _vision.reset();
   _vision3.reset();
   _embed = metal_compute::SharedBuffer{};
@@ -1600,6 +1767,16 @@ DiffusionConditionerStage::reload_encoder_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _enc_dir.empty()) { return false; }
+  if (_family == "vosr") {
+    if (!load_dinov2_(mc, _root_dir)) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): DINOv2 reload failed: {}",
+          this->id(), _enc_dir));
+      return false;
+    }
+    _unloaded = false;
+    return true;
+  }
   if (!load_encoder_(mc)) {
     session()->error(fmt(
         "DiffusionConditionerStage('{}'): encoder reload failed: {}",
@@ -2622,6 +2799,73 @@ DiffusionConditionerStage::screen_(const std::string& prompt,
   return genai::mage_screen(*_encoder, *_tokenizer, req, session());
 }
 
+// The ref_image iports: the first is iport3, the second iport4.
+[[maybe_unused]] constexpr unsigned kRefPort = 3;
+
+Job
+DiffusionConditionerStage::process_vosr_(RuntimeContext& ctx)
+{
+  // VOSR conditions on a PICTURE and on nothing else, so this path shares
+  // no line with the text one: no prompt, no tokenizer, no negative, no
+  // guidance. What it does share is the idle-unload policy, because a
+  // 0.6 GB tower sitting resident through a 1.4B restoration is the same
+  // waste a text encoder would be.
+  if (ctx.num_iports() <= kRefPort || !ctx.iport_connected(kRefPort)) {
+    session()->error(fmt(
+        "DiffusionConditionerStage('{}'): the vosr family conditions on the "
+        "ref_image iport and nothing is wired to it; inert", this->id()));
+    ctx.signal_done();
+    co_return;
+  }
+  resolve_unload_policy_();
+  if (_dinov2 == nullptr && !_unloaded) {
+    // Inert: consume the picture rather than returning at once, or the
+    // runtime re-invokes this immediately and the stage spins a core.
+    auto drop = co_await ctx.read(kRefPort);
+    if (!drop) { ctx.signal_done(); }
+    co_return;
+  }
+  // THE PICTURE IS THE BEAT. Read fresh every time -- a restoration graph
+  // hands this stage a different image on each beat, and the latch the
+  // text path uses would condition every one of them on the first.
+  auto rb = co_await ctx.read(kRefPort);
+  if (!rb) { ctx.signal_done(); co_return; }
+  const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb.get());
+  if (tb == nullptr || tb->dtype != TensorBeat::DType::U8 ||
+      tb->shape.size() != 3 || tb->shape[0] != 3 || tb->shape[1] <= 0 ||
+      tb->shape[2] <= 0) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): expected a planar U8 RGB [3,H,W] "
+        "TensorBeat, got {}; dropping beat", this->id(),
+        rb->describe()));
+    co_return;
+  }
+  if (_unloaded && !reload_encoder_()) { co_return; }
+  if (_dinov2 == nullptr) { co_return; }
+
+  const int H = (int)tb->shape[1], W = (int)tb->shape[2];
+  const auto bytes = tb->materialize_contiguous();
+  int n_tok = 0;
+  SharedBuffer tokens =
+      _dinov2->encode_rgb(bytes.data(), H, W, _dino_size, &n_tok);
+  if (tokens.empty() || n_tok <= 0) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): DINOv2 encode failed for a "
+        "{}x{} picture; dropping beat", this->id(), W, H));
+    co_return;
+  }
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): {}x{} -> {} DINOv2 tokens x {}",
+      this->id(), W, H, n_tok, _enc_hidden));
+  // Let go before the beat is published: the restorer starts the moment
+  // it lands, and the tower has nothing left to do until the next
+  // picture.
+  release_encoder_when_idle_();
+  co_await ctx.write(0, to_beat_(tokens, {n_tok, _enc_hidden},
+                                 TensorBeat::DType::Bf16));
+  ++_emitted;
+}
+
 Job
 DiffusionConditionerStage::process(RuntimeContext& ctx)
 {
@@ -2659,6 +2903,12 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
         ensure_loaded_();
       }
     }
+  }
+  // VOSR is driven by the PICTURE, not by a prompt. Everything below
+  // blocks on iport0, which a vision-only graph does not wire at all.
+  if (_family == "vosr") {
+    co_await process_vosr_(ctx);
+    co_return;
   }
   // The wan family's tower is _umt5, not _encoder (a umT5 ENCODER rather
   // than a decoder-only LM), so both members have to be consulted --
@@ -2707,9 +2957,15 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // Reference images latch independently on iport3 / iport4, then compact to a
   // contiguous [0, _n_ref) run so "reference i" always means the i-th picture
   // the VLM sees even if only the second port was wired.
+  // LATCHED, unless the graph said the picture changes per beat. An edit
+  // graph sends one source image and many instructions, so holding the
+  // first is right and re-reading would block forever. A graph that
+  // sends a picture WITH every prompt is the opposite case, and the two
+  // cannot share a default -- see the `reference_mode` config key.
+  const bool ref_fresh = ref_per_beat_();
   for (int i = 0; i < kMaxRefs; ++i) {
     const unsigned port = 3u + (unsigned)i;
-    if (!_ref_rgb[i].empty()) { continue; }
+    if (!_ref_rgb[i].empty() && !ref_fresh) { continue; }
     if ((int)ctx.num_iports() <= (int)port || !ctx.iport_connected(port)) {
       continue;
     }

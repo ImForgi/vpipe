@@ -2078,6 +2078,12 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     op.bias(b, 0, mods, (std::size_t)slot * 4 * H, 1, 4 * H);
   };
 
+  // The int8 split's width, for shapes an earlier forward recorded. HERE
+  // because it runs its own command streams and so needs no encoder
+  // open: step 1 records, step 2 measures, every step after reads the
+  // cache. No-op once the shapes are settled, and on a run with i8 off.
+  if (_i8) { _i8->tune_pending(_mc); }
+
   // ===== stream 1: conditioning + patch embed + the three refiner stacks ====
   if (prof) { t_setup = ms_since(mk); mk = tnow(); }
   {
