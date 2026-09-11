@@ -14,10 +14,13 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/conditioner-profile.h"
 #include "generative-models/context-manager.h"
+#include "generative-models/image-model-registry.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/video-model-registry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -526,22 +529,37 @@ genai::MetalQwenModel::Config encoder_config_flux2_(const std::string& enc_dir)
 // difference is the checkpoint layout -- Mage-Flow wraps everything in
 // `model.` (398 LM tensors under "model.language_model.", 315 tower tensors
 // under "model.visual."), krea2 omits that wrapper.
-genai::MetalQwenModel::Config encoder_config_mage_()
+// A REGISTERED family's encoder, from its conditioning profile.
+//
+// The base is the Qwen3-VL every image family here drives; the profile
+// supplies only what differs about this checkpoint. Three keys matter
+// enough to name:
+//
+//   weight_prefix   the checkpoint's wrapper, e.g.
+//                   "model.language_model." for a
+//                   Qwen3VLForConditionalGeneration against a bare
+//                   "language_model.". Reading a wrapped checkpoint
+//                   without it finds no tensors at all, which is at
+//                   least loud.
+//   backbone_only   false when something GENERATES on these weights --
+//                   a content screen, a captioner -- which needs the
+//                   token-embedding muxer and the head. The conditioning
+//                   path then takes its embeddings from the same muxer,
+//                   binding one embed table rather than keeping a second
+//                   copy beside the model's (~780 MB at vocab 151936 x
+//                   2560 bf16).
+//   max_seq         a page-pool CAP, not a resident allocation. A family
+//                   whose screen runs a policy of a few thousand tokens
+//                   needs more than its ~100-token prompts imply.
+genai::MetalQwenModel::Config
+encoder_config_profile_(const FlexData* profile)
 {
+  namespace c_ = genai::cond;
   genai::MetalQwenModel::Config c = encoder_config_krea2_();
-  c.weight_prefix = "model.language_model.";
-  // NOT backbone-only, unlike every other diffusion text encoder here: the
-  // MANDATORY content screen (mage-screen.h) GENERATES a JSON verdict on
-  // these same weights, which needs the token-embedding muxer + the (tied)
-  // lm_head. The conditioning path takes its embeddings from the same muxer,
-  // so this binds one embed table rather than the stage keeping a second copy
-  // beside the model's (~780 MB at vocab 151936 x 2560 bf16).
-  c.backbone_only = false;
-  // The classifier's system prompt is the policy itself -- a few thousand
-  // tokens, far past the ~100-token conditioning prompts the other families
-  // size for. This is only a page-pool CAP (pages are allocated lazily and
-  // returned on release), not a resident allocation.
-  c.max_seq = 8192;
+  c.weight_prefix = c_::text(profile, c_::kWeightPrefix,
+                             c.weight_prefix.c_str());
+  c.backbone_only = c_::flag(profile, c_::kBackboneOnly, c.backbone_only);
+  c.max_seq = (int)c_::integer(profile, c_::kMaxSeq, c.max_seq);
   return c;
 }
 // Boogu-Image's mllm is a stock Qwen3VLForConditionalGeneration -- the 10B
@@ -806,8 +824,8 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   genai::MetalQwenModel::Config ecfg =
       _family == "flux2" ? encoder_config_flux2_(_enc_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
-      : _family == "mage-flow" ? encoder_config_mage_()
       : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
+      : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
   _enc_hidden = ecfg.hidden;
   // The encoder may be affine-quantized (model-quantize target=text_encoder).
@@ -891,17 +909,18 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     // streamable claim declare_resources() made already says what this
     // reduces to; there is nothing to correct.
   }
-  if (_family == "mage-flow") {
-    // Mage-Flow takes its embeddings from the model's own muxer (loaded
-    // because the content screen has to generate), so there is no second
-    // table to load here. Probe it once: an encoder that cannot gather a
-    // token embedding can neither condition NOR screen, and a mage-flow
-    // encoder that cannot screen must not run at all.
+  // A family whose profile asked for the OUTPUT HEAD takes its
+  // embeddings from the model's own muxer, so there is no second table
+  // to load here -- which is the point of asking for the head at all.
+  // Probe it once: an encoder that cannot gather a token embedding can
+  // neither condition nor run whatever it wanted the head for.
+  if (_profile != nullptr &&
+      !genai::cond::flag(_profile, genai::cond::kBackboneOnly, true)) {
     if (_encoder->embed_text_buf(std::vector<std::int32_t>{0}).empty()) {
       session()->error(fmt(
-          "DiffusionConditionerStage('{}'): Mage-Flow encoder has no usable "
-          "token-embedding table -- it could neither condition nor run the "
-          "mandatory content screen; inert", this->id()));
+          "DiffusionConditionerStage('{}'): the '{}' encoder has no usable "
+          "token-embedding table -- it can neither condition nor generate "
+          "on these weights; inert", this->id(), _family));
       return false;
     }
     return true;
@@ -1117,7 +1136,28 @@ DiffusionConditionerStage::apply_model_config_()
   // invisible: the encode succeeds either way, just at a resolution the
   // model was not trained against.
   _ground = genai::GroundedEncodeParams::for_family(_family);
+  // ...then a REGISTERED family's own numbers, which the table above
+  // cannot hold because they arrived with the plugin. Applied over the
+  // table's defaults rather than instead of them, so a profile that
+  // states only a long edge keeps sensible bounds for the rest.
+  if (_profile != nullptr) {
+    namespace c_ = genai::cond;
+    _ground.long_edge =
+        (int)c_::integer(_profile, c_::kGroundedLongEdge, _ground.long_edge);
+    _ground.min_pixels = (std::size_t)c_::integer(
+        _profile, c_::kGroundedMinPixels, (long long)_ground.min_pixels);
+    _ground.max_pixels = (std::size_t)c_::integer(
+        _profile, c_::kGroundedMaxPixels, (long long)_ground.max_pixels);
+  }
   const std::string want = model_config::family_of(_model_cfg);
+  // WAIT until the family is settled before calling a beat a mismatch.
+  //
+  // A config beat and a model reference arrive on different ports and
+  // either can be first, so this runs once with `_family` still at its
+  // default -- and warning then reports a mismatch against a family
+  // nothing has chosen. The beat is re-applied when the checkpoint is
+  // resolved, which is where a REAL mismatch is worth saying.
+  if (!want.empty() && want != _family && !_family_settled) { return; }
   if (!want.empty() && want != _family) {
     session()->warn(fmt(
         "DiffusionConditionerStage('{}'): the model_config beat is for the "
@@ -1153,6 +1193,10 @@ DiffusionConditionerStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  // What the models DB recorded, for the registry probe below. It is the
+  // only thing that can identify a bare weights directory, and it is
+  // read here rather than there so the lookup happens once.
+  _model_type = resolve_model(session(), _hf_dir).model_type;
   _family = family_((std::filesystem::path(root) / "transformer").string());
   // Seeded here and again below: the H3 probe can still change the
   // family, and `_ground` has to describe whichever one wins.
@@ -1172,11 +1216,104 @@ DiffusionConditionerStage::ensure_loaded_()
       apply_model_config_();
     }
   }
+  // A REGISTERED family, asked LAST and only when everything above fell
+  // through to the "krea2" default.
+  //
+  // Two things make this the right place for it. A checkpoint whose
+  // `_class_name` the chain above READ has answered for itself, and an
+  // out-of-tree family must not be able to take it away. And the
+  // fall-through is the case that needs help: a family published as a
+  // single file, or as a ComfyUI repack, has no transformer config at
+  // all -- so the only thing that can identify it is the family that
+  // knows how to read it, which is exactly what `claims` is.
+  //
+  // Asked with `root` rather than the transformer path because a
+  // family's `claims` looks at the checkpoint the way it is published,
+  // which for most new models is not a diffusers subdirectory.
+  if (_family == "krea2") {
+    const std::string mt = _model_type;
+    std::string tag;
+    if (genai::ImageModelFamily* f =
+            genai::ImageModelRegistry::get().claim_for(session(), root, mt)) {
+      tag = std::string(f->tag());
+    } else if (genai::VideoModelFamily* v =
+                   genai::VideoModelRegistry::get().claim_for(session(), root,
+                                                              mt)) {
+      tag = std::string(v->tag());
+    }
+    if (!tag.empty()) {
+      _family = tag;
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): '{}' has no readable transformer "
+          "config; the registered '{}' family claimed it", this->id(), root,
+          _family));
+      apply_model_config_();
+    }
+  }
+  // The family's own conditioning profile, if a plugin registered one.
+  // Null for every built-in family, which is what the host's own
+  // defaults below serve. See generative-models/conditioner-profile.h.
+  _family_settled = true;
+  _profile = genai::cond::find(_family);
+  if (_profile != nullptr) {
+    // WHAT THIS HOST DOES NOT IMPLEMENT, said once and out loud.
+    //
+    // The bag is open by design, so a profile can legitimately carry a
+    // key this build has never heard of -- that costs nothing, and
+    // ignoring it is correct. What is NOT correct is silently ignoring a
+    // key it does know and cannot honour: a family that asked for a
+    // multi-layer tap and got the last hidden state is conditioned on
+    // the wrong tensor, and nothing downstream can tell.
+    namespace c_ = genai::cond;
+    const std::string kind = c_::text(_profile, c_::kEncoderKind, "qwen3-vl");
+    if (kind != "qwen3-vl") {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): the '{}' profile asks for a '{}' "
+          "encoder, which the profile path does not drive -- running the "
+          "Qwen3-VL path. A family needing another encoder ships its own "
+          "conditioner stage", this->id(), _family, kind));
+    }
+    const std::string tap = c_::text(_profile, c_::kHiddenTap, "last");
+    if (tap != "last") {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): the '{}' profile asks for a '{}' "
+          "hidden tap; the profile path taps the LAST hidden state only, so "
+          "the conditioning would come from the wrong layer",
+          this->id(), _family, tap));
+    }
+    const std::string pos = c_::text(_profile, c_::kPositions, "sequential");
+    if (pos != "sequential") {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): the '{}' profile asks for '{}' "
+          "positions; the profile path runs plain sequential ones",
+          this->id(), _family, pos));
+    }
+  }
   // Boogu names its text encoder `mllm/` (it is a full multimodal LLM, not a
   // text_encoder in the diffusers sense); every other family uses
   // text_encoder/.
-  _enc_dir = (std::filesystem::path(root) /
-              (_family == "boogu-image" ? "mllm" : "text_encoder")).string();
+  {
+    // A profile names its own subdirectory; Boogu says "mllm" and
+    // everything else "text_encoder".
+    const std::string sub =
+        _profile != nullptr
+            ? genai::cond::text(_profile, genai::cond::kEncoderSubdir,
+                                "text_encoder")
+            : (_family == "boogu-image" ? "mllm" : "text_encoder");
+    _enc_dir = (std::filesystem::path(root) / sub).string();
+    // ...and a ComfyUI repack spells it PLURAL, with one freely-named
+    // file inside. Probed rather than configured because the two
+    // spellings are the same component, and a family should not have to
+    // know which packing an operator fetched.
+    std::error_code sec;
+    if (!std::filesystem::is_directory(_enc_dir, sec)) {
+      const std::filesystem::path alt =
+          std::filesystem::path(root) / (sub + "s");
+      if (std::filesystem::is_directory(alt, sec)) {
+        _enc_dir = alt.string();
+      }
+    }
+  }
   if (_family == "minimax-h3") {
     // `text_encoders/` on a repack, `text_encoder/` on a diffusers tree,
     // and a directory checkpoint in either once quantized -- one resolver
@@ -1560,13 +1697,21 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   // Mage-Flow rides the SAME Qwen3-VL tower + deepstack path as krea2; only
   // the checkpoint prefix ("model.visual." vs "visual."), the conditioning
   // long-edge cap (384 vs 768) and the processor's min_pixels differ.
-  if (_family == "krea2" || _family == "mage-flow" ||
-      _family == "boogu-image") {
+  if (_family == "krea2" || _family == "boogu-image" ||
+      _profile != nullptr) {
     // Boogu's mllm shares Mage-Flow's checkpoint wrapper ("model.visual."),
     // its bf16 pipeline dtype and its preprocessor bounds (shortest_edge
     // 65536), and its pipeline caps the VLM conditioning image at 384x384
     // pixels -- so it takes the same branch.
-    const bool mage = (_family == "mage-flow" || _family == "boogu-image");
+    // Whether the tower's tensors carry the
+    // Qwen3VLForConditionalGeneration wrapper ("model.visual.") or sit
+    // bare ("visual."). Boogu's mllm is wrapped; a registered family
+    // says so in its profile.
+    const bool mage =
+        _family == "boogu-image" ||
+        (_profile != nullptr &&
+         genai::cond::text(_profile, genai::cond::kVisionPrefix,
+                           "visual.") == "model.visual.");
     if (!_vision3) {
       genai::ModelLoader loader(session());
       const auto mcfg = loader.load_config(_enc_dir);
@@ -2118,20 +2263,41 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     return txt;
   }
 
-  if (_family == "mage-flow") {
-    const int NL = 36;   // Qwen3-VL 4B layers
+  // ---- a REGISTERED family, driven by its conditioning profile ------
+  //
+  // The machinery below is the host's and is shared: the tokenizer, the
+  // Qwen3-VL tower, the deepstack injection, the embedding muxer. What
+  // the profile supplies is the FACTS -- the chat template, how many
+  // leading tokens this checkpoint drops, what it labels its references,
+  // whether its positions are a plain arange or the 2-D grid. Those are
+  // the things that differ between checkpoints and that a host cannot
+  // know about a model published after it.
+  //
+  // The defaults are the shared Qwen-Image conventions, which is what a
+  // profile that says nothing gets -- and what Mage-Flow's own templates
+  // are byte-identical to.
+  if (_profile != nullptr) {
+    namespace c_ = genai::cond;
+    const int NL = _encoder->config().n_layers;
     const bool img_aware = (n_img > 0) && !vtok.empty();
     const std::int32_t pad_id =
         img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
     const bool grounded = img_aware && pad_id >= 0;
-    // Edit template (drop 64) when a reference rides along, t2i template
-    // (drop 34) otherwise -- the reference picks the template from the CALL
-    // (generate_edits vs generate_images), which is the same distinction.
-    const int drop = grounded ? kQieDropPrefix : kDropPrefix;
+    // The edit template when a reference rides along, the text-only one
+    // otherwise -- which is the same distinction the reference pipelines
+    // draw between their generate_edits and generate_images calls.
+    const int drop =
+        grounded
+            ? (int)c_::integer(_profile, c_::kEditDrop, kQieDropPrefix)
+            : (int)c_::integer(_profile, c_::kDropPrefix, kDropPrefix);
+    const std::string label = c_::text(_profile, c_::kRefLabel, "Image");
     const std::string tmpl =
-        (grounded ? std::string(kQiePrefix) + ref_blocks_(_img_n, "Image")
-                  : std::string(kPrefix)) +
-        text + (grounded ? std::string(kQieSuffix) : std::string(kSuffix));
+        (grounded ? c_::text(_profile, c_::kEditPrefix, kQiePrefix) +
+                        ref_blocks_(_img_n, label.c_str())
+                  : c_::text(_profile, c_::kPromptPrefix, kPrefix)) +
+        text +
+        (grounded ? c_::text(_profile, c_::kEditSuffix, kQieSuffix)
+                  : c_::text(_profile, c_::kPromptSuffix, kSuffix));
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
     std::vector<std::pair<int, int>> runs;
     if (grounded) { runs = expand_pads_(ids, pad_id, _img_tok, _img_n); }

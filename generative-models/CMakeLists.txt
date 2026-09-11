@@ -10,6 +10,9 @@
 
 set(LOCAL_SOURCES
   chat-template.cc
+  detect-profile.cc
+  family-profile.cc
+  quantize-profile.cc
   context-manager.cc
   generative-model-manager.cc
   weight-registry.cc
@@ -18,6 +21,7 @@ set(LOCAL_SOURCES
   metal-token-muxer.cc
   model-exec-registry.cc
   vae-model-registry.cc
+  image-model-registry.cc
   video-model-registry.cc
   quantize-family-registry.cc
   hidden-state-encoder.cc
@@ -76,7 +80,6 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
   mage/metal-mage-vae.cc
-  mage/mage-watermark.cc
   mage/mage-screen.cc
   mage/mage-screen-policy.cc
   flux2/metal-flux2-transformer.cc
@@ -185,8 +188,6 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-text-encoder.h
   minimax-h3/minimax-h3-denoise.h
   mage/metal-mage-vae.h
-  mage/metal-mage-flow-transformer.h
-  mage/mage-watermark.h
   mage/mage-screen.h
   quantize/affine-quantizer.h
   quantize/arch-detect.h

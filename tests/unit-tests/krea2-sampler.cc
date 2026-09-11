@@ -82,12 +82,31 @@ TEST(krea2_sampler, sampler_spec_roundtrips_and_aliases)
   fd.as_object().insert_or_assign("method", FlexData::make_string("dpm++_2m"));
   EXPECT_TRUE(FlowSamplerSpec::from_flex(fd).method == "dpmpp_2m");
 
-  // Unknown -> euler + error.
+  // A method this host does not implement is PASSED THROUGH, and
+  // reported. It used to be rewritten to "euler", which made the
+  // request unrecoverable -- a registered family runs its own denoise
+  // loop and reads this spec itself, so it can understand a name this
+  // tree never heard of, but only if the name survives.
+  //
+  // The in-tree samplers are unaffected: they fall to euler for any
+  // name they do not know, which is what they did with the rewrite too.
   FlexData bad = FlexData::make_object();
   bad.as_object().insert_or_assign("method", FlexData::make_string("nope"));
   std::string err;
-  EXPECT_TRUE(FlowSamplerSpec::from_flex(bad, &err).method == "euler");
+  EXPECT_TRUE(FlowSamplerSpec::from_flex(bad, &err).method == "nope");
   EXPECT_TRUE(!err.empty());
+  // ...and the sampler still steps, on euler, rather than refusing.
+  FlowSchedulerSpec sc;
+  sc.steps = 2;
+  FlowSampler samp(FlowSamplerSpec::from_flex(bad), sc);
+  std::vector<float> x = {1.0f};
+  int calls = 0;
+  samp.step(0, x, [&](const std::vector<float>&, double) {
+    ++calls;
+    return std::vector<float>{1.0f};
+  });
+  EXPECT_TRUE(calls == 1);
+  EXPECT_TRUE(x[0] != 1.0f);
 }
 
 TEST(krea2_sampler, scheduler_spec_roundtrips)

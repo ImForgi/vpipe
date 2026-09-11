@@ -12,13 +12,12 @@
 // is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
-#include "generative-models/mage/metal-mage-flow-transformer.h"
-#include "generative-models/mage/mage-watermark.h"
 #endif
 
 #include <array>
@@ -31,6 +30,9 @@
 namespace vpipe {
 
 namespace genai { class WeightSet; }   // generative-models/weight-set.h
+// generative-models/image-model-registry.h -- an out-of-tree family and
+// the one resident checkpoint it builds.
+namespace genai { class ImageModelFamily; class ImageGenerator; }
 
 // Text-to-image (DiT) stage: the denoiser half of the diffusion split -- it
 // consumes ready-made conditioning from a `diffusion-conditioner` stage (which
@@ -111,7 +113,7 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 // reference latent is wired on iport5, the size is INFERRED from it:
 // ref_latent0 is vae-encode's output for the source image, so the output is
 // its H/W times the family's VAE factor (8 for Krea-2 / Qwen-Image-Edit, 16
-// for FLUX.2 / Mage-Flow -- see latent_scale_). An edit therefore comes out at
+// for FLUX.2 -- see latent_scale_). An edit therefore comes out at
 // the source resolution with no size config at all. Falls back to 256x256 when
 // there is no reference either.
 class GenerateImageStage final : public TypedStage<GenerateImageStage> {
@@ -152,6 +154,16 @@ public:
   // Test-only accessors.
   const std::string& hf_dir()        const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
+  // The RESOLVED Sol-Attn config, after the key-block validation. Test-
+  // only, and the reason it exists: whether a rejected block size falls
+  // back or is silently kept is not visible from config_error(), because
+  // a perf knob spelled wrong warns rather than failing the stage.
+  const genai::sol::Config& sol_config() const noexcept { return _sol; }
+  // The bag itself, which is what a registered family gets. A test seam
+  // like sol_config() beside it, and the one that can check the two
+  // agree -- the whole point of writing the settled values in and
+  // reading them straight back out.
+  const FlexData& accel_settings() const noexcept { return _accel; }
   // The adapter this stage would load with, after its own config and
   // any model_config beat. Exposed because the interesting failure is
   // that it is EMPTY when the graph thought it had set one, and every
@@ -182,12 +194,41 @@ private:
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  // ---- an out-of-tree family, when one claimed this checkpoint ------
+  //
+  // Consulted BEFORE the built-in _class_name chain and, when it claims,
+  // INSTEAD of it: `_family` is then the plugin's tag and every built-in
+  // DiT member stays null. See generative-models/image-model-registry.h
+  // for why the seam is the generation rather than the step.
+  //
+  // The family pointer is the registry's and outlives the stage; the
+  // generator is this stage's one resident checkpoint.
+  genai::ImageModelFamily*             _plugin_family = nullptr;
+  std::unique_ptr<genai::ImageGenerator> _plugin_gen;
+  // The acceleration settings as the open bag a family reads, built once
+  // from the typed members below and then read BACK into them -- two
+  // spellings of one decision drift, one spelling with two readers
+  // cannot. See generative-models/shared/accel-settings.h.
+  FlexData _accel{};
+  // The sampler / scheduler beats as they ARRIVED, beside the typed
+  // specs parsed from them. A registered family reads these: the typed
+  // form is this tree's vocabulary, and a plugin's integrator need not
+  // be in it.
+  FlexData _sampler_raw{};
+  FlexData _scheduler_raw{};
+
   // SageAttention (LOSSY int8 QK^T), family-agnostic like _i8_gemm.
   genai::sage::Config _sage{};
+  // Sol-Attn (LOSSY block routing), the third cross-family tier. Kept as
+  // a typed member for the same reason the other two are -- it is what
+  // the settled values are read back into, so the log line and the bag
+  // cannot disagree -- even though no BUILT-IN image DiT takes one
+  // today. A registered family reads the bag, not this.
+  genai::sol::Config _sol{};
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 
-  // "krea2" | "flux2" | "qwen-image-edit" | "mage-flow" | "boogu-image" (from
+  // "krea2" | "flux2" | "qwen-image-edit" | "boogu-image" (from
   // the transformer _class_name).
   std::string _family = "krea2";
 
@@ -208,8 +249,7 @@ private:
   // them. Both held rather than one variant: the families share no keys,
   // and a struct wide enough for both would describe neither.
   genai::MetalFlux2Transformer::GenerationParams _flux2_params;
-  genai::mage_wm::Params _wm_params;
-  // Re-parse `_model_cfg` for the family that is now resident. Called
+   // Re-parse `_model_cfg` for the family that is now resident. Called
   // when either input changes -- a new config beat, or a model that just
   // resolved. Returns false when the beat is for another family, which
   // is reported and then ignored.
@@ -226,15 +266,9 @@ private:
   std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
   std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
   std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;
-  // Mage-Flow's NR-MMDiT IS MetalQwenImageTransformer (a different Config);
-  // kept in its own handle so the two families never share load state.
-  std::unique_ptr<genai::MetalMageFlowTransformer> _mage_dit;
   // Boogu-Image's 10B NextDiT (its own class: five block kinds and three
   // refiner stacks share nothing with the MMDiTs above).
   std::unique_ptr<genai::MetalBooguTransformer> _boogu_dit;
-  // Mage-Flow's STATIC flow shift from <root>/scheduler/scheduler_config.json
-  // (6.0 in every published checkpoint; use_dynamic_shifting is false).
-  double _mage_shift = 6.0;
   // On a memory-bounded box (DiT + the conditioner's resident encoder can't fit
   // a large decode too), drop the DiT's per-forward scratch after each
   // generation so it doesn't crowd out the downstream vae-decode. Set from the
@@ -409,24 +443,6 @@ private:
   // [16, h, w]) packed 2x2 to DiT tokens + appended in their own RoPE frame
   // bands. Returns the unpacked, whitened latent [16, H/8, W/8] (channel-first)
   // or empty.
-  // Mage-Flow forward: `txt` is the diffusion-conditioner's mage-flow
-  // conditioning (bf16 [n_real, 2560] single last-hidden tap, POST final
-  // norm). MageVAE downsamples 16x and the DiT is patch_size 1, so a latent
-  // pixel IS a token: no 2x2 pack/unpack anywhere on this path. `refs` are
-  // MageVAE reference latents ([128, h, w] channel-first from vae-encode),
-  // appended CLEAN after the target in their own RoPE frame bands -- the
-  // sampler steps only the target tokens. FlowMatchEuler with the checkpoint's
-  // STATIC shift 6.0 (scheduler_config.json, use_dynamic_shifting false).
-  // Returns the latent [128, H/16, W/16] (channel-first) or empty.
-  std::vector<float>
-  generate_mage_(const metal_compute::SharedBuffer& txt, int n_real,
-                 const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
-                 int gen_h, int gen_w,
-                 const std::vector<float>* init_packed,
-                 const std::vector<RefLatent>& refs,
-                 const std::function<void(const std::vector<float>&)>&
-                     emit_step = {}) const;
-
   // Boogu-Image forward: `txt` is the diffusion-conditioner's boogu-image
   // conditioning (bf16 [n_real, 4096] mllm last-hidden POST final norm, over
   // the WHOLE templated sequence -- Boogu drops no prefix). Runs the NextDiT

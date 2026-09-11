@@ -14,16 +14,11 @@ GroundedEncodeParams::for_family(const std::string& family)
     p.long_edge = 768;
     return p;
   }
-  if (family == "mage-flow") {
-    // pipeline.py `vl_cond_long_edge`. The processor bounds come from
-    // preprocessor_config.json, whose shortest_edge is 65536 against the
-    // Qwen default of 3136 -- so a small or very wide reference is
-    // UPSCALED before patching, which the default bound would skip.
-    p.long_edge  = 384;
-    p.min_pixels = 65536;
-    p.max_pixels = 16777216;
-    return p;
-  }
+  // Mage-Flow's row is NOT here. Its numbers moved into the family's
+  // own conditioning profile when the family left this tree -- see
+  // generative-models/conditioner-profile.h. This table is for the
+  // families the host itself implements; a registered family's numbers
+  // arrive with it, which is the whole point of the profile.
   if (family == "boogu-image") {
     // BooguImagePipeline's VLM preprocessing: max side 768, area capped
     // at 384x384. BOTH, not either -- which is why the long edge here is

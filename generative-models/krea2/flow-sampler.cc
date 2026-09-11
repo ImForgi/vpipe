@@ -275,8 +275,18 @@ FlowSamplerSpec::canon_method(const std::string& m, bool* ok)
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
   if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
   if (m == "dmd_student" || m == "turbo") { return "dmd"; }
+  // NOT one of this host's names -- and PASSED THROUGH rather than
+  // replaced. The in-tree samplers all fall to euler for a name they do
+  // not know, so nothing here changes for them; what changes is that a
+  // REGISTERED family, which runs its own denoise loop and reads this
+  // spec itself, can be asked for a method this tree has never heard
+  // of. Rewriting it to "euler" made that impossible and made the
+  // request unrecoverable.
+  //
+  // `ok` is still false, because the caller does need to know this host
+  // did not recognise it.
   if (ok != nullptr) { *ok = false; }
-  return "euler";
+  return m;
 }
 
 FlexData
@@ -312,7 +322,9 @@ FlowSamplerSpec::from_flex(const FlexData& fd, std::string* err)
     s.method =
         canon_method(std::string(o.at("method").as_string("euler")), &ok);
     if (!ok && err != nullptr) {
-      *err = "unknown sampler method; using 'euler'";
+      *err = "sampler method is not one this host implements; a "
+             "registered family may still understand it, and the "
+             "built-in samplers will run euler";
     }
   }
   if (o.contains("eta")) { s.eta = o.at("eta").as_real(s.eta); }

@@ -328,20 +328,284 @@ look like a hang.
 Ship the family's knobs as a `ModelConfigSourceStage` (above), not as keys
 on `generate-video`.
 
+### Where new things go, and why they do not go in a field
+
+The ABI is a strict-equality cookie, so anything that moves a layout
+costs every plugin a rebuild — including the plugins that never use the
+thing that moved. Four places used to grow that way and no longer do:
+
+| you want to add | it goes in | not in |
+|---|---|---|
+| an acceleration tier | the `accel` bag | a field on the request |
+| a per-family fact the host needs | a **family profile** domain | a switch in the host |
+| a new generation INPUT with a shape | `req.input("name", &t)` | a field on the request |
+| a scalar the host states | `req.extras` | a field on the request |
+| something a family wants said back | `result.sideband` | a field on the result |
+| a new packaging fact | `ModelCatalogEntry::extra` | a field on the entry |
+| new stage or port metadata | `spec.extra` (a `SpecExtra` span) | a field on the spec |
+| a new VAE codec kind | a `role` NAME | an enumerator |
+
+`VideoGenRequest` is the worked example of the cost. Read its typed
+fields in order: `cond`, `neg`, `audio_cond`, `ref`, `ref_last`, then
+the two reference-row triples. Each arrived with a capability, each
+moved the layout, and each invalidated every family binary including the
+ones that ignore it.
+
+The typed fields that exist **stay** — they work and they are
+documented. What changed is where the next one goes.
+
+Two rules make the bags safe in both directions, and they are the same
+two everywhere: **an unknown key is ignored** (a newer plugin talking to
+an older host) and **a missing key is the documented default** (an older
+plugin talking to a newer host). A third case is not the same as either:
+a key the reader *knows* and cannot honour is **warned**, because being
+treated differently than you asked is silent otherwise.
+
+`req.input` is always installed by the host, so you may call it
+unconditionally; it returns false for every name a graph did not wire,
+which today is every name.
+
+The same four seams are on the **VAE** requests
+(`vae-model-registry.h`), which had none of them: an `accel` bag, the
+named-input lookup, `extras`, and a `report` out-parameter a family
+writes what it wants said back into. `report` is on the REQUEST rather
+than a result, because a decode reports through a sink and has no
+result struct to grow -- so a family gains an output without anyone's
+virtual changing signature.
+
+Note what `accel` means on a codec. **Every tier is off by default and
+that is a quality decision, not a missing implementation**: a codec is
+the last thing between a latent and the pixels somebody looks at, so an
+approximation in it has nowhere to be absorbed, where the same trade
+inside a DiT is followed by dozens of blocks and a decode. The settings
+are plumbed so the trade can be measured, which is not the same as
+recommending it.
+
+`VaeModelFamily::Role` is a **name**, not an enumerator: `kRoleVideo`
+and `kRoleAudio` are the two the host asks for today, and a third codec
+costs nobody a rebuild. A family handed a role it does not know must
+return an empty path, never a guess at the nearest one.
+
+### Family profiles: what your model knows that the host cannot
+
+The host has several closed switches over family name. Which prompt
+template to wrap. Which tensor leaves are worth quantizing. Which
+encoder prefix to read. Each is a table of facts about *checkpoints*,
+and each is unextendable from outside — so a model published after the
+host has no way to answer, and moving a family out of the tree means
+finding every table it appears in.
+
+One seam serves all of them:
+
+```cpp
+#include "generative-models/conditioner-profile.h"
+#include "generative-models/quantize-profile.h"
+
+ctx->register_family_profile(std::string(vpipe::genai::cond::kDomain),
+                             "acme-image", my_conditioning_profile());
+ctx->register_family_profile(std::string(vpipe::genai::quant::kDomain),
+                             "acme-image", my_quantize_profile());
+```
+
+A profile is a `FlexData` keyed by **(domain, family tag)**. The domain
+names the subsystem asking; the tag names your family, and is the same
+string your `tag()` returns and a model_config beat carries in
+`model_family`. Each domain's keys live in its own header, beside the
+code that reads them.
+
+**One method, and it will stay one.** The ABI is a strict-equality
+cookie, so every entry point added to this facade is a rebuild every
+plugin author pays for. A domain *string* keeps that decision out of the
+ABI: the next subsystem that wants per-family facts picks a name, writes
+a key header, and needs no new method, no vtable change and no version
+bump. Registration is first-wins per pair, and your two domains do not
+collide with each other.
+
+The same two properties as the acceleration bag make it work: an unknown
+key is **ignored** (a newer plugin talking to an older host) and a
+missing key is the **documented default** (an older plugin talking to a
+newer host). A domain that *knows* a key and cannot honour it **warns** —
+that is a third case, and it is a family being treated differently than
+it asked, which is silent everywhere else.
+
+A profile is **data, never behaviour**. It cannot hand the host code to
+run, reach machinery the host did not offer, or switch off a policy the
+host enforces. If your needs exceed a domain's vocabulary, ship a stage.
+
+#### The `quantize` domain
+
+Two things `model-quantize` cannot work out for itself: what your
+transformer config calls itself (`dit_class_name` — the built-in chain
+is a closed switch over class names, so without this your diffusers
+checkpoint is not recognised as a text-to-image DiT at all) and which
+tensor leaves are matrices (`quant_linears`, with `quant_exclude` for
+the collisions and `modulation_linears` for the adaLN opt-in).
+
+A leaf is the **last dot-component** before `.weight`, which is what the
+matcher compares — `attn.to_out.0` is `"0"`. Short, so collisions are
+the norm; name them in the exclude list rather than narrowing the leaf.
+
+An empty `quant_linears` means "said nothing", never "quantize none".
+And note what is *not* here: the matching rule, the group sizing, the
+mixed-precision ranking and the writer are the stage's, because a family
+that could override them could produce a checkpoint that loads, runs and
+generates the wrong thing.
+
+This is the *second* seam that stage has, and it answers a different
+question from the first: `QuantizableFamily`
+(`quantize-family-registry.h`) describes a **repack** — where each
+component lives, which file to pick. This describes a **diffusers-layout
+DiT**. A checkpoint published both ways wants both, and its leaf set is
+the same either way, because leaf names are a property of the weights.
+
+#### The `detect` domain
+
+How a checkpoint of your family is recognised on disk and what it is
+called: `class_names`, `model_type` (and `model_type_edit` when your
+t2i and edit repos share a transformer config), `label_family`,
+`label_version`, and the `inputs` / `outputs` modalities.
+
+This is a **labelling** answer, not a loading one. What runs a
+checkpoint is `claims()` on the model registry, which reads the weights
+rather than a table. Register both; where they could disagree the
+registry wins, because it looked.
+
+Without it, a checkpoint of your family that arrived any way other than
+through a catalogue fetch shows in a browser as a model type with no
+name — which is the state LTX-2.5 and SenseNova-U1.5 are in today.
+
+#### The `conditioning` domain, and what it is not
+
+Your family's DiT is yours. Its **prompt encoder** probably is not: five
+of the six families in this tree condition through the same Qwen3-VL
+tower, the same tokenizer, the same deepstack injection. So
+`diffusion-conditioner` keeps that machinery and you tell it the facts
+that differ about **your checkpoint**:
+
+```cpp
+namespace c = vpipe::genai::cond;
+FlexData p = FlexData::make_object();
+p.as_object().insert_or_assign(c::kWeightPrefix,
+                               FlexData::make_string("model.language_model."));
+p.as_object().insert_or_assign(c::kDropPrefix, FlexData::make_int(34));
+// ...the template, the reference label, the grounded caps
+```
+
+The host is only consulted for a profile when nothing else identified
+the checkpoint — a `_class_name` the conditioner can read wins, and an
+out-of-tree family cannot take a checkpoint away from a built-in one.
+That matters for a model published as a single file or a ComfyUI
+repack, which has no transformer config at all: your `claims()` is then
+the only thing that can say what it is.
+
+Two things this domain deliberately cannot do:
+
+- **It cannot bring machinery.** If your conditioning needs an encoder
+  or a position scheme the host does not have, ship your own conditioner
+  stage the way LTX-2.5 does.
+- **It cannot switch off a mandatory content screen.** Whether a
+  family's prompts are screened is decided by the host from the family
+  tag, never from a key in here. A profile that could omit the screen
+  would be a bypass, which is what the screen exists to prevent.
+
 ### The acceleration settings, and what they are not
 
-`VideoModelCreateArgs` and `VideoGenRequest` both carry `sage` and
-`i8_gemm`. These are the cross-family settings the graph asked for, and
-the host applies **none** of them on your behalf — nothing outside your
-family touches your forward. They are there because every DiT in this
-tree runs the same steel flash kernel and the same GEMM kernels, so a
-family that wants them has the same decisions to make and no other way
-to learn what was asked.
+`VideoModelCreateArgs` and `VideoGenRequest` both carry
+
+```cpp
+const vpipe::FlexData* accel;   // and it stays one pointer
+```
+
+— and so do `ImageModelCreateArgs` and `ImageGenRequest`, from
+`generate-image`. The two generating stages carry the **same three
+tiers** under the same key spellings, so a family that reads the bag
+reads it identically whichever one it plugs into.
+
+These are the cross-family settings the graph asked for, as an **open
+bag**. The
+host applies **none** of them on your behalf; nothing outside your family
+touches your forward. They are there because every DiT in this tree runs
+the same steel flash kernel and the same GEMM kernels, so a family that
+wants them has the same decisions to make and no other way to learn what
+was asked.
 
 Implement none and they are ignored, which is what their defaults mean.
-Implement **some** and say which in your own log line: silence is
-indistinguishable from a knob that did nothing, and the numbers get
-believed either way.
+Implement **some** and say which in your own log line — `accel::tiers_on`
+below is there for exactly that — because silence is indistinguishable
+from a knob that did nothing, and the numbers get believed either way.
+
+#### Why a bag and not fields
+
+Because typed fields put the host's vocabulary into **your** ABI. These
+were `sage::Config sage; bool i8_gemm;` until a third tier arrived, and
+adding it changed the struct's layout — which invalidates every plugin
+binary, *including* the ones that implement none of the three. That is a
+rebuild you did not ask for, for a decision you were not part of, and it
+would be due again on the fourth tier.
+
+So the vocabulary lives in a header instead:
+
+```cpp
+#include "generative-models/shared/accel-settings.h"
+```
+
+which ships with the host and is where the keys, their types, their
+defaults and the rules are written down. Everything in it is `inline`
+and compiles into **your** binary. That is what makes the promise
+directional and real:
+
+| | |
+|---|---|
+| host adds a key, your plugin is old | your readers were built without it, so you never ask. Nothing changes, nothing rebuilds. |
+| host is old, your plugin is new | the key is absent and your reader supplies the documented default — the same answer as a graph that left it off. |
+
+Neither direction touches a struct layout. What would break it is
+putting a typed field back.
+
+This makes the acceleration **vocabulary** soft. It does not make the
+whole ABI soft — `FlexData`'s own layout is still shared, as is the
+config struct of any tier you choose to drive. The difference is the
+rate: `FlexData` changes rarely and deliberately, where this list grows
+whenever someone has an idea.
+
+#### Reading it
+
+Scalars, for a tier you drive yourself:
+
+```cpp
+namespace accel = vpipe::genai::accel;
+
+const bool i8 = accel::flag(args.accel, accel::kI8Gemm);
+```
+
+or the tier's own typed config, from that tier's own header — so a family
+that wants none of them includes none of them:
+
+```cpp
+#include "generative-models/shared/sol-attention.h"     // for the Config
+const vpipe::genai::sol::Config sol = sol::config_from_flex(req.accel);
+```
+
+The values are **settled**, not raw: `generate-video` validates and
+corrects before filling the bag — a `sol_key_block` it refused is already
+the value it fell back to — so you can use what you read without
+repeating the check, and two families cannot disagree about what the
+graph asked for.
+
+A null `accel` is legitimate and reads as every default. And the keys are
+**added, never renamed or repurposed**: if a setting's meaning changes it
+gets a new key, and the old one keeps meaning what it always did for as
+long as anything might ask.
+
+```cpp
+// What the graph turned on, so you can name what you do not implement.
+for (auto tier : accel::tiers_on(req.accel)) {
+  if (tier != accel::kSolAttn) {
+    warn(fmt("AcmeVideo: '{}' was asked for and is not implemented here",
+             tier));
+  }
+}
+```
 
 `sage` is [**SageAttention**](https://arxiv.org/abs/2410.02367) — the
 QK^T product of the flash attention in int8, with one scale per
@@ -365,12 +629,13 @@ already pass to the attention:
 //    the model then: running dense under a config that asked for Sage
 //    reports a Sage run and its numbers get believed.
 bool fatal = false;
-_sage = MetalSageAttention::load_for_model(mc, /*bf16=*/true, args.sage,
+const auto sage_cfg = vpipe::genai::sage::config_from_flex(args.accel);
+_sage = MetalSageAttention::load_for_model(mc, /*bf16=*/true, sage_cfg,
                                            "AcmeVideo", &fatal);
 if (fatal) { return nullptr; }
 
 // 2. Build an int8 TWIN of your attention function. Both, not one:
-//    sage.dense_layers leaves the leading blocks on the f16 kernel.
+//    sage_cfg.dense_layers leaves the leading blocks on the f16 kernel.
 fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
 
 // 3. Per block, into the SAME encoder, immediately before the dispatch.
@@ -381,7 +646,7 @@ fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
 MetalSageAttention::Operand q{&qt, 0, head_dim, seq * head_dim};
 MetalSageAttention::Operand k{&kt, 0, head_dim, seq * head_dim};
 if (_sage->prepare(enc, q, k, n_heads, n_kv_heads, qL, kL, head_dim,
-                   bq, bk, args.sage, &err)) {
+                   bq, bk, sage_cfg, &err)) {
   enc.set_function(fn_attn_i8);
   /* ...your usual binds... */
   _sage->bind(enc);          // buffers 15..18
@@ -400,6 +665,134 @@ it two regions to carve from — the same lending the in-tree DiTs do out
 of their forward arena, so Sage costs the process nothing it was not
 already holding. If you lend, **take the loan back before you replace
 it**: the carved buffers are windows that hold your allocation alive.
+
+#### `sol_attn` — which key blocks are attended at all
+
+Where Sage changes how a key block is *computed*, [**Sol-Attn**](https://nvlabs.github.io/Sana/Sol-Attn/)
+decides which ones are *read*. They are orthogonal and compose. Per block
+of keys it keeps the keys' centroid and the values' mean; one product
+against those centroids scores every block at 1/BLK of the dense cost; a
+block above the threshold is attended exactly by the same steel flash
+kernel your dense path already dispatches, and one below is folded into
+the same running softmax as if all its keys carried the centroid's score.
+Nothing is dropped, and there is no second pass.
+
+It wants only the head-major `q/k/v` an unfused attention already
+produces, plus the head count, the row count and the scale:
+
+```cpp
+#include "generative-models/shared/metal-sol-attention.h"
+
+// At load, or per generation -- it holds no weights and costs no memory.
+const auto cfg = vpipe::genai::sol::config_from_flex(req.accel);
+if (cfg.enabled) { _sol = MetalSolAttention::load(mc, /*bf16=*/true, &err); }
+
+// Per attention, in place of your dense dispatch.
+_sol->set_arena(dead_a, dead_b);      // see below
+_sol->encode(enc, qh, kh, vh, oh, heads, rows, head_dim, scale, cfg, &err);
+```
+
+Four things decide whether a given attention is a candidate, and three of
+them are yours to check:
+
+- **head_dim 128.** The method is specified there and `encode` refuses
+  anything else.
+- **Self-attention.** A centroid summarises the keys a query is compared
+  against, so a crossing — text, or another modality — is summarising the
+  wrong sequence. Leave those dense.
+- **Long enough to have something to route.** Below ~16 routing blocks
+  the local band and the tail already cover most of the sequence.
+- **`cfg.dense_layers`**, which is yours to honour: it leaves the leading
+  blocks exact, and a family that ignored it would be running a different
+  model than the one the setting describes.
+
+`cfg.sink_tokens` is **not** in the bag and cannot be: it marks where
+your sequence stops being the modality the routing is summarising, and
+only you know that. A model that packs a prompt or a soundtrack in with
+the video fills it; a per-stream self-attention over one modality leaves
+it at zero.
+
+It allocates nothing if you lend it two regions that are idle across the
+call — `scratch_bytes()` says how much it wants, and `set_arena` carves
+from what you give it before allocating any of its own. The same rule as
+Sage: take the loan back before you replace it.
+
+`exact_blocks()` / `total_blocks()` report what the *previous* forward
+actually routed. Realized sparsity is a property of the clip rather than
+of `sol_tau`, so it is worth logging rather than predicting.
+
+## Extension point 4a — image families
+
+`register_image_family` is the same seam for `generate-image`, and it is
+deliberately the video registry's mirror: a family that has shipped one
+can read the other without re-learning anything.
+
+```cpp
+#include "generative-models/image-model-registry.h"
+
+class AcmeImage : public vpipe::genai::ImageModelFamily {
+  std::string_view tag() const noexcept override { return "acme-image"; }
+  bool claims(const std::string& root, const std::string& model_type)
+      const override;
+  std::unique_ptr<vpipe::genai::ImageGenerator>
+  load(const vpipe::genai::ImageModelCreateArgs&) override;
+};
+
+ctx->register_image_family(std::make_unique<AcmeImage>());
+```
+
+The seam is the **generation**, not the step, for the reason the video
+one gives: `generate-image` holds five built-in denoisers side by side
+because their per-step forwards do not agree — Krea-2 takes a packed
+`[img_seq, z*4]` latent with one timestep, Qwen-Image-Edit runs a dual
+stream, FLUX.2 appends multi-reference tokens with their own RoPE band,
+Boogu is a NextDiT. An interface wide enough for all five describes none
+of them. One level up they all answer the same question: given
+conditioning, geometry, a step count and a seed, produce a latent.
+
+**It returns a latent, not pixels**, and that is what makes an image
+family plus a VAE family a complete model with no stage of its own:
+`generate-image`'s oport0 is exactly what the stock `vae-decode` reads.
+
+What the stage keeps, and what you get:
+
+| the stage owns | you own |
+|---|---|
+| the ports and the beats | the denoise loop |
+| geometry (through your `size_grid`) | the scheduler and the guidance rule |
+| the sampler / scheduler **beats**, handed down unparsed | which of them you understand |
+| the progress bar and cancellation | calling `req.progress` so both work |
+| publishing the latent | its shape |
+
+`req.cond` arrives **family-shaped and family-typed** — the stage does
+not interpret it, so what your conditioner emitted is what your DiT
+reads. `req.accel` is the same acceleration bag described above.
+`req.step_latent`, when non-null, streams each step's latent to a
+downstream preview; a family that cannot produce an intermediate simply
+never calls it.
+
+The registry is consulted **before** the built-in `flux2` / `krea2` /
+`qwen-image-edit` / `boogu-image` / `mage-flow` dispatch. The built-ins
+are unchanged and unregistered: this adds a path, it does not reroute the
+existing ones.
+
+Three things worth knowing before you write `claims`:
+
+- It is asked with the model **root**, not a `transformer/` subdir —
+  most new checkpoints are not published diffusers-shaped, which is the
+  case this extension point exists for.
+- It runs for every family on every resolve, so it must be **cheap** and
+  **sure**. Claiming a checkpoint that is not yours loads at full cost
+  and computes nonsense.
+- A throwing probe is skipped and warned, never fatal. That is the
+  registry protecting the host from your bug, not a licence to throw.
+
+Answer `declare_resources` and `declare_holdings` or the planner has a
+hole where your checkpoint is — see `docs/MODEL-MEMORY.md`. And
+`latent_scale` is the one number the stage needs *before* your model
+exists: it infers the output size from a reference latent when the graph
+set neither width nor height, and 0 means "cannot say", which makes it
+fall back to its default size rather than guess your ratio.
 
 ## Extension point 4b — VAE families
 
@@ -675,7 +1068,7 @@ method.
 ## Versioning
 
 - `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the plugin
-  contract version, currently **2**. The host loads a plugin only when the
+  contract version, currently **3**. The host loads a plugin only when the
   plugin's reported value **equals** the host's — strict equality, no
   backward compatibility.
 
@@ -696,6 +1089,18 @@ method.
   a plugin built against the older header passes every check and then calls
   through the wrong slot. That has already happened once, which is why it
   is written down here rather than left to judgement.
+
+  It covers the **structs those interfaces are handed**, too, and that is
+  the half that was missed once: a field was added to `VideoGenRequest`
+  without a bump, which an old plugin would have passed every check and
+  then misread.
+
+  **What does *not* need a bump: a new key in the acceleration bag.**
+  That is the point of `accel-settings.h` — one pointer whose layout does
+  not move, header-only readers compiled into your binary, and a key you
+  were never told about is one you never ask for. If a new tier ever
+  forces a rebuild, something has been put back that should not have
+  been.
 - The `libvpipe` `SOVERSION` guards the underlying C++/ABI. It moves
   independently; a plugin records a dependency on a compatible `libvpipe`.
 - `VpipePluginInfo::schema_version` lets the info struct grow additively.

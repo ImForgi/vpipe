@@ -7,6 +7,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/image-model-registry.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "stages/denoise-progress.h"
 #include "generative-models/generative-model-manager.h"
@@ -67,14 +68,14 @@ const ConfigKey kAttrs[] = {
           "pipeline. OPTIONAL: a model-select source on the model iport "
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
-       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "krea2,flux2,qwen-image-edit,"
        "boogu-image,boogu-image-edit",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
-       "krea2-dit,flux2-dit,qwen-image-edit-dit,mage-flow-dit,"
+       "krea2-dit,flux2-dit,qwen-image-edit-dit,"
        "boogu-image-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
@@ -121,6 +122,75 @@ const ConfigKey kAttrs[] = {
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
           "without NAX matmul2d (matrix-core GPU + kernels). Default "
           "false; env VPIPE_I8_GEMM overrides"},
+  // Sol-Attn. The same five keys generate-video carries, with the same
+  // spellings and the same defaults, because they are one vocabulary
+  // (generative-models/shared/accel-settings.h) and a graph moved from
+  // one stage to the other should not have to be re-authored.
+  //
+  // NO BUILT-IN IMAGE DiT IMPLEMENTS IT TODAY, and the doc says so
+  // rather than leaving an operator to infer it from an unchanged step
+  // time. That is not a reason to withhold the key: the bag is how a
+  // REGISTERED family learns what the graph asked for, and without
+  // these an out-of-tree image family cannot be told at all -- which is
+  // exactly the coupling the bag exists to remove. The key being inert
+  // for the five built-ins is a fact about them, not about the
+  // interface, and it stops being true the day one of them takes it
+  // with no change here.
+  {.key = "sol_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): Sol-Attn routes whole key "
+          "blocks during the online softmax, attending the ones a proxy "
+          "score keeps and standing in for the rest with each block's key "
+          "centroid and value sum. Cost falls with the fraction of blocks "
+          "kept, which is a property of the DATA and is reported per run. "
+          "NO BUILT-IN IMAGE FAMILY TAKES IT -- flux2, krea2, "
+          "qwen-image-edit and boogu-image all ignore it, and "
+          "the stage says so once when it is set. It is here for "
+          "REGISTERED families (see generative-models/"
+          "image-model-registry.h), which read it out of the acceleration "
+          "bag. MEASURED IN THE MODEL on an M4 Pro, on the video family "
+          "that does take it (minimax-h3 at 20036 rows): a routed block's "
+          "attention goes 3480 -> 1348 ms (2.58x) keeping 26.1% of key "
+          "blocks. An image DiT's sequence is shorter, so expect less. "
+          "INDEPENDENT OF i8_gemm and of sage_attn and settable with "
+          "either: i8_gemm chooses how the block's GEMMs are computed, "
+          "sage_attn how the kept blocks' QK product is, and this one "
+          "WHICH key blocks are computed at all. Off by default -- it is "
+          "an approximation, and which images it is safe on is a "
+          "judgement about the model, not about the kernel",
+   .def_bool = false},
+  {.key = "sol_tau", .type = ConfigType::Real, .required = false,
+   .doc = "Sol-Attn routing threshold, in STANDARD DEVIATIONS of a query "
+          "block's own proxy-score distribution -- which is what lets one "
+          "number serve every head, layer and resolution where a fixed "
+          "block count would not. HIGHER keeps fewer blocks: quality falls "
+          "and speed rises, monotonically in both. 1.0 is the default "
+          "because a single value has to be the conservative one",
+   .def_real = 1.0},
+  {.key = "sol_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left DENSE, untouched by Sol-Attn. "
+          "The first blocks are where the residual stream is least "
+          "redundant. 0 routes every block",
+   .def_int = 1},
+  {.key = "sol_key_block", .type = ConfigType::Int, .required = false,
+   .doc = "keys summarised by one centroid, and the unit the routing "
+          "decides on. 32 or 64 only; 0 (default) takes 64. THE TWO TRADE "
+          "AGAINST EACH OTHER RATHER THAN ONE DOMINATING, which is why "
+          "both are offered. MEASURED on an M4 Pro at 56 heads x 20036 "
+          "rows against dense steel: 64 keeps 19.1% of key blocks and "
+          "runs 3.54x, 32 keeps 22.9-26.0% and runs 2.79x -- so 32 does "
+          "MORE exact work, is slower, and is also the more accurate of "
+          "the two, because a centroid over 32 keys stands in for them "
+          "better. 64 is the speed choice, 32 the fidelity one. Larger "
+          "blocks were measured and are worse on both counts, so they "
+          "are not offered",
+   .def_int = 0},
+  {.key = "sol_local_radius", .type = ConfigType::Int, .required = false,
+   .doc = "key blocks either side of a query's own block that are always "
+          "exact, never routed. A block centroid is least representative "
+          "exactly where a query discriminates most, so the near diagonal "
+          "is not put to the vote. -1 routes even the query's own block, "
+          "which is an ablation rather than a setting",
+   .def_int = 1},
   // The adapter lives HERE, on the stage that loads the DiT, and not
   // only on the family's config source.
   //
@@ -184,8 +254,6 @@ const ConfigKey kAttrs[] = {
 struct MovedKey { const char* key; const char* to; };
 constexpr MovedKey kMovedKeys[] = {
   {"klein_kv",      "flux2-model-config"},
-  {"no_watermark",  "mage-flow-model-config"},
-  {"watermark_key", "mage-flow-model-config"},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning", .doc = "conditioning tensor from a diffusion-"
@@ -216,8 +284,9 @@ const PortSpec kIports[] = {
   {.name = "model_config",
    .doc = "OPTIONAL model-specific parameters from the resident family's own "
           "config source -- flux2-model-config (the klein-kv recipe and its "
-          "`lora`), krea2-model-config (its `lora`), or mage-flow-model-config "
-          "(the provenance watermark). Passed to that family's own params "
+          "`lora`), or krea2-model-config (its `lora`). An out-of-tree "
+          "family's own config source lands here too. Passed to that "
+          "family's own params "
           "struct UNREAD, so this stage carries none of the knobs. Wiring it "
           "DEFERS the DiT load to the first beat, because a recipe like "
           "klein_kv -- or an adapter, which decides how the blocks are built "
@@ -325,6 +394,65 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _i8_gemm = attr_bool("i8_gemm");
   _sage.enabled      = attr_bool("sage_attn");
   _sage.dense_layers = (int)attr_int("sage_dense_layers");
+  _sol.enabled      = attr_bool("sol_attn");
+  _sol.tau          = (float)attr_real("sol_tau");
+  _sol.dense_layers = (int)attr_int("sol_dense_layers");
+  _sol.local_radius = (int)attr_int("sol_local_radius");
+  // 32 or 64, and 0 means the default. WARN AND FALL BACK rather than
+  // refuse the stage, which is what `unload_when_idle` beside it does
+  // for the same class of key: a perf knob spelled wrong should not take
+  // a graph down. Named in the warning, because silently running a
+  // different block size than was asked for is how a benchmark comes to
+  // report the wrong number.
+  {
+    const std::int64_t kb = attr_int("sol_key_block");
+    if (kb == 0 || kb == 32 || kb == 64) {
+      _sol.key_block = (int)kb;
+    } else {
+      _sol.key_block = 0;
+      // The message distinguishes the two rejects, because they are not
+      // the same fact: 128 and 256 RUN and are simply worse on both
+      // speed and accuracy, so declining them is a policy; anything not
+      // a multiple of the steel kernel's 16-key block cannot run at all.
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): sol_key_block {} is not 32 or 64; "
+          "using 64. {}", this->id(), (long long)kb,
+          kb > 64
+              ? "Larger blocks were measured and are slower AND less "
+                "accurate, so they are not offered"
+              : "The routing block is also the unit the exact half walks, "
+                "so it cannot be smaller than 32"));
+    }
+  }
+  // THE BAG, and the typed members are read BACK OUT OF IT, exactly as
+  // generate-video does it. The in-tree DiTs take a typed Config -- they
+  // are compiled with this stage and have no ABI to protect -- and a
+  // registered family gets the bag itself; those are two readings of one
+  // config, and the failure if they drift is a family running at
+  // settings the log line did not describe.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm, _i8_gemm);
+  genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
+  genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
+                            _sage.dense_layers);
+  // Written whether the tier is on or off, and with the SETTLED value:
+  // `sol_key_block` here is what the check above fell back to, not what
+  // the graph said, so no family has to repeat that validation or can
+  // reach a different answer than the log line did.
+  genai::accel::set_flag(&_accel, genai::accel::kSolAttn, _sol.enabled);
+  genai::accel::set_real(&_accel, genai::accel::kSolTau, (double)_sol.tau);
+  genai::accel::set_integer(&_accel, genai::accel::kSolKeyBlock,
+                            _sol.key_block);
+  genai::accel::set_integer(&_accel, genai::accel::kSolDenseLayers,
+                            _sol.dense_layers);
+  genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
+                            _sol.local_radius);
+  // ...and back out, which is the half that makes it one decision. If a
+  // key is ever written under one name and read under another, this is
+  // where it stops being true rather than three plugins away.
+  _sage    = genai::sage::config_from_flex(&_accel);
+  _sol     = genai::sol::config_from_flex(&_accel);
+  _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
   _lora[0].path  = attr_str("lora");
   _lora[0].scale = attr_real("lora_scale");
   _lora[1].path  = attr_str("lora2");
@@ -402,13 +530,35 @@ namespace {
 // applied when it produced ref_latent0 for this family:
 //   krea2 / qwen-image-edit   [16, H/8,  W/8 ]   -> 8
 //   boogu-image               [16, H/8,  W/8 ]   -> 8
-//   flux2 / mage-flow         [C,  H/16, W/16]   -> 16
+//   flux2                     [C,  H/16, W/16]   -> 16
 // (FLUX.2's VAE is 8x but vae-encode emits its 2x2-packed DiT latent, so the
 // pixels-per-cell figure is 16 there too.)
+// A checkpoint this stage RECOGNISES and no longer implements. Returns
+// the plugin that does, or empty when the root is not one of these.
+//
+// It exists so that removing a family from the tree costs a message
+// rather than a wrong model: `t2i_family_` falls through to "krea2", so
+// without this a Mage-Flow root would load the Krea-2 path at full cost
+// and denoise a 4B checkpoint through a 12B config.
+std::string
+unclaimed_family_(const std::string& transformer_dir)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(transformer_dir) / "config.json");
+  if (!in) { return {}; }
+  FlexData fd = FlexData::from_json(in);
+  if (!fd.is_object()) { return {}; }
+  auto obj = fd.as_object();
+  if (!obj.contains("_class_name")) { return {}; }
+  const std::string cls(obj.at("_class_name").as_string(""));
+  if (cls == "MageFlow") { return "vpipe-mage-flow"; }
+  return {};
+}
+
 int
 latent_scale_(const std::string& family)
 {
-  return (family == "flux2" || family == "mage-flow") ? 16 : 8;
+  return family == "flux2" ? 16 : 8;
 }
 
 // FLUX.2 empirical flow-shift mu (diffusers Flux2Pipeline.compute_empirical_mu):
@@ -433,6 +583,13 @@ flux2_empirical_mu_(int image_seq_len, int num_steps)
 // The transformer family from <root>/transformer/config.json `_class_name`:
 // "Flux2Transformer2DModel" -> "flux2"; "QwenImageTransformer2DModel" ->
 // "qwen-image-edit"; else "krea2".
+//
+// "MageFlow" is deliberately ABSENT and is handled by the registry
+// instead: that family moved out of this tree into the vpipe-mage-flow
+// plugin. It still has to be RECOGNISED, though -- see
+// unclaimed_family_() -- because the fall-through here is "krea2", and
+// silently loading a 12B Krea-2 config over a 4B Mage-Flow checkpoint
+// is the worst failure this stage has.
 std::string
 t2i_family_(const std::string& transformer_dir)
 {
@@ -446,7 +603,6 @@ t2i_family_(const std::string& transformer_dir)
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
-        if (cls == "MageFlow") { return "mage-flow"; }
         if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
       }
     }
@@ -563,28 +719,6 @@ qwen_decode_peak_(int w, int h, int base)
   return im2col + im2col / 2;
 }
 
-// Mage-Flow's static flow-matching shift from <root>/scheduler/
-// scheduler_config.json (FlowMatchEulerDiscreteScheduler, shift 6.0,
-// use_dynamic_shifting false). 6.0 when unreadable -- the published value and
-// the reference's own fallback (pipeline.py _get_scheduler).
-double
-mage_static_shift_(const std::string& root)
-{
-  namespace fs = std::filesystem;
-  std::ifstream in(fs::path(root) / "scheduler" / "scheduler_config.json");
-  if (in) {
-    FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto o = fd.as_object();
-      if (o.contains("shift")) {
-        const double s = o.at("shift").as_real(6.0);
-        if (s > 0.0) { return s; }
-      }
-    }
-  }
-  return 6.0;
-}
-
 // The Krea-2 VAE (WanVAE-style, shared with Qwen-Image-Edit) sizes its conv
 // stack from `base_dim`, not diffusers' block_out_channels. Read it for the
 // decode-peak estimate; fall back to the checkpoint default (96).
@@ -618,7 +752,7 @@ GenerateImageStage::reset_run_state()
   // weights are still held we deliberately leave the guard set --
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
-  if (!_dit && !_flux2_dit && !_qie_dit && !_mage_dit && !_boogu_dit) {
+  if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
   }
@@ -681,7 +815,28 @@ GenerateImageStage::declare_memory() const
   // lifetimes, and collapsing them to one number loses the distinction
   // the plan exists to make. Naming them is also what keeps a second
   // generate-image over the same model from being billed twice.
-  m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor_bytes_(dit));
+  // A REGISTERED FAMILY ANSWERS FOR ITSELF here too, and for the same
+  // reason: `dit` below is a diffusers path a plugin's checkpoint need
+  // not have. Its holdings replace the DiT's, never the encoder's --
+  // the text encoder is the conditioner's, and it is resident beside
+  // whichever DiT this is.
+  bool held_by_family = false;
+  if (genai::ImageModelFamily* fam =
+          genai::ImageModelRegistry::get().claim_for(
+              session(), root, resolve_model(session(), _hf_dir).model_type)) {
+    // `releases` / `reclaimable` are the STAGE's to say, not the
+    // family's: whether idle weights are dropped is this stage's
+    // policy. It has none -- it holds for the run -- so both stay
+    // false, and a family that set them is overruled rather than
+    // believed.
+    for (const auto& h : fam->declare_holdings(root)) {
+      m.hold(h.source, h.preload, h.floor);
+    }
+    held_by_family = true;
+  }
+  if (!held_by_family) {
+    m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor_bytes_(dit));
+  }
   m.hold(enc, model_memory::dir_weights_bytes(enc));
   // No unload policy on this stage: it holds both for the run. Freeing
   // the DiT for a decode that would not otherwise fit
@@ -713,6 +868,20 @@ GenerateImageStage::declare_resources() const
   // "everything streamable at its floor" reads the same as "everything
   // preloaded", and a 17 GB checkpoint that runs on a couple of blocks
   // is weighed as 17 GB against the box.
+  // A REGISTERED FAMILY DECLARES ITS OWN, because the built-in shape
+  // below assumes a diffusers `transformer/` subdir and a plugin's
+  // checkpoint commonly has no such thing. Empty means the family
+  // declined, and a hole in this ledger reads as room that is not
+  // there -- so the encoder claim is still added either way.
+  if (genai::ImageModelFamily* fam =
+          genai::ImageModelRegistry::get().claim_for(
+              session(), root, resolve_model(session(), _hf_dir).model_type)) {
+    std::vector<ResourceClaim> pout = fam->declare_resources(root);
+    for (auto& c : model_memory::weight_claims({enc})) {
+      pout.push_back(std::move(c));
+    }
+    return pout;
+  }
   const std::string dit = (fs::path(root) / "transformer").string();
   std::vector<ResourceClaim> out{
       model_memory::weight_claim_streamable(dit, dit_floor_bytes_(dit))};
@@ -825,8 +994,6 @@ GenerateImageStage::apply_model_config_()
         _flux2_dit->set_lora_scale(i, s);
       }
     });
-  } else if (_family == "mage-flow") {
-    _wm_params = genai::mage_wm::Params::from_flex(_model_cfg, &perr);
   } else if (_family == "krea2") {
     adapter_keys("Krea-2", _dit != nullptr, [&](int i, float s) {
       if (_dit && _dit->lora_modules(i) > 0) {
@@ -898,11 +1065,124 @@ GenerateImageStage::ensure_loaded_()
   const std::string dit_dir = _dit_dir.empty()
       ? (fs::path(root) / "transformer").string()
       : resolve_model_dir(session(), _dit_dir);
-  _family = t2i_family_(dit_dir);
+  // AN OUT-OF-TREE FAMILY FIRST, and if one claims this checkpoint it
+  // is the whole of the dispatch: `_family` becomes its tag and every
+  // built-in DiT member below stays null. Asked with `root` rather than
+  // `dit_dir` because a family's `claims` looks at the checkpoint the
+  // way it is published, which for most new models is not a diffusers
+  // `transformer/` subdir at all.
+  _plugin_family = genai::ImageModelRegistry::get().claim_for(
+      session(), root, resolve_model(session(), _hf_dir).model_type);
+  // A graph that named a `dit_dir` may have pointed `hf_dir` at a
+  // directory holding only the encoder and the VAE -- which is what
+  // happens when a quantized DiT is written beside a checkpoint rather
+  // than into it. Ask again with the DiT the graph actually named.
+  //
+  // Second, not first: the root is the model's identity, and a family
+  // must not be able to claim a run on the strength of a weights
+  // directory when another family already claimed the checkpoint.
+  if (_plugin_family == nullptr && !_dit_dir.empty()) {
+    _plugin_family = genai::ImageModelRegistry::get().claim_for(
+        session(), dit_dir, resolve_model(session(), _hf_dir).model_type);
+  }
+  // A CHECKPOINT THIS STAGE RECOGNISES AND NO LONGER IMPLEMENTS. Checked
+  // only once the registry has declined it, so a loaded plugin never
+  // sees this -- and refused rather than warned, because the fall-through
+  // below is "krea2": without it a Mage-Flow root would load a 12B
+  // Krea-2 config over a 4B checkpoint, spend minutes and emit noise.
+  if (_plugin_family == nullptr) {
+    const std::string plug = unclaimed_family_(dit_dir);
+    if (!plug.empty()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): '{}' is a {} checkpoint, whose family "
+          "is no longer built in -- load the {} plugin (vpipe --plugin "
+          "<path>) and re-run. The stage is inert rather than guessing a "
+          "family, because the guess would be a different model at full "
+          "cost", this->id(), root, "Mage-Flow", plug));
+      return;
+    }
+  }
+  _family = _plugin_family != nullptr ? std::string(_plugin_family->tag())
+                                      : t2i_family_(dit_dir);
+  // NO CONFIG AND NO CLAIM: `_family` above is the fall-through, not a
+  // reading. Say so, because the alternative is a log line that names
+  // "krea2" with the same confidence it would have had from a config --
+  // and the load that follows fails on missing tensors several seconds
+  // later, describing a family nobody chose.
+  //
+  // A WARNING rather than a refusal, deliberately: a fused or
+  // hand-assembled DiT directory with no config.json is a supported
+  // thing to point `dit_dir` at, and turning that into an error would
+  // break a working path to improve a message. The families that are
+  // recognised-but-absent are refused above; this is the residue.
+  if (_plugin_family == nullptr) {
+    std::error_code cec;
+    if (!fs::exists(fs::path(dit_dir) / "config.json", cec)) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): '{}' has no transformer config and no "
+          "registered family claimed it, so the family was GUESSED as "
+          "'{}'. If this is a single-file or ComfyUI-packed checkpoint, "
+          "the family that reads it is a plugin that is not loaded",
+          this->id(), dit_dir, _family));
+    }
+  }
   // The family is only now known, so this is the first moment a config
   // beat that already arrived can be parsed by anything -- and it has to
   // happen BEFORE the load below, since klein_kv is an argument to it.
   apply_model_config_();
+  if (_plugin_family != nullptr) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): loading the '{}' DiT from '{}' (an "
+        "out-of-tree family)", this->id(), _family, root));
+    genai::ImageModelCreateArgs args;
+    args.root       = root;
+    args.model_type = resolve_model(session(), _hf_dir).model_type;
+    // The DiT the graph NAMED, if it named one. Passed only when the
+    // config actually set it: `dit_dir` defaults to <root>/transformer,
+    // and handing a family that default would tell it the graph made a
+    // choice it did not make -- on a checkpoint published as a single
+    // file there is no transformer/ at all.
+    //
+    // Without this a registered family could not be pointed at a
+    // quantized DiT beside its checkpoint, which every built-in family
+    // has always been able to do.
+    if (!_dit_dir.empty()) { args.dit_dir = dit_dir; }
+    args.metal      = session()->services()->metal_compute();
+    args.session    = session();
+    // The stage's own residency verdict, so a family need not re-derive
+    // it. It is free to disagree -- it knows its own sizes -- but it
+    // should say so.
+    args.prefer_streaming =
+        model_memory::plan_streaming(session(), dit_dir, enc_dir,
+                                     model_memory::kStreamHeadroom).stream;
+    args.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    args.accel        = &_accel;
+    // The picture the graph intends to make, through the family's own
+    // grid: a load-time decision that scales with the beat wants the
+    // right order of magnitude rather than none.
+    {
+      int gh = 16, gw = 16;
+      _plugin_family->size_grid(root, &gh, &gw);
+      auto up = [](int v, int g) { return g > 0 ? ((v + g - 1) / g) * g : v; };
+      args.width  = up(_width, gw);
+      args.height = up(_height, gh);
+    }
+    _plugin_gen = _plugin_family->load(args);
+    if (!_plugin_gen) {
+      // The family warned through args.session; saying it twice adds
+      // nothing, but the stage has to record that it is inert.
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the '{}' family did not load; this "
+          "stage is inert", this->id(), _family));
+    } else {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): '{}' ready -- latent {} channels at "
+          "1/{} spatial", this->id(), _family,
+          _plugin_gen->latent_channels(),
+          _plugin_gen->spatial_compression()));
+    }
+    return;
+  }
   const std::string size_desc =
       _infer_size ? std::string("auto (from ref_latent0)")
                   : std::to_string(_width) + "x" + std::to_string(_height);
@@ -915,7 +1195,6 @@ GenerateImageStage::ensure_loaded_()
       "GenerateImageStage('{}'): loading {} DiT from '{}'", this->id(),
       _family == "flux2" ? "FLUX.2"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
-      : _family == "mage-flow" ? "Mage-Flow NR-MMDiT"
       : _family == "boogu-image" ? "Boogu-Image NextDiT"
       : "Krea2 MMDiT", dit_dir));
   if (_family == "flux2") {
@@ -1085,47 +1364,7 @@ GenerateImageStage::ensure_loaded_()
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
-  } else if (_family == "mage-flow") {
-    // Mage-Flow's 4B NR-MMDiT is MetalQwenImageTransformer under a different
-    // Config (12 dual-stream blocks, in_channels 128 @ patch_size 1, txt_dim
-    // 2560, text stream unrotated, bf16 timestep frequencies) -- see
-    // mage_flow_dit_config(). At ~8 GB bf16 it streams on a box that can't
-    // hold it beside the resident Qwen3-VL encoder, same rule as the others.
-    const auto plan = model_memory::plan_streaming(
-        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
-    bool   stream_blocks = plan.stream;
-    if (const char* e = std::getenv("VPIPE_MAGE_STREAM")) {
-      stream_blocks = (std::atoi(e) != 0);
-    }
-    session()->log_debug(fmt(
-        "GenerateImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) "
-        "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
-        plan.footprint >> 30, plan.others >> 30,
-        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
-    auto mcfg = genai::mage_flow_dit_config();
-    _mage_dit = genai::MetalMageFlowTransformer::load(
-        weight_set_(dit_dir), mc, mcfg, stream_blocks);
-    if (!_mage_dit) {
-      session()->error(fmt(
-          "GenerateImageStage('{}'): failed to load the Mage-Flow DiT from '{}'; "
-          "inert", this->id(), dit_dir));
-      return;
-    }
-    if (stream_blocks) {
-      // No prefix any more: the pinned-prefix policy was a fraction of
-      // TOTAL RAM decided before the run and blind to the machine, and
-      // the measured resident set (shared/block-residency.h) replaced
-      // it. Growth fills the stack from here as the box allows.
-      session()->info(fmt(
-          "GenerateImageStage('{}'): Mage-Flow DiT streaming {} blocks; the "
-          "resident set grows as the box allows", this->id(),
-          mcfg.n_layers));
-    }
-    _release_scratch = stream_blocks;
-    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
-    _mage_shift = mage_static_shift_(root);
-  } else {
+    } else {
     // Stream the 28 transformer blocks when the box cannot hold the DiT
     // beside the conditioner's encoder -- the same rule the other four
     // image families take, from the same plan_streaming(), rather than a
@@ -1193,6 +1432,27 @@ GenerateImageStage::ensure_loaded_()
         model_memory::weight_footprint(session(), peers) >> 30,
         model_memory::kHeadroom >> 30, phys_ram() >> 30,
         _release_scratch ? "RELEASE" : "keep"));
+  }
+  // A TIER ASKED FOR THAT WILL NOT HAPPEN, said once, here -- where the
+  // family is finally known and before a minute of denoising.
+  //
+  // This is the failure mode the acceleration bag has and the reason it
+  // is worth a line: a tier is a key in an untyped object, so asking a
+  // family for one it does not implement is not a type error, not a load
+  // error and not visible in the picture. It is a run that is slower
+  // than the operator believes it is. Only sol_attn is named because it
+  // is the only one none of the built-ins takes; i8_gemm and sage_attn
+  // report their own non-engagement from inside the models that do.
+  //
+  // Reached only on the BUILT-IN path -- the registered-family branch
+  // returns above -- so a plugin that implements Sol is never told its
+  // own tier is inert.
+  if (_sol.enabled) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): sol_attn is set and the built-in '{}' "
+        "denoiser does not implement it, so the attention runs dense. It "
+        "reaches a REGISTERED image family through the acceleration bag; "
+        "no built-in image DiT takes it yet", this->id(), _family));
   }
   session()->log_debug(fmt(
       "GenerateImageStage('{}'): {} DiT ready{}",
@@ -2675,213 +2935,6 @@ GenerateImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   return unpack(packed);
 }
 
-std::vector<float>
-GenerateImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
-                                 int n_real,
-                                 const metal_compute::SharedBuffer& txt_neg,
-                                 int n_real_neg, int gen_h, int gen_w,
-                                 const std::vector<float>* init_packed,
-                                 const std::vector<RefLatent>& refs,
-                                 const std::function<void(
-                                     const std::vector<float>&)>& emit_step)
-    const
-{
-  auto* mc = session()->services()->metal_compute();
-  using metal_compute::SharedBuffer;
-  const int IC = _mage_dit->config().in_channels;   // 128
-  // MageVAE downsamples 16x and the DiT patch_size is 1, so the latent grid IS
-  // the token grid -- there is no 2x2 pack/unpack anywhere on this path (the
-  // reason the Qwen-Image transformer could be reused verbatim is that the
-  // packing lived in the caller, not the DiT).
-  const int gh = gen_h / 16, gw = gen_w / 16;
-  const int img_seq = gh * gw;
-  if (img_seq <= 0) { return {}; }
-
-  session()->log_debug(fmt(
-      "GenerateImageStage('{}'): Mage-Flow conditioning [{} rows]; {}x{} grid "
-      "{}x{} img_seq {}", this->id(), n_real, gen_w, gen_h, gh, gw, img_seq));
-
-  const bool cfg = !txt_neg.empty() && n_real_neg > 0 && _guidance_scale != 1.0;
-
-  // Sampler: FlowMatchEuler over linspace(1, 1/S, S) with the checkpoint's
-  // STATIC shift (scheduler_config.json shift 6.0, use_dynamic_shifting
-  // false). vpipe's "linear" time-shift IS the diffusers static-shift curve
-  // mu*s/(1 + (mu-1)*s), so shift_type must be "linear" here, NOT the
-  // exponential default. Turbo is 4 steps at cfg 1.0 (no negative branch).
-  // An operator-supplied scheduler beat still wins.
-  genai::FlowSchedulerSpec sched = _scheduler_spec;
-  if (!_scheduler_latched) {
-    sched.dynamic_shift = false;
-    sched.type          = "simple";
-    sched.shift         = _mage_shift;
-    sched.shift_type    = "linear";
-  }
-  genai::FlowSampler sampler(_sampler_spec, sched);
-  const int S = sampler.steps();
-
-  // Packed target latents [img_seq, IC]: a supplied init (repro / golden),
-  // else Gaussian-Shading WATERMARKED noise (the reference's encode_noise),
-  // else plain noise when the watermark is disabled. The watermark forces each
-  // entry into a key-chosen half-plane and randomizes the magnitude within it,
-  // so the sample is still exactly ~N(0,1) -- no quality cost -- and a
-  // detector that inverts the flow ODE back to the noise can read the signs.
-  std::vector<float> packed((std::size_t)img_seq * IC);
-  if (init_packed != nullptr && init_packed->size() == packed.size()) {
-    packed = *init_packed;   // pinned noise: never watermarked (repro/golden)
-  } else if (_wm_params.enabled) {
-    // encode_noise lays the mark out CHANNEL-first (the order the detector
-    // reshapes into) and returns it token-major, which is what the DiT wants.
-    packed = genai::mage_wm::encode_noise(
-        IC, gh, gw, genai::mage_wm::resolve_key(_wm_params.key), _seed);
-    if (packed.size() != (std::size_t)img_seq * IC) {
-      session()->warn(fmt(
-          "GenerateImageStage('{}'): watermark noise generation failed; falling "
-          "back to plain noise (NO provenance mark)", this->id()));
-      packed.assign((std::size_t)img_seq * IC, 0.0f);
-      std::mt19937_64 rng(_seed);
-      std::normal_distribution<float> nd(0.0f, 1.0f);
-      for (auto& v : packed) { v = nd(rng); }
-    }
-  } else {
-    session()->log_debug(fmt(
-        "GenerateImageStage('{}'): watermark DISABLED -- this image carries no "
-        "provenance mark", this->id()));
-    std::mt19937_64 rng(_seed);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (auto& v : packed) { v = nd(rng); }
-  }
-  SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
-  if (latbuf.empty()) { return {}; }
-
-  // Reference conditioning: each MageVAE reference latent arrives channel-first
-  // [128, rh, rw]; transpose to token-major [rh*rw, 128] bf16 so the DiT embeds
-  // it via img_in in its own RoPE frame band (frame = index + 1). References
-  // stay CLEAN (never noised) and the sampler steps only the target tokens.
-  std::vector<genai::MetalMageFlowTransformer::RefImage> ri;
-  for (const auto& r : refs) {
-    if (r.empty()) { continue; }
-    if (r.c != IC || r.h <= 0 || r.w <= 0) {
-      session()->warn(fmt(
-          "GenerateImageStage('{}'): reference latent [{}, {}, {}] must be "
-          "{}-channel; ignoring", this->id(), r.c, r.h, r.w, IC));
-      continue;
-    }
-    // scale_rope centers each segment's h/w positions at 0, so a reference
-    // grid smaller than the target's covers only a centered sub-region (the
-    // same trap the Qwen-Image-Edit path warns about).
-    if (r.h != gh || r.w != gw) {
-      session()->warn(fmt(
-          "GenerateImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
-          "the centered reference will cover only part of the output. Encode "
-          "the reference at the output resolution (set the vae-encode target "
-          "to {}x{}).", this->id(), r.w, r.h, gw, gh, gen_w, gen_h));
-    }
-    const int rseq = r.h * r.w;
-    SharedBuffer rb = mc->make_shared_buffer((std::size_t)rseq * IC * 2);
-    if (rb.empty()) { continue; }
-    auto* d = static_cast<std::uint16_t*>(rb.contents());
-    for (int cc = 0; cc < IC; ++cc) {
-      for (int t = 0; t < rseq; ++t) {
-        d[(std::size_t)t * IC + cc] =
-            f32_to_bf16_(r.chw[(std::size_t)cc * rseq + t]);
-      }
-    }
-    genai::MetalMageFlowTransformer::RefImage img;
-    img.latents = std::move(rb);
-    img.seq = rseq; img.grid_h = r.h; img.grid_w = r.w;
-    ri.push_back(std::move(img));
-  }
-  if (!ri.empty()) {
-    session()->info(fmt(
-        "GenerateImageStage('{}'): Mage-Flow edit conditioning on {} reference "
-        "image(s)", this->id(), ri.size()));
-  }
-
-  bool dit_ok = true;
-  const float gscale = (float)_guidance_scale;
-  // Opened before the denoise callable so the per-block hook is
-  // live for the very first forward.
-  UiProgress bar = session()->open_progress("denoise");
-  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
-  ScopedBlockProgress<std::remove_reference_t<decltype(*_mage_dit)>>
-      prog_guard(_mage_dit.get(), prog);
-  auto denoise = [&](const std::vector<float>& cand,
-                     double sigma) -> std::vector<float> {
-    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
-    for (std::size_t k = 0; k < cand.size(); ++k) {
-      lb[k] = f32_to_bf16_(cand[k]);
-    }
-    SharedBuffer vel = _mage_dit->forward(latbuf, img_seq, txt_pos, n_real, gh,
-                                          gw, (float)sigma, ri);
-    prog.end_forward();
-    if (vel.empty()) { dit_ok = false; return {}; }
-    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
-    std::vector<float> v(cand.size());
-    for (std::size_t k = 0; k < v.size(); ++k) { v[k] = bf16_to_f32_(vp[k]); }
-    if (cfg) {
-      SharedBuffer veln = _mage_dit->forward(latbuf, img_seq, txt_neg,
-                                             n_real_neg, gh, gw, (float)sigma,
-                                             ri);
-      prog.end_forward();
-      if (veln.empty()) { dit_ok = false; return {}; }
-      const auto* np = static_cast<const std::uint16_t*>(veln.contents());
-      // Plain CFG: unc + scale*(cond - unc). The reference's CFG-renorm
-      // (pipeline.py `renormalization`) defaults OFF -- unlike Qwen-Image-Edit,
-      // whose path always norm-preserves.
-      for (std::size_t k = 0; k < v.size(); ++k) {
-        const float vneg = bf16_to_f32_(np[k]);
-        v[k] = vneg + gscale * (v[k] - vneg);
-      }
-    }
-    return v;
-  };
-
-  const bool prof = std::getenv("VPIPE_MAGE_PROFILE") != nullptr;
-  double dit_ms = 0.0;
-  int dit_calls = 0;
-  auto denoise_p = [&](const std::vector<float>& cand, double sigma) {
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> v = denoise(cand, sigma);
-    dit_ms += std::chrono::duration<double, std::milli>(
-                  std::chrono::steady_clock::now() - t0).count();
-    ++dit_calls;
-    return v;
-  };
-  // [img_seq, IC] token-major -> [IC, gh, gw] channel-first: a transpose, with
-  // no patch to undo.
-  auto unpack = [&](const std::vector<float>& pk) {
-    std::vector<float> latent((std::size_t)IC * img_seq);
-    for (int c = 0; c < IC; ++c) {
-      for (int t = 0; t < img_seq; ++t) {
-        latent[(std::size_t)c * img_seq + t] = pk[(std::size_t)t * IC + c];
-      }
-    }
-    return latent;
-  };
-  const auto gen_t0 = std::chrono::steady_clock::now();
-  for (int i = 0; i < S; ++i) {
-    sampler.step(i, packed,
-                 prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
-    if (!dit_ok) { return {}; }
-    if (emit_step) { emit_step(unpack(packed)); }
-    prog.end_step(i);
-  }
-  const double gen_s = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - gen_t0).count();
-  session()->info(fmt(
-      "GenerateImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
-      "{} ms/step)", this->id(), gen_s, S,
-      S ? (long)(gen_s * 1000.0 / S) : 0));
-  if (prof) {
-    session()->log_normal(fmt(
-        "GenerateImageStage('{}'): Mage-Flow DiT {} forward calls, {} ms total, "
-        "{} ms/call (txt {} + img {} = {})", this->id(), dit_calls,
-        (long)dit_ms, dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real,
-        img_seq, n_real + img_seq));
-  }
-  return unpack(packed);
-}
-
 
 void
 GenerateImageStage::tag_model_(TensorBeat& tb) const
@@ -2985,9 +3038,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "prompt", this->id()));
     if (load_boogu_dit_()) { _dit_unloaded = false; }
   }
-  const bool have_dit = _family == "flux2" ? (bool)_flux2_dit
+  const bool have_dit = _plugin_family != nullptr ? (bool)_plugin_gen
+      : _family == "flux2" ? (bool)_flux2_dit
       : _family == "qwen-image-edit" ? (bool)_qie_dit
-      : _family == "mage-flow" ? (bool)_mage_dit
       : _family == "boogu-image" ? (bool)_boogu_dit
       : (bool)_dit;
   if (!have_dit) {
@@ -3181,6 +3234,11 @@ GenerateImageStage::process(RuntimeContext& ctx)
     _sampler_latched = true;
     const auto* sfd = dynamic_cast<const FlexDataPayload*>(sb.get());
     if (sfd != nullptr) {
+      // KEPT UNPARSED as well as parsed: the built-ins take the typed
+      // spec, and a registered family reads what it understands out of
+      // the beat itself -- an integrator this tree does not implement is
+      // still a thing a plugin may.
+      _sampler_raw = sfd->data;
       std::string serr;
       _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
       if (!serr.empty()) {
@@ -3198,6 +3256,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     _scheduler_latched = true;
     const auto* cfd = dynamic_cast<const FlexDataPayload*>(cb.get());
     if (cfd != nullptr) {
+      _scheduler_raw = cfd->data;
       std::string cerr;
       _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
       if (!cerr.empty()) {
@@ -3243,6 +3302,188 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // whole (multi-second at high res) step. Set around each generate_ call and
   // cleared after -- the callback captures ctx, valid only for this process().
   auto stopping = [&ctx]() { return ctx.stop_requested(); };
+
+  // ---- AN OUT-OF-TREE FAMILY -----------------------------------------
+  //
+  // First, and instead of everything below when one claimed this
+  // checkpoint. The family owns its whole denoise -- scheduler,
+  // guidance, patchify, residency -- and returns the latent this stage
+  // publishes. What it gets is what the built-ins get: the conditioning
+  // as it ARRIVED (not the uploaded copy: the family owns its own
+  // dtype and its own upload), the geometry the stage settled, the
+  // reference latents, the two specs unparsed, and the acceleration bag.
+  if (_plugin_gen) {
+    genai::ImageGenRequest req;
+    req.height = gen_h;
+    req.width  = gen_w;
+    req.steps  = _scheduler_spec.steps;
+    req.seed   = _seed + (std::uint64_t)_latents_emitted;
+    req.guidance_scale = _guidance_scale;
+    // MATERIALIZED, because a beat may be strided or offset and a
+    // family reads a contiguous block. Held in a local for the call,
+    // which is exactly the lifetime the request documents.
+    const auto cond_bytes = ctb->materialize_contiguous();
+    req.cond      = cond_bytes.data();
+    req.cond_rows = n_real;
+    req.cond_dim  = ctb->shape.size() > 1 ? (int)ctb->shape.back() : 0;
+    req.cond_elem_size = ctb->dtype == TensorBeat::DType::F32 ? 4 : 2;
+    req.cond_is_bf16   = ctb->dtype == TensorBeat::DType::Bf16;
+    req.cond_sideband  = ctb->sideband.is_object() ? &ctb->sideband : nullptr;
+    if (!_ref[0].empty()) {
+      req.ref_latent0 = _ref[0].chw.data();
+      req.ref0_shape  = {_ref[0].c, _ref[0].h, _ref[0].w};
+    }
+    if (!_ref[1].empty()) {
+      req.ref_latent1 = _ref[1].chw.data();
+      req.ref1_shape  = {_ref[1].c, _ref[1].h, _ref[1].w};
+    }
+    req.model_config   = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    req.sampler_spec   = _sampler_raw.is_object() ? &_sampler_raw : nullptr;
+    req.scheduler_spec = _scheduler_raw.is_object() ? &_scheduler_raw : nullptr;
+    req.accel          = &_accel;
+    // Cancellation and the two progress granularities. A family that
+    // never calls these cannot be interrupted and reports nothing, which
+    // on a 12B DiT is a Stop that takes minutes and a bar that never
+    // moves.
+    UiProgress bar = session()->open_progress("denoise");
+    DenoiseProgress prog(&bar, req.steps, /*forwards_per_step=*/1);
+    auto block_fn = prog.block_fn();
+    // A plugin drives its own loop and has no command buffer to hang the
+    // publish on, so the two phases collapse into one call -- staging and
+    // publishing at the same instant cannot go stale between them.
+    req.block_progress = [&block_fn, &ctx](int done, int total) {
+      if (auto publish = block_fn(done, total)) { publish(); }
+      return !ctx.stop_requested();
+    };
+    // `total` is the count the family's SCHEDULER settled on, not the
+    // configured steps; adopting it is what makes the bar finish at
+    // 100%. `step` is 1-based on entry, end_step takes the 0-based index
+    // it just finished.
+    req.progress = [&prog, &ctx](int step, int total) {
+      prog.set_steps(total);
+      prog.end_step(step - 1);
+      return !ctx.stop_requested();
+    };
+    // Each step's latent, LIVE on oport1, when anything is listening.
+    // The family calls it or does not; a step-latent nobody consumes
+    // costs an empty std::function.
+    if (want_steps) {
+      req.step_latent = [&](int, int, const float* lat,
+                            const std::vector<int>& shp) {
+        if (lat == nullptr || shp.empty()) { return; }
+        std::vector<std::int64_t> s64(shp.begin(), shp.end());
+        std::size_t n = 1;
+        for (int d : shp) { n *= (std::size_t)(d > 0 ? d : 0); }
+        if (n == 0) { return; }
+        auto fn = step_emitter(std::move(s64));
+        if (fn) { fn(std::vector<float>(lat, lat + n)); }
+      };
+    }
+    // ALWAYS INSTALLED, even though nothing is named yet. A family that
+    // had to guard every lookup would eventually forget one, and calling
+    // an empty std::function throws -- which on this path is a family
+    // taking the host down for asking a question the answer to is "no".
+    req.input = [](std::string_view, genai::NamedTensor*) { return false; };
+    genai::ImageGenResult res;
+    bool ok = false;
+    try {
+      ok = _plugin_gen->generate(req, &res);
+    } catch (const std::exception& e) {
+      // A family that lets an exception out would otherwise take the
+      // host down. The contract says never to, and this is what makes
+      // breaking it a dropped beat instead.
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the '{}' family threw: {}; dropping "
+          "beat", this->id(), _family, e.what()));
+      co_return;
+    } catch (...) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the '{}' family threw a non-standard "
+          "exception; dropping beat", this->id(), _family));
+      co_return;
+    }
+    if (!ok || res.latent.empty() || res.shape.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): '{}' generation {}; dropping beat",
+          this->id(), _family,
+          ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    // THE SHAPE THE FAMILY RETURNED, not the one it predicted at load:
+    // a family that mispredicts its own geometry should produce a
+    // confusing log, not a mislabelled beat.
+    std::size_t want = 1;
+    for (int d : res.shape) { want *= (std::size_t)(d > 0 ? d : 0); }
+    if (want == 0 || want != res.latent.size()) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): '{}' returned {} floats for a shape "
+          "wanting {}; dropping beat", this->id(), _family,
+          res.latent.size(), want));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape.assign(res.shape.begin(), res.shape.end());
+    out->resize_contiguous(res.latent.size());
+    std::memcpy(out->as_f32(), res.latent.data(),
+                res.latent.size() * sizeof(float));
+    // WHAT THE FAMILY WANTED SAID BACK. Merged before the stage's own
+    // provenance so a family cannot overwrite the model name -- what it
+    // is reporting about is downstream of what produced it.
+    if (res.sideband.is_object()) {
+      auto from = res.sideband.as_object();
+      auto to = out->sideband.is_object() ? out->sideband.as_object()
+                                          : (out->sideband =
+                                                 FlexData::make_object(),
+                                             out->sideband.as_object());
+      for (const auto& kv : from) {
+        to.insert_or_assign(kv.first, kv.second);
+      }
+    }
+    tag_model_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): '{}' latent {} floats ({} steps @ {}x{})",
+        this->id(), _family, res.latent.size(), req.steps, gen_w, gen_h));
+    bar.finish();
+    // ROOM FOR THE DECODE, on the same signal the built-in families use
+    // -- and before the write, so the downstream vae-decode sees the
+    // freed room rather than racing it.
+    //
+    // This stage has no `unload_when_idle` key: the built-ins decide it
+    // per generation instead, from whether the decode about to run
+    // would fit beside a resident DiT. The host cannot size a plugin's
+    // decode peak, so what it can offer a family is the QUESTION -- the
+    // box is tight, drop what you can -- and let the family answer with
+    // whatever it is willing to give up. A family with nothing to
+    // release does nothing, which is the default.
+    {
+      const int forced = forced_dit_reclaim_();
+      bool tight = forced > 0;
+      if (forced < 0) {
+        auto* mc2 = session()->services()->metal_compute();
+        if (mc2 != nullptr) {
+          const auto mb = mc2->memory_budget();
+          // The latent that just came back is a floor on what the decode
+          // will touch, not the peak -- but a peak this stage cannot
+          // compute is better approximated by something real than by a
+          // built-in's formula for a different model.
+          const std::size_t hint = res.latent.size() * sizeof(float);
+          tight = mb.recommended != 0 &&
+                  !(mb.fits(hint) && mb.fits_physical(hint));
+        }
+      }
+      if (tight) {
+        session()->info(fmt(
+            "GenerateImageStage('{}'): asking '{}' to release what it can "
+            "before the decode{}", this->id(), _family,
+            forced > 0 ? " -- FORCED by VPIPE_IMAGE_DIT_RECLAIM" : ""));
+        _plugin_gen->release_idle();
+      }
+    }
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
 
   if (_family == "flux2") {
     std::vector<RefLatent> frefs;
@@ -3354,41 +3595,6 @@ GenerateImageStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // ---- Mage-Flow: single last-hidden conditioning + the 12-block NR-MMDiT.
-  // MageVAE is 16x, so the latent grid is H/16 x W/16 (128 channels) and the
-  // reference latents on iport5/iport6 ride along as clean edit-conditioning
-  // segments. -> latent [128, H/16, W/16]. ----
-  if (_family == "mage-flow") {
-    std::vector<RefLatent> mrefs;
-    if (!_ref[0].empty()) { mrefs.push_back(_ref[0]); }
-    if (!_ref[1].empty()) { mrefs.push_back(_ref[1]); }
-    const int mgh = gen_h / 16, mgw = gen_w / 16;
-    const int MC = _mage_dit->config().in_channels;
-    _mage_dit->set_stream_stop(stopping);
-    const std::vector<float> ml =
-        generate_mage_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
-                       init_ptr, mrefs, step_emitter({MC, mgh, mgw}));
-    _mage_dit->set_stream_stop({});
-    if (ml.empty()) {
-      session()->info(fmt(
-          "GenerateImageStage('{}'): Mage-Flow generation {}; dropping beat",
-          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
-      co_return;
-    }
-    auto out = std::make_unique<TensorBeatPayload>();
-    out->dtype = TensorBeat::DType::F32;
-    out->shape = {MC, mgh, mgw};
-    out->resize_contiguous(ml.size());
-    std::memcpy(out->as_f32(), ml.data(), ml.size() * sizeof(float));
-    tag_model_(*out);
-    ++_latents_emitted;
-    session()->info(fmt(
-        "GenerateImageStage('{}'): Mage-Flow latent [{}, {}, {}] ({} steps @ "
-        "{}x{})", this->id(), MC, mgh, mgw, _scheduler_spec.steps, gen_h,
-        gen_w));
-    co_await ctx.write(0, std::move(out));
-    co_return;
-  }
 
   // Krea-2 reference conditioning (Qwen-Image-Edit multi-reference): the ref
   // latents NOT consumed by img2img. strength>0 uses ref0 as the img2img init,

@@ -11,6 +11,7 @@
 #include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
+#include "generative-models/quantize-profile.h"
 #include "generative-models/qwen-image/metal-qwen-image-calibration.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
@@ -136,9 +137,6 @@ dit_class_family_(const std::string& class_name)
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
-  // Mage-Flow's NR-MMDiT is the Qwen-Image dual-stream MMDiT under a different
-  // config (see metal-mage-flow-transformer.h), so it shares that leaf set.
-  if (class_name == "MageFlow") { return "mage-flow"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   // Wan video. Its two A14B experts are separate checkpoints, so each is
   // quantized by pointing src_model at that expert's own directory.
@@ -148,7 +146,17 @@ dit_class_family_(const std::string& class_name)
   // the class name is all there is to go on -- and all there needs to be,
   // since the quant leaf set does not depend on the partition.
   if (class_name == "MiniMaxH3DiTModel") { return "minimax-h3"; }
-  return {};
+  // A REGISTERED family, asked last. The chain above is a closed switch
+  // over the class names this tree implements, so a family published
+  // after it -- or one that left it, as Mage-Flow did -- falls through
+  // and is not recognised as a text-to-image DiT at all.
+  //
+  // Asked LAST so a class name this host owns cannot be taken away by a
+  // plugin, and matched EXACTLY so a family cannot claim a name that is
+  // not its own: quantizing someone else's weights with your leaf set
+  // produces a checkpoint that loads, runs, and generates the wrong
+  // thing. See generative-models/quantize-profile.h.
+  return genai::quant::family_for_class(class_name);
 }
 
 // Resolve the DiT weight dir + family from what the user pointed `src_model`
@@ -462,6 +470,17 @@ resolve_llm_target_(const std::string& src_dir, const std::string& target,
 std::vector<std::string>
 dit_quant_linears_(const std::string& family)
 {
+  // A REGISTERED family's own list, first. It is asked before the
+  // built-ins because a plugin only reaches this function for a family
+  // the chain below has never heard of -- and an EMPTY list from a
+  // profile means "said nothing", not "quantize none", so a family that
+  // registered a profile without one still falls through.
+  {
+    const std::vector<std::string> leaves =
+        genai::quant::strings(genai::quant::find(family),
+                              genai::quant::kQuantLinears);
+    if (!leaves.empty()) { return leaves; }
+  }
   if (family == "flux2") {
     // The big per-block compute Linears only. The embedders (x_embedder K=128
     // -> only 2 groups/row at g64; context_embedder; final proj_out) are left
@@ -471,11 +490,8 @@ dit_quant_linears_(const std::string& family)
             "add_q_proj", "add_k_proj", "add_v_proj", "to_qkv_mlp_proj",
             "linear_in", "linear_out"};
   }
-  if (family == "qwen-image-edit" || family == "mage-flow") {
-    // Dual-stream QwenImageTransformer2DModel -- and Mage-Flow's NR-MMDiT,
-    // whose checkpoint tensor NAMES are identical (that is what let the metal
-    // port reuse the transformer wholesale), so one leaf set covers both.
-    // Mage-Flow simply has no single_transformer_blocks tail.
+  if (family == "qwen-image-edit") {
+    // Dual-stream QwenImageTransformer2DModel.
     // The quantizer matches the LAST
     // dot-component before ".weight", so use those: to_out is "attn.to_out.0"
     // -> "0" (60, unique); both FeedForward up-projs "*_mlp.net.0.proj" ->
@@ -1230,11 +1246,15 @@ ModelQuantizeStage::quantize_dit_component_(
   if (mc == nullptr) { return false; }
 
   const bool is_flux2 = (family == "flux2");
-  const bool is_mage  = (family == "mage-flow");
+  // A REGISTERED family: one whose leaf set and class name came from a
+  // profile rather than from this file. Used below for the two things
+  // the host cannot do for it -- there is no in-tree AWQ collector for a
+  // family it has never seen, and its modulation leaves are its own.
+  const FlexData* qprof = genai::quant::find(family);
   const bool is_boogu = (family == "boogu-image");
   // Mage-Flow shares Qwen-Image's block topology and tensor names, so the
   // modulation handling below applies to it too.
-  const bool is_qie   = (family == "qwen-image-edit") || is_mage;
+  const bool is_qie   = (family == "qwen-image-edit");
   const bool awq = _awq;
 
   // Plain group-affine over the DiT leaf set (no LM arch-detect / embedding
@@ -1294,6 +1314,33 @@ ModelQuantizeStage::quantize_dit_component_(
         "(adaln_proj.linear, 13B of 33B) at 8-bit; body stays {}-bit",
         this->id(), _bits));
   }
+  // A registered family's modulation leaves, from its profile. Same rule
+  // as the built-ins below -- opt-in, and forced to 8 bits whatever the
+  // body runs, because the modulation is what the residual scale rides
+  // on and 4-bit wrecks it.
+  if (_quant_modulation && qprof != nullptr) {
+    const std::vector<std::string> mods =
+        genai::quant::strings(qprof, genai::quant::kModulationLinears);
+    if (mods.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): quant_modulation is set and the '{}' "
+          "family named no modulation leaves, so nothing extra is "
+          "quantized", this->id(), family));
+    }
+    for (const std::string& leaf : mods) {
+      opt.quant_linears.push_back(leaf);
+      opt.high_bit_leaves.push_back(leaf);
+    }
+    if (!mods.empty()) {
+      opt.high_bits = 8;
+      session()->info(fmt(
+          "ModelQuantizeStage('{}'): quantizing the AdaLN modulation ({}) at "
+          "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
+          genai::quant::text(qprof, genai::quant::kModulationLabel,
+                             "the family's modulation leaves"),
+          _bits));
+    }
+  }
   if (_quant_modulation && (is_qie || is_boogu || is_wan)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
@@ -1324,6 +1371,16 @@ ModelQuantizeStage::quantize_dit_component_(
         "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
         is_boogu ? "norm*.linear" : is_wan ? "condition_embedder.time_proj"
                                             : "*_mod.1", _bits));
+  }
+  // A registered family's dense-keeps, appended to whatever the stage
+  // already excludes rather than replacing it. Leaves are short -- the
+  // last dot-component -- so collisions are the norm and this is how a
+  // family keeps a timestep embedder out of a feed-forward's leaf.
+  if (qprof != nullptr) {
+    for (const std::string& e :
+         genai::quant::strings(qprof, genai::quant::kQuantExclude)) {
+      opt.quant_exclude.push_back(e);
+    }
   }
   if (is_boogu) {
     // Keep the precision-sensitive heads out despite their shared leaf names
@@ -1364,15 +1421,18 @@ ModelQuantizeStage::quantize_dit_component_(
     // no calib_dir is supplied. Krea-2 and FLUX.2 use family-specific collectors
     // (different encoder / template / tap groups); the quantizer reads the
     // right calib layout via opt.dit_family.
-    if (is_mage && _calib_dir.empty()) {
-      // The on-device collectors drive a family's own encoder + template; no
-      // Mage-Flow collector exists yet, and the Qwen-Image one would build a
-      // QIE DiT config against Mage weights. Refuse rather than silently
-      // calibrate the wrong model -- an explicit calib_dir still works.
+    if (qprof != nullptr && _calib_dir.empty()) {
+      // The on-device collectors drive a family's OWN encoder and
+      // template, and they are in-tree code -- so a family the host
+      // learned about from a profile has none by construction, and the
+      // nearest built-in collector would build another family's DiT
+      // config against these weights. Refuse rather than silently
+      // calibrate the wrong model; an explicit calib_dir still works,
+      // and so do plain and mixed quantization.
       session()->warn(fmt(
-          "ModelQuantizeStage('{}'): Mage-Flow DiT AWQ has no on-device "
-          "collector yet; supply calib_dir, or drop awq (plain / mixed "
-          "quantization is supported)", this->id()));
+          "ModelQuantizeStage('{}'): '{}' is an out-of-tree family, which has "
+          "no on-device AWQ collector; supply calib_dir, or drop awq (plain "
+          "and mixed quantization are supported)", this->id(), family));
       return false;
     }
     if (!_calib_dir.empty()) {

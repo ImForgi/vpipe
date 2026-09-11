@@ -147,6 +147,22 @@ private:
   std::string _enc_dir;
   // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
   std::string _family = "krea2";
+  // What the models DB recorded for this checkpoint, when a model-select
+  // source named one. Only used to ask a registered family's `claims`,
+  // which is the one probe a bare weights directory can answer.
+  std::string _model_type;
+  // True once the checkpoint has been resolved and the family is the
+  // one that will run. Before it, `_family` is a default nobody chose,
+  // and calling a config beat a mismatch against it is noise about a
+  // decision that has not been taken.
+  bool _family_settled = false;
+  // The family's conditioning profile, when a plugin registered one --
+  // an open FlexData bag of the facts that differ between checkpoints.
+  // Null for every built-in family, and null is the case the host's own
+  // per-family defaults serve. BORROWED from a process-wide registry
+  // that outlives every stage. See
+  // generative-models/conditioner-profile.h.
+  const FlexData* _profile = nullptr;
   std::uint64_t _emitted = 0;
   std::uint64_t _blocked = 0;      // refused by the Mage-Flow content screen
   // Image-aware families: always emit a grounded negative (empty prompt ok) on

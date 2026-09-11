@@ -84,9 +84,19 @@ MetalKrea2Vae::wname_(const std::string& diffusers_name) const
 }
 
 // Load a 3x3 conv as a dense-gemm weight [Cout, 9*Cin], flattened (ky,kx,cin)
-// to pair with im2col_hwc_3x3. `from3d` sources a [Cout,Cin,3,3,3] causal
-// conv3d and keeps only the kt=2 temporal slice (single-frame decode); else a
-// [Cout,Cin,3,3] 2D conv (the upsample resample.1).
+// to pair with im2col_hwc_3x3. A [Cout,Cin,3,3,3] causal conv3d keeps only
+// the kt=2 temporal slice (single-frame decode); a [Cout,Cin,3,3] 2D conv
+// is taken whole.
+//
+// THE TENSOR'S RANK DECIDES, not the caller. `from3d` says what the
+// caller EXPECTS -- the video VAE for every weight but the upsample
+// resample.1 -- and that expectation is right for the checkpoint
+// AutoencoderKLQwenImage publishes. It is wrong for the image-only
+// extraction of it (`AutoencoderKLQwenImage2D`, which VOSR ships to
+// avoid paying for a temporal dimension it never uses): same names, same
+// values, one axis fewer. Reading a 4-D tensor as 5-D indexes past the
+// end of every row, so trusting the caller here is not a mis-load that
+// fails, it is one that produces a plausible picture of nothing.
 MetalKrea2Vae::Conv
 MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
                              bool from3d)
@@ -95,6 +105,7 @@ MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
   const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.empty()) { return c; }
   const auto& sh = info->shape;
+  from3d = from3d && sh.size() >= 5;
   const int Cout = (int)sh[0];
   const int Cin = (int)sh[1];
   const int kt = from3d ? (int)sh[2] : 1;   // 3 for conv3d, absent for conv2d

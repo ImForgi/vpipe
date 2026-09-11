@@ -45,6 +45,39 @@ std::string_view config_type_name(ConfigType) noexcept;
 // (Array/Object) default to an empty container; required keys default
 // to Null. All string_view members must point at static storage
 // (string literals) -- the table outlives every stage instance.
+// ONE EXTRA FACT about a spec, as a name and a value.
+//
+// It exists so this file can stop growing. StageSpec, PortSpec and
+// ConfigKey are AGGREGATES A PLUGIN BUILDS, with static storage, and
+// hands over as pointers and spans -- so a field added here moves a
+// layout a plugin already compiled, and every plugin that registers a
+// stage has to be rebuilt for metadata it does not use. All three of
+// this tree's plugins register stages.
+//
+// So new spec metadata goes in a span of these instead. Both halves are
+// string_view over STATIC storage, exactly like every other member
+// beside them, which keeps the aggregates brace-initializable and free
+// of a non-trivial destructor.
+//
+// Names are lower-case and the host's, added and never repurposed.
+// Two are defined today:
+//
+//   "category"  on a StageSpec -- a category NAME that wins over the
+//               `category` enum when set, so a plugin whose stage is a
+//               kind this tree has no enumerator for can say so without
+//               an enum change (which is an ABI change).
+//   "since"     a version string, for a composer that wants to mark
+//               what is new.
+struct SpecExtra {
+  std::string_view key;
+  std::string_view value;
+};
+
+// Look one up. Empty when absent, which is what every spec written
+// before a key existed produces.
+std::string_view spec_extra(std::span<const SpecExtra> extra,
+                            std::string_view key) noexcept;
+
 struct ConfigKey {
   std::string_view key;
   ConfigType       type     = ConfigType::Any;
@@ -127,6 +160,12 @@ struct ConfigKey {
   // which kind a given file is -- video-ref-encoder's reference list
   // reads that from the file itself.
   std::string_view path_filter = {};
+  // Anything this struct has no field for -- a span of
+  // {name, value} pairs over static storage. See SpecExtra in
+  // pipeline/stage-spec.h for why new metadata goes here rather than
+  // into a new member: this aggregate is built by PLUGINS, so a field
+  // added here moves a layout they already compiled.
+  std::span<const SpecExtra> extra;
 };
 
 // Contribute model_types to a shared-model channel at RUN TIME.

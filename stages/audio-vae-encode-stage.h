@@ -131,6 +131,11 @@ private:
   // Append one beat's samples. False (with a message already logged)
   // when the beat does not fit the stream being built.
   bool accumulate_(const class TensorBeatPayload& tb);
+  // The acceleration settings as a BAG, for a registered VAE family.
+  // See generative-models/shared/accel-settings.h. Every tier in it is
+  // off unless a graph asks: a codec's output is looked at directly, so
+  // an approximation here has nowhere to be absorbed.
+  FlexData _accel{};
 };
 
 }  // namespace vpipe

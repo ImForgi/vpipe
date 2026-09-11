@@ -1,8 +1,8 @@
 #ifndef VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 #define VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 
-#include "generative-models/shared/sage-attention.h"
 #include "common/flex-data.h"
+#include "generative-models/gen-input.h"
 #include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 
@@ -147,10 +147,34 @@ struct VideoGenRequest {
   // The same acceleration settings VideoModelCreateArgs carries, repeated
   // per generation. A family that decides at LOAD (building a kernel
   // variant, sizing int8 scratch) reads them there; one that decides per
-  // forward reads them here, and the two are the same values -- the stage
-  // fills both from one config.
-  sage::Config sage;
-  bool         i8_gemm = false;
+  // forward reads them here, and the two are the same object -- the
+  // stage fills both from one config.
+  //
+  // ONE POINTER, and it stays one pointer. See
+  // generative-models/shared/accel-settings.h for the keys, the readers
+  // and why this is a bag: typed fields here put the host's vocabulary
+  // into the plugin ABI, so adding a tier invalidated every family's
+  // binary including the ones that implement none of them.
+  //
+  // Owned by the stage and valid for the call. Null is legitimate and
+  // reads as every default.
+  const FlexData* accel = nullptr;
+
+  // ---- the growth seam ----------------------------------------------
+  //
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h for the
+  // argument, and read this struct's own typed fields as the evidence:
+  // `cond`, then `neg`, then `audio_cond`, then `ref`, then `ref_last`,
+  // then the two reference-row triples. Each arrived with a capability,
+  // each moved this layout, and each invalidated every family binary
+  // including the ones that ignore it.
+  //
+  // `input` looks up anything with a SHAPE by name; `extras` carries
+  // scalars the host wants to state and no family has to read. Both are
+  // legitimately absent -- a null `input` and a null `extras` are what a
+  // graph that wired neither produces, and a family must work then.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            extras = nullptr;
 };
 
 // What a generation produced. A family that generates no audio simply
@@ -161,6 +185,11 @@ struct VideoGenResult {
   std::vector<float> audio;        // f32 [stereo, channels, latents]
   std::vector<int>   audio_shape;
   double latents_per_second = 0.0; // stamped on the audio beat
+  // WHAT THE FAMILY WANTS SAID BACK, for anything this struct has no
+  // field for -- realized sparsity, a chosen variant, a per-step
+  // statistic. The stage forwards it onto the beat's sideband and reads
+  // none of it, so a family adding one costs nobody a rebuild.
+  FlexData sideband;
 };
 
 // ONE resident checkpoint of a family. Built by VideoModelFamily::load()
@@ -243,13 +272,28 @@ struct VideoModelCreateArgs {
   // in its own log line: silence is indistinguishable from a knob that
   // did nothing, and the numbers get believed either way.
   //
-  // `sage` is driveable directly -- MetalSageAttention is public and its
-  // three-step contract (build the function with constant 306, prepare()
-  // into the encoder, bind() on the dispatch) asks nothing of the caller
-  // beyond the strides it already has. `i8_gemm` likewise goes through
-  // I8GemmContext.
-  sage::Config                 sage;
-  bool                         i8_gemm = false;
+  // Every tier here is DRIVEABLE from a plugin, and each one costs
+  // exactly the header it needs and no more: `i8_gemm` through
+  // I8GemmContext, `sage_attn` through MetalSageAttention, `sol_attn`
+  // through MetalSolAttention -- which takes the head-major q/k/v an
+  // unfused attention already has and needs nothing else from the family
+  // but the head count, the row count and the scale.
+  //
+  // accel-settings.h gives the keys and the readers; each tier's own
+  // header gives a `config_from_flex` that returns its typed Config, so
+  // a family that wants one writes
+  //
+  //   const sol::Config c = sol::config_from_flex(args.accel);
+  //
+  // and a family that wants none includes nothing at all. That is the
+  // point of the bag: the cost of a tier falls on its users.
+  //
+  // Sol's Config carries a SINK that is NOT in the bag and cannot be:
+  // the rows the routing must read exactly are where a family's own
+  // sequence stops being the modality being summarised, and only the
+  // family knows that. H3 fills it from its packed layout; a per-stream
+  // self-attention over one modality leaves it at zero.
+  const FlexData*              accel = nullptr;
 
   // The clip the graph INTENDS to generate, already through the family's
   // own align_frames / size_grid. 0 when the stage could not settle it.
@@ -264,6 +308,32 @@ struct VideoModelCreateArgs {
   // family that cares must re-check. What it buys is a load-time
   // decision made against the right order of magnitude instead of none.
   int width = 0, height = 0, frames = 0;
+
+  // ---- what the graph pointed at, and the growth seam ---------------
+  //
+  // The DiT the graph NAMED, resolved, when it named one -- the
+  // `dit_dir` config, which points a run at a quantized or fused DiT
+  // beside the checkpoint rather than the one inside it. EMPTY means
+  // the graph named none and the family finds its own weights under
+  // `root`, which is what every family did before this existed.
+  //
+  // It is a typed field rather than an `extras` key because it is not
+  // an optional capability: it is the same resolved path the built-in
+  // families have always been handed, and a family that ignores it
+  // silently loads weights the operator did not ask for.
+  //
+  // NOTE WHAT IT DOES NOT REACH. The planning calls -- declare_resources,
+  // declare_holdings, latent_bytes -- are asked about the ROOT, and are
+  // asked before this struct exists. So a graph that names a smaller
+  // quantized DiT is sized against the checkpoint's own, which
+  // over-declares. That is the safe direction: a streaming model revises
+  // down once it knows what it holds, where under-declaring is a box
+  // admitted to a graph it cannot run.
+  std::string dit_dir;
+
+  // NEW ARGUMENTS GO IN HERE, NOT IN A NEW FIELD. See gen-input.h.
+  // Null is what a host with nothing to add produces.
+  const FlexData* extras = nullptr;
 };
 
 // A video model FAMILY: process-wide, stateless, one per architecture.

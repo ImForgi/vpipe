@@ -199,6 +199,11 @@ private:
   void unload_vae_();
   void reload_vae_();
 #endif
+  // The acceleration settings as a BAG, for a registered VAE family.
+  // See generative-models/shared/accel-settings.h. Every tier in it is
+  // off unless a graph asks: a codec's output is looked at directly, so
+  // an approximation here has nowhere to be absorbed.
+  FlexData _accel{};
 };
 
 }

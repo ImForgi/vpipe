@@ -241,6 +241,9 @@ public:
   // back or is silently kept is not visible from config_error(), because
   // a perf knob spelled wrong warns rather than failing the stage.
   const genai::sol::Config& sol_config() const noexcept { return _sol; }
+  // The bag itself, which is what a plugin family gets. A test seam like
+  // sol_config() beside it, and the one that can check the two agree.
+  const FlexData& accel_settings() const noexcept { return _accel; }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -275,6 +278,16 @@ private:
   // plugin families too (VideoModelCreateArgs::sage), because the
   // families out of tree run the same flash kernel.
   genai::sage::Config _sage{};
+  // THE SAME THREE, as the open bag a plugin family reads -- one object,
+  // owned here and pointed at by both VideoGenRequest and
+  // VideoModelCreateArgs, so a family that decides at load and one that
+  // decides per forward cannot see different answers.
+  //
+  // It is the bag that is authoritative: the typed members above are
+  // read back out of it after it is filled. See
+  // generative-models/shared/accel-settings.h for why the boundary is a
+  // bag and not fields.
+  FlexData _accel{};
   std::uint64_t _seed   = 0;
   std::uint64_t _emitted = 0;
 

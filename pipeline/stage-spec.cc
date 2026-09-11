@@ -4,6 +4,16 @@
 
 namespace vpipe {
 
+std::string_view
+spec_extra(std::span<const SpecExtra> extra, std::string_view key) noexcept
+{
+  for (const SpecExtra& e : extra) {
+    if (e.key == key) { return e.value; }
+  }
+  return {};
+}
+
+
 namespace {
 
 // Trim ASCII whitespace from both ends of a view.

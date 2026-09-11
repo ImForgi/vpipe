@@ -1,4 +1,6 @@
 set(LOCAL_TEST_SOURCES
+  accel-settings.cc
+  image-model-registry.cc
   buffer-stage.cc
   byte-track-stage.cc
   call-stage.cc
@@ -192,9 +194,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
         mage-vae.cc
-        mage-dit.cc
         mage-cond.cc
-        mage-watermark.cc
         mage-t2i.cc
         mage-screen.cc
         krea2-t2i.cc

@@ -18,6 +18,7 @@ namespace vpipe {
 class SessionContextIntf;
 
 namespace genai { class VideoModelFamily; }
+namespace genai { class ImageModelFamily; }
 namespace genai { class VaeModelFamily; }
 namespace genai { class QuantizableFamily; }
 
@@ -90,6 +91,23 @@ public:
   // mistake worth seeing.
   bool register_video_family(std::unique_ptr<genai::VideoModelFamily> family);
 
+  // ---- image families --------------------------------------------------
+  // The same seam for `generate-image`, drawn at the same place: given
+  // conditioning, geometry, a step count and a seed, produce a LATENT.
+  // The family owns its denoise loop -- its scheduler, its guidance
+  // rule, its patchify, its residency -- and the stage owns the ports,
+  // the beats, the geometry bookkeeping and the sampler/scheduler
+  // selections, which it hands down unparsed.
+  //
+  // A latent rather than pixels, which is why an image family and a VAE
+  // family together need no stage of their own: generate-image's oport0
+  // is what the stock `vae-decode` reads. See
+  // generative-models/image-model-registry.h.
+  //
+  // Takes ownership; first-wins on `tag()`, on the same terms as the
+  // video registry above.
+  bool register_image_family(std::unique_ptr<genai::ImageModelFamily> family);
+
   // ---- VAE families ----------------------------------------------------
   // Contribute a VAE DECODER, so the stock `vae-decode` stage can turn a
   // latent from an out-of-tree checkpoint into RGB frames. The family
@@ -108,6 +126,37 @@ public:
   // dispatch is pointer-guarded so it would still run the right code,
   // but every log line would read as a built-in.
   bool register_vae_family(std::unique_ptr<genai::VaeModelFamily> family);
+
+  // ---- family profiles ------------------------------------------------
+  // WHAT YOUR FAMILY KNOWS ABOUT ITSELF THAT THE HOST CANNOT, for any
+  // host subsystem that asks: how your prompt is conditioned, which of
+  // your DiT's tensors are worth quantizing, and whatever comes next.
+  //
+  // `domain` names the subsystem and `family` your model's tag; the bag
+  // carries that domain's vocabulary. The domains and their keys live in
+  // headers beside the code that reads them --
+  // generative-models/conditioner-profile.h,
+  // generative-models/quantize-profile.h -- each of which names the
+  // `domain` string to pass.
+  //
+  // ONE METHOD, DELIBERATELY. The ABI is a strict-equality cookie, so
+  // every entry point added here is a rebuild every plugin author pays
+  // for. A domain STRING keeps that decision out of the ABI: the next
+  // subsystem that wants per-family facts picks a name, writes a key
+  // header, and needs no new method and no version bump.
+  //
+  // It is the counterpart to the acceleration bag, running the other
+  // way: that one is the host telling a family what the graph asked for,
+  // this one a family telling the host what its checkpoint needs. Both
+  // are FlexData for the same reason -- a typed struct puts one side's
+  // vocabulary into the other's ABI.
+  //
+  // A profile is DATA, never behaviour. It cannot hand the host code to
+  // run, reach machinery the host did not offer, or switch off a policy
+  // the host enforces. A family whose needs exceed its domain's
+  // vocabulary ships a stage -- see docs/PLUGINS.md.
+  bool register_family_profile(std::string domain, std::string family,
+                               FlexData profile);
 
   // ---- quantizable families --------------------------------------------
   // Contribute a QUANTIZE recipe, so `model-quantize` can package this

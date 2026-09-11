@@ -514,8 +514,14 @@ PipelineApi::h_stage_types_(const HttpRequest&)
     // spec entry), so the registry's vpipe::StageSpec needs the prefix.
     const vpipe::StageSpec* sp = StageRegistry::get().spec(n);
     if (sp) {
+      // A spec may NAME its category, which wins over the enum: a
+      // plugin stage whose kind this tree has no enumerator for can
+      // say so without an enum change, and an enum change is an ABI
+      // change. See SpecExtra in pipeline/stage-config.h.
+      std::string_view cat = spec_extra(sp->extra, "category");
+      if (cat.empty()) { cat = stage_category_name(sp->category); }
       oo.insert("category",
-                FlexData::make_string(stage_category_name(sp->category)));
+                FlexData::make_string(cat));
       oo.insert("doc", FlexData::make_string(sp->doc));
       oo.insert("display_name", FlexData::make_string(sp->display_name));
       oo.insert("iports", ports_to_flex_(sp->iports));

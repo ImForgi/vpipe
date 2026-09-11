@@ -18,7 +18,6 @@
 #include "generative-models/tokenizer.h"
 #include "stages/model-quantize-stage.h"
 
-#include "generative-models/mage/metal-mage-flow-transformer.h"
 #include "stages/model-registry.h"
 
 #include <cstdio>
@@ -599,17 +598,12 @@ TEST(model_quantize_stage, mage_flow_dit_quantizes)
   // set would).
   EXPECT_TRUE(n_scales == 144);
 
-  // Producing files is not the same as producing a usable model: load the
-  // quantized DiT back through the real Mage-Flow loader.
-  {
-    auto m = vpipe::genai::MetalMageFlowTransformer::load(
-        (out / "transformer").string(), sess.metal_compute(),
-        vpipe::genai::mage_flow_dit_config());
-    EXPECT_TRUE((bool)m);
-    if (m) {
-      std::printf("[model_quantize_stage] quantized mage-flow DiT reloaded\n");
-    }
-  }
+  // The RELOAD half of this case is gone from here, not dropped: the
+  // Mage-Flow DiT moved out of this tree into the vpipe-mage-flow
+  // plugin, and a host test cannot reach a plugin's loader. What stays
+  // is the half that is the QUANTIZER's own -- the leaf set it matched
+  // and the tensors it wrote -- and the plugin's mage-dit test loads a
+  // quantized pack back.
 
   fs::remove_all(out, ec);
 }

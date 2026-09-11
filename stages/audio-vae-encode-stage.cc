@@ -1,3 +1,4 @@
+#include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-encode-stage.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 
@@ -43,6 +44,16 @@ const ConfigKey kAttrs[] = {
           "from physical RAM vs the pipeline's weight bytes; "
           "\"always\" / \"never\" force it",
    .def_str = "auto"},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
+          "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
+          "is unimplemented: a codec is the last thing between a latent and "
+          "the pixels a person looks at, so an approximation in it has "
+          "nowhere to be absorbed -- where the same trade inside a DiT is "
+          "followed by dozens of blocks and a decode. It is settable so the "
+          "trade can be MEASURED. Only a REGISTERED family reads it; the "
+          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "audio",
@@ -93,6 +104,15 @@ AudioVaeEncodeStage::AudioVaeEncodeStage(const SessionContextIntf* s,
                                     std::move(config))
 {
   _hf_dir   = attr_str("hf_dir");
+  // THE ACCELERATION BAG, built once and handed to a registered family
+  // whole. Written whether the tier is on or off, and with the SETTLED
+  // value, so no family repeats this stage's reading or reaches a
+  // different answer than the log line did. The built-in codecs never
+  // see it: they are compiled with this stage and take their kernels
+  // from their own configs.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
+                         attr_bool("i8_gemm"));
   _cfg_rate = (int)attr_int("sample_rate");
   {
     const double m = attr_real("max_seconds");
@@ -239,7 +259,7 @@ AudioVaeEncodeStage::declare_memory() const
           session(), root, vae,
           resolve_model(session(), _hf_dir).model_type)) {
     const std::string a =
-        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { vae = a; }
   }
   if (vae.empty() || vae == root) { return m; }
@@ -430,6 +450,13 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
                 (std::size_t)n * sizeof(float));
   }
   genai::AudioVaeEncodeRequest req;
+  req.accel = &_accel;
+  // ALWAYS INSTALLED, even though nothing is named yet: a
+  // family that had to guard every lookup would eventually
+  // forget one, and calling an empty std::function throws.
+  req.input =
+      [](std::string_view, genai::NamedTensor*) { return false; };
+
   req.pcm         = flat.data();
   req.channels    = ch;
   req.n_samples   = n;

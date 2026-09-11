@@ -1,6 +1,7 @@
 #ifndef STAGES_MODEL_CATALOG_H
 #define STAGES_MODEL_CATALOG_H
 
+#include "common/flex-data.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -96,6 +97,25 @@ struct ModelCatalogEntry {
   // user who is choosing between two copies of one model.
   std::string weight_format;
   bool        needs_tokenizer_json = false;
+  // ---- the growth seam ----------------------------------------------
+  //
+  // NEW PACKAGING FACTS GO HERE, NOT IN A NEW FIELD. This struct is
+  // built BY VALUE inside plugins -- all three of this tree's do -- and
+  // it has grown four times already (`name`, `weight_format`,
+  // `companion_files`, `extract_archive`). Each of those moved a layout
+  // a plugin had already compiled, for metadata most entries do not set.
+  //
+  // A FlexData rather than a span of string pairs, unlike the spec
+  // structs: an entry is a value with strings and vectors in it
+  // already, so it has no aggregate or static-storage constraint to
+  // protect, and packaging facts are as likely to be lists or numbers
+  // as strings.
+  //
+  // Keys are the host's, lower_snake, added and never repurposed. None
+  // is defined today, which is the honest state of it: this is the
+  // seam, not a backlog.
+  FlexData extra;
+
   std::string name;         // registration key + extract subdir (when several
                             // entries share one hf_path); empty -> key=hf_path
   bool        extract_archive = false;  // unpack fetched .tar(s); local_path

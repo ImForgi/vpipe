@@ -34,7 +34,33 @@
 // symbol and no facade method, yet moves the vtable: a plugin built
 // against the older header passes every check and then calls through the
 // wrong slot. That has already happened once here.
-#define VPIPE_PLUGIN_ABI_VERSION 2u
+//
+// It covers the STRUCTS those interfaces are handed, too -- and that is
+// the half that was missed: `sol::Config` was added beside `sage` in
+// VideoGenRequest without a bump, which is a layout change an old plugin
+// would have passed every check and then misread. This value is the one
+// thing standing between that and a wrong answer, so a field is never
+// added to one of those structs without touching this line.
+//
+// ...AND WHAT DOES NOT COUNT. Adding a KEY to
+// generative-models/shared/accel-settings.h is not a bump: the bag is
+// one pointer whose layout does not move, its readers are header-only
+// and compiled into the plugin, and a key an old plugin was never told
+// about is one it never asks for. That is the whole reason those
+// settings stopped being fields -- see the same header, and
+// docs/PLUGINS.md, "Why a bag and not fields".
+//
+// THREE IS CARRYING TWO CHANGES, and that is only legitimate because it
+// never shipped. It was introduced for the acceleration bag and then
+// reused for `register_image_family`, both on the same day, with nothing
+// outside this tree ever having reported 3 -- so no binary exists that
+// says 3 and means only the first of them. Reusing a number that HAS
+// been released is the exact failure this line prevents: two different
+// contracts answering to one cookie, and a plugin that passes the check
+// and then misreads. The test is not "has anything been built against
+// it", it is "has anything LEFT" -- check the number's introducing
+// commit against the public remote before ever doing this again.
+#define VPIPE_PLUGIN_ABI_VERSION 3u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

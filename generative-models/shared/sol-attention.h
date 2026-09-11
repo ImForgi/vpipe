@@ -1,6 +1,8 @@
 #ifndef GENERATIVE_MODELS_SHARED_SOL_ATTENTION_H
 #define GENERATIVE_MODELS_SHARED_SOL_ATTENTION_H
 
+#include "generative-models/shared/accel-settings.h"
+
 // Sol-Attn: training-free sparse attention by on-the-fly routing.
 //
 // NVlabs/Sana, `techniques/sparse_backends/sol_attn` (Sol-Attn, Li et
@@ -102,6 +104,38 @@ struct Config {
   // exact half walks is in steel's units.
   int       key_block    = 0;
 };
+
+// The same settings out of the acceleration BAG a generating stage
+// hands every family (accel-settings.h).
+//
+// HEADER-ONLY, so it compiles into the caller: a plugin built against an
+// older host reads the keys that host documented and gets this file's
+// defaults for anything it has never heard of -- which is the same thing
+// it gets from a graph that asked for nothing. That is what lets the
+// host add a knob here without invalidating a binary that does not use
+// it.
+//
+// The defaults below are THIS file's, deliberately: they are the shipped
+// values, and the stage writes settled values into the bag whenever the
+// tier is on, so the two agree wherever it matters and the reader is
+// still correct on a bag that carries nothing.
+inline Config
+config_from_flex(const FlexData* bag)
+{
+  Config c;
+  c.enabled      = accel::flag(bag, accel::kSolAttn, c.enabled);
+  c.tau          = (float)accel::real(bag, accel::kSolTau, (double)c.tau);
+  c.dense_layers =
+      (int)accel::integer(bag, accel::kSolDenseLayers, c.dense_layers);
+  c.local_radius =
+      (int)accel::integer(bag, accel::kSolLocalRadius, c.local_radius);
+  c.key_block = (int)accel::integer(bag, accel::kSolKeyBlock, c.key_block);
+  // The SINK is not in the bag and cannot be: it is where a family's own
+  // sequence stops being the modality the routing is summarising, and
+  // only the family knows that. H3 fills it from its packed layout; a
+  // per-stream self-attention leaves it at zero.
+  return c;
+}
 
 // What a forward actually routed, for a benchmark to report. Realized
 // sparsity is a property of the DATA, not of tau alone, so it is

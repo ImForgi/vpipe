@@ -35,6 +35,7 @@ enum class StageCategory : unsigned char {
 // picking wrong looks like picking right. See stages/model-config-source.h.
 std::string_view stage_category_name(StageCategory) noexcept;
 
+
 // Static, type-level declaration of one stage port (input or output).
 // `type` is the concrete beat payload type carried on the port
 // (&typeid(ConcretePayload)); nullptr means "untyped / any", which the
@@ -58,6 +59,8 @@ struct PortSpec {
   const std::type_info* type        = nullptr;
   std::string_view      tags;            // comma-separated; OR semantics
   unsigned              clock_group  = 0;
+  // Anything this struct has no field for. See SpecExtra.
+  std::span<const SpecExtra> extra;
 };
 
 // True iff a producer output port advertising the tag list `produced`
@@ -96,6 +99,8 @@ struct StageSpec {
   std::span<const PortSpec>  iports;
   std::span<const PortSpec>  oports;
   std::span<const ConfigKey> attrs;
+  // Anything this struct has no field for. See SpecExtra.
+  std::span<const SpecExtra> extra;
   // When true, tooling (the web-ui composer toolbox) omits this stage
   // from the palette of stages a user can add. The spec is still
   // registered + returned by the stage-types API so an already-present

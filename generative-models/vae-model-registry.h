@@ -2,6 +2,7 @@
 #define VPIPE_GENERATIVE_MODELS_VAE_MODEL_REGISTRY_H
 
 #include "common/flex-data.h"
+#include "generative-models/gen-input.h"
 #include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 
@@ -77,6 +78,39 @@ struct VaeDecodeRequest {
   // like a hang -- but a family that STREAMS gets cancellation for free,
   // because the sink's return value is also an abort point.
   std::function<bool(int done, int total)> progress;
+
+  // ---- what the graph asked for, and the growth seam -----------------
+  //
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, the same object the
+  // generating stages hand a DiT family. See
+  // generative-models/shared/accel-settings.h for the keys.
+  //
+  // Every tier here is OFF by default and that is a QUALITY decision,
+  // not a missing implementation: a codec is the last thing between a
+  // latent and the pixels a person looks at, so an approximation in it
+  // has nowhere to be absorbed. The settings are plumbed so the trade
+  // can be MEASURED when someone wants to make it, which is not the
+  // same as recommending it. A family that takes one should say so in
+  // its own log line.
+  //
+  // Null is legitimate and reads as every default.
+  const FlexData* accel = nullptr;
+
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
+  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // The host always installs `input`, so it may be called
+  // unconditionally; it returns false for every name a graph did not
+  // wire.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            extras = nullptr;
+
+  // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
+  // chosen kernel. An out-parameter on the REQUEST rather than a field
+  // on a result, because a decode reports through a sink and has no
+  // result struct to grow; this way a family gains an output without
+  // anyone's virtual changing signature. Null means nobody is
+  // listening, which a family must tolerate.
+  FlexData* report = nullptr;
 };
 
 // One chunk of decoded frames, in frame order.
@@ -112,6 +146,10 @@ struct VaeFrameChunk {
   // the log line and the preflight only. A family that mispredicts its
   // own geometry should produce a confusing log, not a mislabelled beat.
   int frames_total = 0;
+  // Anything this struct has no field for, per chunk. See SpecExtra's
+  // argument in pipeline/stage-config.h: a field added here moves a
+  // layout every VAE plugin already compiled.
+  const FlexData* extra = nullptr;
 };
 
 // Returning false ABORTS the decode; decode() then returns false too.
@@ -195,6 +233,39 @@ struct AudioVaeDecodeRequest {
   // False ABORTS. A decode short enough never to call it is fine; a long
   // one that does not is a Stop that looks like a hang.
   std::function<bool(int done, int total)> progress;
+
+  // ---- what the graph asked for, and the growth seam -----------------
+  //
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, the same object the
+  // generating stages hand a DiT family. See
+  // generative-models/shared/accel-settings.h for the keys.
+  //
+  // Every tier here is OFF by default and that is a QUALITY decision,
+  // not a missing implementation: a codec is the last thing between a
+  // latent and the pixels a person looks at, so an approximation in it
+  // has nowhere to be absorbed. The settings are plumbed so the trade
+  // can be MEASURED when someone wants to make it, which is not the
+  // same as recommending it. A family that takes one should say so in
+  // its own log line.
+  //
+  // Null is legitimate and reads as every default.
+  const FlexData* accel = nullptr;
+
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
+  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // The host always installs `input`, so it may be called
+  // unconditionally; it returns false for every name a graph did not
+  // wire.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            extras = nullptr;
+
+  // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
+  // chosen kernel. An out-parameter on the REQUEST rather than a field
+  // on a result, because a decode reports through a sink and has no
+  // result struct to grow; this way a family gains an output without
+  // anyone's virtual changing signature. Null means nobody is
+  // listening, which a family must tolerate.
+  FlexData* report = nullptr;
 };
 
 // ONE resident audio VAE decoder.
@@ -248,6 +319,39 @@ struct VaeEncodeRequest {
   int frames = 1;
   int height = 0;
   int width  = 0;
+
+  // ---- what the graph asked for, and the growth seam -----------------
+  //
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, the same object the
+  // generating stages hand a DiT family. See
+  // generative-models/shared/accel-settings.h for the keys.
+  //
+  // Every tier here is OFF by default and that is a QUALITY decision,
+  // not a missing implementation: a codec is the last thing between a
+  // latent and the pixels a person looks at, so an approximation in it
+  // has nowhere to be absorbed. The settings are plumbed so the trade
+  // can be MEASURED when someone wants to make it, which is not the
+  // same as recommending it. A family that takes one should say so in
+  // its own log line.
+  //
+  // Null is legitimate and reads as every default.
+  const FlexData* accel = nullptr;
+
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
+  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // The host always installs `input`, so it may be called
+  // unconditionally; it returns false for every name a graph did not
+  // wire.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            extras = nullptr;
+
+  // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
+  // chosen kernel. An out-parameter on the REQUEST rather than a field
+  // on a result, because a decode reports through a sink and has no
+  // result struct to grow; this way a family gains an output without
+  // anyone's virtual changing signature. Null means nobody is
+  // listening, which a family must tolerate.
+  FlexData* report = nullptr;
 };
 
 // ONE resident VAE encoder.
@@ -288,6 +392,39 @@ struct AudioVaeEncodeRequest {
   // encoding at the wrong rate — a silent rate mismatch is a reference
   // that is the right length and the wrong pitch.
   int sample_rate = 0;
+
+  // ---- what the graph asked for, and the growth seam -----------------
+  //
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, the same object the
+  // generating stages hand a DiT family. See
+  // generative-models/shared/accel-settings.h for the keys.
+  //
+  // Every tier here is OFF by default and that is a QUALITY decision,
+  // not a missing implementation: a codec is the last thing between a
+  // latent and the pixels a person looks at, so an approximation in it
+  // has nowhere to be absorbed. The settings are plumbed so the trade
+  // can be MEASURED when someone wants to make it, which is not the
+  // same as recommending it. A family that takes one should say so in
+  // its own log line.
+  //
+  // Null is legitimate and reads as every default.
+  const FlexData* accel = nullptr;
+
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
+  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // The host always installs `input`, so it may be called
+  // unconditionally; it returns false for every name a graph did not
+  // wire.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            extras = nullptr;
+
+  // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
+  // chosen kernel. An out-parameter on the REQUEST rather than a field
+  // on a result, because a decode reports through a sink and has no
+  // result struct to grow; this way a family gains an output without
+  // anyone's virtual changing signature. Null means nobody is
+  // listening, which a family must tolerate.
+  FlexData* report = nullptr;
 };
 
 // ONE resident audio VAE encoder.
@@ -361,7 +498,21 @@ public:
   // generates a soundtrack ships two, in two files, with two lifetimes
   // -- they are loaded and dropped by different stages, in different
   // phases -- so every question below has to name one.
-  enum class Role { kVideo, kAudio };
+  // WHICH CODEC of this family is wanted, as a NAME rather than an
+  // enumerator.
+  //
+  // It was an enum with two values, and a third one -- a control codec,
+  // a depth codec, a second audio rate -- would have been an ABI change
+  // for exactly the reason a new struct field is: every plugin that
+  // implements this interface has to be rebuilt for a value it does not
+  // handle. A string costs one comparison and never does that.
+  //
+  // The two the host asks for today are named below. A family that is
+  // handed a role it does not know must return an empty path, which the
+  // caller reads as "this family has no such codec" -- never a guess at
+  // the nearest one.
+  static constexpr std::string_view kRoleVideo = "video";
+  static constexpr std::string_view kRoleAudio = "audio";
 
   // WHERE this family's weights actually live under `root`, when that
   // is not a directory the host can find on its own.
@@ -376,7 +527,8 @@ public:
   //
   // Empty -- the default -- means "the host's answer is right", which it
   // is for any diffusers layout.
-  virtual std::string vae_path(const std::string& /*root*/, Role /*role*/) const
+  virtual std::string vae_path(const std::string& /*root*/,
+                               std::string_view /*role*/) const
   {
     return {};
   }
@@ -387,7 +539,8 @@ public:
   // `preload`. `releases` and `reclaimable` are the STAGE's policy and
   // are stamped on afterwards.
   virtual std::vector<StageHolding>
-  declare_holdings(const std::string& /*root*/, Role /*role*/) const
+  declare_holdings(const std::string& /*root*/,
+                   std::string_view /*role*/) const
   {
     return {};
   }

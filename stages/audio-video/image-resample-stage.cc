@@ -65,6 +65,7 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   // `def_str` for an absent key, but a key set to "" reaches here empty
   // and would otherwise land on whichever branch the else happened to be.
   if      (alg == "bilinear") { _alg = 0; }
+  else if (alg == "bicubic")  { _alg = 2; }
   else                        { _alg = 1; }   // lanczos (default)
   // Deferred validation: the ctor never throws (Stage::fail_config).
   // At least one of width / height must be positive; a missing (<= 0)
@@ -73,9 +74,11 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
     fail_config(fmt("ImageResampleStage('{}'): at least one of width / "
                     "height must be > 0 (got {}x{})",
                     this->id(), _out_w, _out_h));
-  } else if (!alg.empty() && alg != "bilinear" && alg != "lanczos") {
+  } else if (!alg.empty() && alg != "bilinear" && alg != "lanczos" &&
+             alg != "bicubic") {
     fail_config(fmt("ImageResampleStage('{}'): unknown algorithm '{}' "
-                    "(supported: 'bilinear', 'lanczos')", this->id(), alg));
+                    "(supported: 'bilinear', 'lanczos', 'bicubic')",
+                    this->id(), alg));
   }
   allocate_oports(spec().oports.size());
 }
@@ -111,10 +114,15 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "algorithm", .type = ConfigType::String,
    .doc = "interpolation algorithm: 'lanczos' (the DEFAULT -- Lanczos-3, "
           "anti-aliased, matches PIL LANCZOS) | 'bilinear' (cheaper, and "
-          "aliases when downscaling). Most traffic through this stage is a "
-          "downscale onto a model's input canvas, where bilinear keeps the "
-          "high frequencies it should be removing -- so the good filter is "
-          "the default and the fast one is opted into",
+          "aliases when downscaling) | 'bicubic' (matches PIL BICUBIC). "
+          "Most traffic through this stage is a downscale onto a model's "
+          "input canvas, where bilinear keeps the high frequencies it "
+          "should be removing -- so the good filter is the default and the "
+          "fast one is opted into. Pick 'bicubic' when a model's own "
+          "preprocessing used it and the pixels are what it conditions on: "
+          "a VOSR restoration upscales its input this way before anything "
+          "sees it, and a different filter there is a different input. It "
+          "has no GPU kernel and runs on the CPU",
    .def_str = "lanczos"},
 };
 const PortSpec kIports[] = {
@@ -157,10 +165,16 @@ ImageResampleStage::initialize(RuntimeContext&)
   _mc = session() ? session()->services()->metal_compute() : nullptr;
   const string ws = _out_w > 0 ? std::to_string(_out_w) : string("auto");
   const string hs = _out_h > 0 ? std::to_string(_out_h) : string("auto");
+  // Name the FILTER and where it runs. "metal ok" alone reported the
+  // backend's availability, which is not the same question: bicubic has
+  // no GPU kernel and always takes the CPU path, so a graph that asked
+  // for it was told metal was fine and quietly did not use it.
+  const char* alg = _alg == 0 ? "bilinear" : _alg == 2 ? "bicubic"
+                                                       : "lanczos";
+  const bool gpu = _mc && _mc->valid() && _alg != 2;
   session()->info(fmt(
-      "ImageResampleStage('{}'): -> {}x{}, fit={}, metal {}",
-      this->id(), ws, hs, _mode,
-      (_mc && _mc->valid()) ? "ok" : "cpu-fallback"));
+      "ImageResampleStage('{}'): -> {}x{}, fit={}, {} on the {}",
+      this->id(), ws, hs, _mode, alg, gpu ? "GPU" : "CPU"));
   co_return;
 }
 
@@ -237,7 +251,7 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
 void
 ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
                                  int out_w, int out_h,
-                                 uint8_t* dst, bool is_f32) const
+                                 uint8_t* dst, bool is_f32, bool cubic) const
 {
   const metal_compute::ResampleGeom g =
       metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
@@ -267,10 +281,16 @@ ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
   }
   std::vector<int> bx, by;
   std::vector<float> wx, wy;
-  const int ksx = metal_compute::build_lanczos_coeffs(
-      in_w, g.src_x0, g.new_w, g.inv_x, bx, wx);
-  const int ksy = metal_compute::build_lanczos_coeffs(
-      in_h, g.src_y0, g.new_h, g.inv_y, by, wy);
+  const int ksx = cubic
+      ? metal_compute::build_cubic_coeffs(in_w, g.src_x0, g.new_w, g.inv_x,
+                                          bx, wx)
+      : metal_compute::build_lanczos_coeffs(in_w, g.src_x0, g.new_w, g.inv_x,
+                                            bx, wx);
+  const int ksy = cubic
+      ? metal_compute::build_cubic_coeffs(in_h, g.src_y0, g.new_h, g.inv_y,
+                                          by, wy)
+      : metal_compute::build_lanczos_coeffs(in_h, g.src_y0, g.new_h, g.inv_y,
+                                            by, wy);
   for (int y = 0; y < out_h; ++y) {
     for (int x = 0; x < out_w; ++x) {
       const bool out = x < g.pad_x || x >= g.pad_x + g.new_w
@@ -359,7 +379,9 @@ ImageResampleStage::process(RuntimeContext& ctx)
     if (src_h) {
       auto dst = metal_compute::make_shared_storage(
           *_mc, static_cast<size_t>(3) * out_w * out_h, session());
-      const bool ok = dst && (_alg == 1
+      // No bicubic GPU twin: _alg 2 falls through to the CPU path below,
+      // which is where the Pillow-exact cubic coefficients live.
+      const bool ok = _alg != 2 && dst && (_alg == 1
           ? metal_compute::resample_lanczos_planar_u8_to_u8(
                 *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
                 _mode, _src_x, _src_y, static_cast<float>(_scale),
@@ -389,8 +411,9 @@ ImageResampleStage::process(RuntimeContext& ctx)
   tb.sideband = tin->sideband;
   tb.resize_contiguous(static_cast<size_t>(3) * out_w * out_h);
   const bool is_f32 = tin->dtype == TensorBeat::DType::F32;
-  if (_alg == 1) {
-    cpu_lanczos_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32);
+  if (_alg == 1 || _alg == 2) {
+    cpu_lanczos_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32,
+                 _alg == 2);
   } else {
     cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32);
   }

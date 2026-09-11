@@ -505,6 +505,12 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/vae-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/conditioner-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/detect-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/family-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/gen-input.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/image-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/hidden-state-encoder.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-set.h
@@ -537,6 +543,39 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-tile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-splitk.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.h
+        DESTINATION include/generative-models/shared)
+    # Sol-Attn, for the same reason i8-gemm.h is here: it is an
+    # ACCELERATION TIER a DiT opts into, not a model. It needs no weights
+    # and no checkpoint support, it reads the head-major q/k/v every
+    # unfused attention path already produces, and both of its halves are
+    # libvpipe's own flash kernel -- so an out-of-tree DiT that reaches
+    # these two headers gets the whole method, where one that cannot
+    # would have to reimplement the routing AND the block-sparse
+    # traversal that makes it pay.
+    #
+    # sol-attention.h is the configuration and the CPU oracle;
+    # metal-sol-attention.h is the driver. The kernels are already inside
+    # libvpipe, embedded, so nothing else has to ship.
+    #
+    # sage-attention.h is here for a blunter reason as well as that one:
+    # video-model-registry.h -- a header this list already installs --
+    # INCLUDES it, for the sage::Config it carries on both of its
+    # argument structs. Without it every out-of-tree video family fails
+    # to compile against the install on its first include, which is how
+    # this was found.
+    #
+    # accel-settings.h is the CONTRACT, and it is the one a family that
+    # implements none of these still wants: it is where the keys are
+    # documented and where the argument for the bag lives. It ships and
+    # updates with the host, which is the point -- the vocabulary is not
+    # in the struct layout, so a new key reaches an old binary as
+    # something it does not ask about rather than as a rebuild.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/accel-settings.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sol-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sage-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.h
         DESTINATION include/generative-models/shared)
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-sets/vae-conv3x3-tune.h

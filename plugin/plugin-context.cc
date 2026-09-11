@@ -14,6 +14,8 @@
 // registry call below carry the same gate metal libraries do.
 #include "generative-models/quantize-family-registry.h"
 #include "generative-models/vae-model-registry.h"
+#include "generative-models/family-profile.h"
+#include "generative-models/image-model-registry.h"
 #include "generative-models/video-model-registry.h"
 #endif
 
@@ -106,6 +108,74 @@ VpipePluginContext::register_video_family(
   }
   return false;
 #endif
+}
+
+bool
+VpipePluginContext::register_image_family(
+    std::unique_ptr<genai::ImageModelFamily> family)
+{
+  if (!family) { return false; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Read the tag BEFORE the move: after it, `family` is null.
+  const std::string tag(family->tag());
+  const bool ok =
+      genai::ImageModelRegistry::get().add(std::move(family));
+  if (_session != nullptr) {
+    if (ok) {
+      _session->log_normal(fmt(
+          "plugin '{}': registered image model family '{}'", _plugin, tag));
+    } else {
+      _session->warn(fmt(
+          "plugin '{}': image model family '{}' was NOT registered -- that "
+          "tag is already taken (or the family could not name itself). The "
+          "family already present keeps the tag", _plugin, tag));
+    }
+  }
+  return ok;
+#else
+  // `family` is destroyed here, which needs the type complete -- and on
+  // a non-apple build it is not. Leak the pointer rather than pretend:
+  // this branch cannot be reached by a working plugin (there is no
+  // generate-image to register with), and a plugin that gets here is
+  // already misbuilt.
+  (void)family.release();
+  if (_session != nullptr) {
+    _session->warn(fmt(
+        "plugin '{}': image model families are unsupported in this build",
+        _plugin));
+  }
+  return false;
+#endif
+}
+
+bool
+VpipePluginContext::register_family_profile(std::string domain,
+                                            std::string family,
+                                            FlexData profile)
+{
+  if (domain.empty() || family.empty()) { return false; }
+  // NOT gated on VPIPE_BUILD_APPLE_SILICON, unlike the family
+  // registrations beside it: a profile is a FlexData in a map, with no
+  // Metal type in it anywhere. A plugin that registers one on a build
+  // with no diffusion stages simply has nothing read it, which is the
+  // same as a graph that never wired a conditioner.
+  const std::string tag = family;
+  const std::string dom = domain;
+  const bool ok = genai::profile::Registry::get().add(
+      std::move(domain), std::move(family), std::move(profile));
+  if (_session != nullptr) {
+    if (ok) {
+      _session->log_normal(fmt(
+          "plugin '{}': registered '{}' profile for '{}'", _plugin, dom,
+          tag));
+    } else {
+      _session->warn(fmt(
+          "plugin '{}': '{}' profile for '{}' was NOT registered -- that "
+          "family already has one. The profile already present keeps the "
+          "family", _plugin, dom, tag));
+    }
+  }
+  return ok;
 }
 
 bool

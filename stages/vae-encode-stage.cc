@@ -1,3 +1,4 @@
+#include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
 
 #include "apple-silicon/tensor-beat.h"
@@ -56,6 +57,15 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   // now -- a model-select source on the model iport can supply it instead --
   // so the "no model at all" case is reported at initialize()/process() time.
   _hf_dir    = attr_str("hf_dir");
+  // THE ACCELERATION BAG, built once and handed to a registered family
+  // whole. Written whether the tier is on or off, and with the SETTLED
+  // value, so no family repeats this stage's reading or reaches a
+  // different answer than the log line did. The built-in codecs never
+  // see it: they are compiled with this stage and take their kernels
+  // from their own configs.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
+                         attr_bool("i8_gemm"));
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
@@ -229,6 +239,16 @@ const ConfigKey kAttrs[] = {
           "physical RAM vs the pipeline's weight bytes; \"always\" / "
           "\"never\" force it",
    .def_str = "auto"},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
+          "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
+          "is unimplemented: a codec is the last thing between a latent and "
+          "the pixels a person looks at, so an approximation in it has "
+          "nowhere to be absorbed -- where the same trade inside a DiT is "
+          "followed by dozens of blocks and a decode. It is settable so the "
+          "trade can be MEASURED. Only a REGISTERED family reads it; the "
+          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "image", .doc = "U8 or f32 RGB, channel-first (U8 0..255; f32 is "
@@ -394,7 +414,7 @@ VaeEncodeStage::vae_dir_for_release_() const
           session(), root, vae_dir,
           resolve_model(session(), _hf_dir).model_type)) {
     const std::string p = f->vae_path(root,
-                                      genai::VaeModelFamily::Role::kVideo);
+                                      genai::VaeModelFamily::kRoleVideo);
     if (!p.empty()) { return p; }
   }
 #endif
@@ -1022,6 +1042,13 @@ VaeEncodeStage::process(RuntimeContext& ctx)
                                      sH, sW, H, W, pad);
 
     genai::VaeEncodeRequest req;
+    req.accel = &_accel;
+    // ALWAYS INSTALLED, even though nothing is named yet: a
+    // family that had to guard every lookup would eventually
+    // forget one, and calling an empty std::function throws.
+    req.input =
+        [](std::string_view, genai::NamedTensor*) { return false; };
+
     req.pixels = norm.data();
     req.frames = in_frames;
     req.height = H;

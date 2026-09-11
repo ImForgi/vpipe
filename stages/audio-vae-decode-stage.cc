@@ -1,3 +1,4 @@
+#include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-decode-stage.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
@@ -39,6 +40,16 @@ const ConfigKey kAttrs[] = {
           "\"auto\" (default) decides from physical RAM vs the pipeline's "
           "weight bytes; \"always\" / \"never\" force it",
    .def_str = "auto"},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
+          "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
+          "is unimplemented: a codec is the last thing between a latent and "
+          "the pixels a person looks at, so an approximation in it has "
+          "nowhere to be absorbed -- where the same trade inside a DiT is "
+          "followed by dozens of blocks and a decode. It is settable so the "
+          "trade can be MEASURED. Only a REGISTERED family reads it; the "
+          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "latent",
@@ -115,6 +126,15 @@ AudioVaeDecodeStage::AudioVaeDecodeStage(const SessionContextIntf* s,
   // edited before hf_dir exists. The "no model at all" case is reported
   // at initialize()/process(), when iport connectivity is known.
   _hf_dir = attr_str("hf_dir");
+  // THE ACCELERATION BAG, built once and handed to a registered family
+  // whole. Written whether the tier is on or off, and with the SETTLED
+  // value, so no family repeats this stage's reading or reaches a
+  // different answer than the log line did. The built-in codecs never
+  // see it: they are compiled with this stage and take their kernels
+  // from their own configs.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
+                         attr_bool("i8_gemm"));
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -180,7 +200,7 @@ AudioVaeDecodeStage::declare_resources() const
     // twice, in two phases, and the audio VAE not at all. Asking by
     // ROLE is what tells them apart.
     const std::string a =
-        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { return model_memory::weight_claims({a}); }
     // No separate audio file: the family's single answer is the right
     // one, which is what a checkpoint with one VAE for both means.
@@ -229,7 +249,7 @@ AudioVaeDecodeStage::declare_memory() const
           genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root),
           resolve_model(session(), _hf_dir).model_type)) {
     m.holdings = f->declare_holdings(root,
-                                     genai::VaeModelFamily::Role::kAudio);
+                                     genai::VaeModelFamily::kRoleAudio);
     if (!m.holdings.empty()) {
       for (StageHolding& h : m.holdings) { h.releases = true; }
       return m;
@@ -256,7 +276,7 @@ AudioVaeDecodeStage::vae_dir_for_release_() const
           session(), root, h3,
           resolve_model(session(), _hf_dir).model_type)) {
     const std::string a =
-        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { return a; }
   }
   return h3;
@@ -510,6 +530,13 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
       co_return;
     }
     genai::AudioVaeDecodeRequest areq;
+    areq.accel = &_accel;
+    // ALWAYS INSTALLED, even though nothing is named yet: a
+    // family that had to guard every lookup would eventually
+    // forget one, and calling an empty std::function throws.
+    areq.input =
+        [](std::string_view, genai::NamedTensor*) { return false; };
+
     areq.latent = atb->as_f32();
     areq.shape.reserve(atb->shape.size());
     for (std::int64_t d : atb->shape) { areq.shape.push_back((int)d); }

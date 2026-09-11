@@ -19,7 +19,6 @@
 #include "stages/boogu-image-model-config-stage.h"
 #include "stages/flux2-model-config-stage.h"
 #include "stages/krea2-model-config-stage.h"
-#include "stages/mage-flow-model-config-stage.h"
 #include "stages/minimax-h3-model-config-stage.h"
 #include "stages/model-catalog.h"
 #include "stages/model-config-source.h"
@@ -29,7 +28,9 @@
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/flux2/metal-flux2-transformer.h"
-#include "generative-models/mage/mage-watermark.h"
+#include "generative-models/conditioner-profile.h"
+#include "generative-models/detect-profile.h"
+#include "generative-models/quantize-profile.h"
 #include "generative-models/shared/grounded-encode-params.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/generate-image-stage.h"
@@ -47,7 +48,7 @@ namespace {
 // Every config source, by the type name a pipeline spells.
 const char* const kSources[] = {
   "wan2-model-config", "minimax-h3-model-config", "flux2-model-config",
-  "mage-flow-model-config", "krea2-model-config", "boogu-image-model-config",
+  "krea2-model-config", "boogu-image-model-config",
   "qwen-image-edit-model-config",
 };
 
@@ -95,9 +96,6 @@ TEST(model_config, every_source_stamps_its_family)
     {model_config::family_of(
          Flux2ModelConfigStage(&sess, "c", {}, empty()).resolved_config()),
      "flux2"},
-    {model_config::family_of(
-         MageFlowModelConfigStage(&sess, "d", {}, empty()).resolved_config()),
-     "mage-flow"},
     {model_config::family_of(
          Krea2ModelConfigStage(&sess, "e", {}, empty()).resolved_config()),
      "krea2"},
@@ -167,11 +165,15 @@ TEST(model_config, each_family_keeps_its_own_grounding_numbers)
   EXPECT_TRUE(k.pixel_budget == 0u);
   EXPECT_TRUE(k.min_pixels == 0u);       // the tower's own default stands
 
+  // Mage-Flow is NOT in this table any more. Its numbers moved into the
+  // family's own conditioning profile when the family left this tree,
+  // and the table now answers for it the way it answers for any family
+  // it does not implement -- with nothing. That is the point: a
+  // registered family's numbers arrive WITH it, so the host holds no
+  // stale copy to disagree with the plugin.
   const GP m = GP::for_family("mage-flow");
-  EXPECT_TRUE(m.long_edge == 384);
-  EXPECT_TRUE(m.pixel_budget == 0u);
-  EXPECT_TRUE(m.min_pixels == 65536u);
-  EXPECT_TRUE(m.max_pixels == 16777216u);
+  EXPECT_TRUE(m.long_edge == 0);
+  EXPECT_TRUE(m.min_pixels == 0u);
 
   const GP b = GP::for_family("boogu-image");
   EXPECT_TRUE(b.long_edge == 768);       // NOT mage's 384
@@ -188,12 +190,175 @@ TEST(model_config, each_family_keeps_its_own_grounding_numbers)
 
   // merge_flex OVERLAYS: an absent key leaves the family number alone,
   // which is what makes naming one knob not reset the other three.
-  GP mm = GP::for_family("mage-flow");
+  GP mm = GP::for_family("boogu-image");
   auto cfg = FlexData::make_object();
   cfg.as_object().insert_or_assign("vl_long_edge", FlexData::make_int(512));
   mm.merge_flex(cfg);
   EXPECT_TRUE(mm.long_edge == 512);
   EXPECT_TRUE(mm.min_pixels == 65536u);   // untouched
+}
+
+// A conditioning PROFILE is how a registered family supplies what the
+// table above no longer holds.
+//
+// The two properties that make the bag work are the same pair the
+// acceleration bag is tested on, because they are what "add a key and
+// nothing breaks" actually means: an unknown key is ignored (a new
+// plugin talking to an old host) and a missing key is the documented
+// default (an old plugin talking to a new host).
+TEST(model_config, a_conditioning_profile_is_an_open_bag)
+{
+  namespace c_ = genai::cond;
+  FlexData p = FlexData::make_object();
+  {
+    auto o = p.as_object();
+    o.insert_or_assign(c_::kWeightPrefix,
+                       FlexData::make_string("model.language_model."));
+    o.insert_or_assign(c_::kBackboneOnly, FlexData::make_bool(false));
+    o.insert_or_assign(c_::kMaxSeq, FlexData::make_int(8192));
+    o.insert_or_assign(c_::kGroundedLongEdge, FlexData::make_int(384));
+    o.insert_or_assign("a_key_from_a_later_host", FlexData::make_int(7));
+  }
+  EXPECT_TRUE(c_::text(&p, c_::kWeightPrefix, "") == "model.language_model.");
+  EXPECT_FALSE(c_::flag(&p, c_::kBackboneOnly, true));
+  EXPECT_TRUE(c_::integer(&p, c_::kMaxSeq, 0) == 8192);
+  EXPECT_TRUE(c_::integer(&p, c_::kGroundedLongEdge, 0) == 384);
+  // A key this reader has never heard of costs nothing, which is what
+  // makes the bag open.
+  EXPECT_TRUE(c_::integer(&p, "a_key_from_a_later_host", 0) == 7);
+  // ...and a key the profile does not carry reads as the caller's
+  // documented default -- the SAME answer a null profile gives, so a
+  // family that said nothing and a host that asked about nothing agree.
+  EXPECT_TRUE(c_::text(&p, c_::kRefLabel, "Image") == "Image");
+  EXPECT_TRUE(c_::text(nullptr, c_::kRefLabel, "Image") == "Image");
+  EXPECT_TRUE(c_::integer(&p, c_::kEditDrop, 64) == 64);
+  EXPECT_TRUE(c_::integer(nullptr, c_::kEditDrop, 64) == 64);
+  EXPECT_FALSE(c_::has(nullptr, c_::kMaxSeq));
+}
+
+// The registry is FIRST-WINS per (DOMAIN, FAMILY), so two plugins
+// shipping one model cannot silently reshape each other -- and one
+// family's two domains do not collide with each other.
+TEST(model_config, a_family_profile_registry_is_first_wins_per_domain)
+{
+  auto& reg = genai::profile::Registry::get();
+  auto labelled = [](const char* v) {
+    FlexData f = FlexData::make_object();
+    f.as_object().insert_or_assign(genai::cond::kRefLabel,
+                                   FlexData::make_string(v));
+    return f;
+  };
+  EXPECT_TRUE(reg.add(std::string(genai::cond::kDomain), "test-fw",
+                      labelled("First")));
+  EXPECT_FALSE(reg.add(std::string(genai::cond::kDomain), "test-fw",
+                       labelled("Second")));
+  const FlexData* got = genai::cond::find("test-fw");
+  EXPECT_TRUE(got != nullptr);
+  if (got != nullptr) {
+    EXPECT_TRUE(genai::cond::text(got, genai::cond::kRefLabel, "") ==
+                "First");
+  }
+  // The SAME family in another domain is a different key, which is what
+  // makes one method serve every subsystem.
+  EXPECT_TRUE(reg.add(std::string(genai::quant::kDomain), "test-fw",
+                      labelled("Other")));
+  EXPECT_TRUE(genai::quant::find("test-fw") != nullptr);
+  EXPECT_TRUE(genai::cond::find("test-fw") == got);   // untouched
+
+  // A family nobody registered reads as null, which is every built-in
+  // family and is the case each domain's own defaults serve.
+  EXPECT_TRUE(genai::cond::find("krea2") == nullptr);
+  EXPECT_TRUE(genai::cond::find("") == nullptr);
+  EXPECT_FALSE(reg.add("", "test-fw", FlexData::make_object()));
+  EXPECT_FALSE(reg.add(std::string(genai::cond::kDomain), "",
+                       FlexData::make_object()));
+}
+
+// The detect domain: how a checkpoint is recognised on disk and what it
+// is called. A LABELLING answer -- what runs a checkpoint is claims().
+TEST(model_config, a_detect_profile_names_a_class_and_its_labels)
+{
+  namespace d = genai::detect;
+  FlexData p = FlexData::make_object();
+  {
+    auto o = p.as_object();
+    FlexData cls = FlexData::make_array();
+    cls.as_array().push_back(FlexData::make_string("AcmeDiT"));
+    o.insert_or_assign(d::kClassNames, cls);
+    o.insert_or_assign(d::kModelType, FlexData::make_string("acme"));
+    o.insert_or_assign(d::kModelTypeEdit,
+                       FlexData::make_string("acme-edit"));
+    o.insert_or_assign(d::kLabelFamily, FlexData::make_string("Acme"));
+    o.insert_or_assign(d::kLabelVersion, FlexData::make_string("Gen"));
+  }
+  EXPECT_TRUE(genai::profile::Registry::get().add(
+      std::string(d::kDomain), "acme-detect", std::move(p)));
+
+  // One class, two instantiations, chosen by the `edit` signal -- which
+  // is the shape every image family here has.
+  EXPECT_TRUE(d::model_type_for_class("AcmeDiT", false) == "acme");
+  EXPECT_TRUE(d::model_type_for_class("AcmeDiT", true) == "acme-edit");
+  // A class nobody claimed must stay unclaimed: this answer names a
+  // directory, and naming it wrong is how a fetch offers the wrong
+  // model.
+  EXPECT_TRUE(d::model_type_for_class("Krea2Transformer2DModel",
+                                      false).empty());
+  EXPECT_TRUE(d::model_type_for_class("", false).empty());
+
+  // The reverse lookup, which is what the label and modality tables
+  // need: they are keyed by model TYPE and a profile by family tag.
+  EXPECT_TRUE(d::for_model_type("acme") != nullptr);
+  EXPECT_TRUE(d::for_model_type("acme-edit") != nullptr);
+  EXPECT_TRUE(d::for_model_type("krea2") == nullptr);
+  EXPECT_TRUE(d::text(d::for_model_type("acme"), d::kLabelFamily, "") ==
+              "Acme");
+  // A profile that names classes and no type falls back to the family
+  // TAG, which is what every registry already calls it.
+  FlexData bare = FlexData::make_object();
+  {
+    FlexData cls = FlexData::make_array();
+    cls.as_array().push_back(FlexData::make_string("BareDiT"));
+    bare.as_object().insert_or_assign(d::kClassNames, cls);
+  }
+  EXPECT_TRUE(genai::profile::Registry::get().add(
+      std::string(d::kDomain), "bare-detect", std::move(bare)));
+  EXPECT_TRUE(d::model_type_for_class("BareDiT", false) == "bare-detect");
+}
+
+// The quantize domain answers the two questions that stage's closed
+// switches used to: what a family's DiT config calls itself, and which
+// tensor leaves are worth quantizing.
+TEST(model_config, a_quantize_profile_names_a_class_and_its_leaves)
+{
+  namespace q = genai::quant;
+  FlexData p = FlexData::make_object();
+  {
+    auto o = p.as_object();
+    o.insert_or_assign(q::kDitClassName, FlexData::make_string("AcmeDiT"));
+    FlexData leaves = FlexData::make_array();
+    leaves.as_array().push_back(FlexData::make_string("to_q"));
+    leaves.as_array().push_back(FlexData::make_string("to_k"));
+    o.insert_or_assign(q::kQuantLinears, leaves);
+  }
+  EXPECT_TRUE(genai::profile::Registry::get().add(
+      std::string(q::kDomain), "acme-test", std::move(p)));
+
+  // The class-name lookup is what lets the stage RECOGNISE a diffusers
+  // checkpoint of a family it does not implement.
+  EXPECT_TRUE(q::family_for_class("AcmeDiT") == "acme-test");
+  // ...and it must not answer for a name nobody claimed, or a
+  // checkpoint would be quantized with someone else's leaf set.
+  EXPECT_TRUE(q::family_for_class("Krea2Transformer2DModel").empty());
+  EXPECT_TRUE(q::family_for_class("").empty());
+
+  const std::vector<std::string> leaves =
+      q::strings(q::find("acme-test"), q::kQuantLinears);
+  EXPECT_TRUE(leaves.size() == 2);
+  // An ABSENT list is empty, and a caller must read that as "said
+  // nothing" rather than "quantize none" -- the two differ by the whole
+  // checkpoint.
+  EXPECT_TRUE(q::strings(q::find("acme-test"), q::kQuantExclude).empty());
+  EXPECT_TRUE(q::strings(nullptr, q::kQuantLinears).empty());
 }
 
 // The image families' beats, read back by the parsers that consume them.
@@ -225,22 +390,10 @@ TEST(model_config, image_families_read_back_their_own_beats)
             s.resolved_config());
     EXPECT_FALSE(p.klein_kv);
   }
-  {
-    // The watermark is ON unless the config says otherwise: a NEGATIVE
-    // key with a positive default, so the safe state needs no config.
-    MageFlowModelConfigStage on(&sess, "m", {}, FlexData::make_object());
-    EXPECT_TRUE(genai::mage_wm::Params::from_flex(
-                    on.resolved_config()).enabled);
-
-    auto cfg = FlexData::make_object();
-    cfg.as_object().insert_or_assign("no_watermark", FlexData::make_bool(true));
-    cfg.as_object().insert_or_assign("watermark_key",
-                                     FlexData::make_string("12345"));
-    MageFlowModelConfigStage off(&sess, "m2", {}, cfg);
-    const auto p = genai::mage_wm::Params::from_flex(off.resolved_config());
-    EXPECT_FALSE(p.enabled);
-    EXPECT_TRUE(p.key == "12345");
-  }
+  // Mage-Flow's own source -- and its provenance watermark, which was
+  // the other half of this case -- moved out of the tree with the
+  // family. Its equivalents live in the vpipe-mage-flow plugin's
+  // mage-watermark and mage-model-config tests.
 }
 
 // The consumer side of the seam: both diffusion stages take the config on

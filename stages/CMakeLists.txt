@@ -25,7 +25,6 @@ set(LOCAL_SOURCES
   wan2-model-config-stage.cc
   minimax-h3-model-config-stage.cc
   flux2-model-config-stage.cc
-  mage-flow-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
   qwen-image-edit-model-config-stage.cc
@@ -93,7 +92,6 @@ set(LOCAL_HEADERS
   wan2-model-config-stage.h
   minimax-h3-model-config-stage.h
   flux2-model-config-stage.h
-  mage-flow-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h
   qwen-image-edit-model-config-stage.h

@@ -60,7 +60,7 @@ public:
 private:
   int          _out_w{}, _out_h{};  // 0 on either axis = infer from AR
   int          _mode{};            // 0 pad, 1 crop, 2 stretch, 3 manual
-  int          _alg{1};            // 0 bilinear, 1 lanczos (the default)
+  int          _alg{1};   // 0 bilinear, 1 lanczos (default), 2 bicubic
   int          _src_x{}, _src_y{}; // manual source origin
   double       _scale{};           // manual resample ratio
   std::uint8_t _pad_r{}, _pad_g{}, _pad_b{};
@@ -78,11 +78,13 @@ private:
                      int out_w, int out_h,
                      std::uint8_t* dst, bool is_f32) const;
 
-  // CPU Lanczos-3 fallback (f32 frames, or no metal). Matches PIL LANCZOS and
-  // the resample_lanczos_planar_u8 GPU kernel's geometry.
+  // CPU separable-kernel fallback (f32 frames, no metal, or bicubic --
+  // which has no GPU twin). `cubic` picks Pillow's BICUBIC over
+  // Lanczos-3; both match PIL and the resample_lanczos_planar_u8 GPU
+  // kernel's geometry.
   void cpu_lanczos_(const std::uint8_t* src, int in_w, int in_h,
                     int out_w, int out_h,
-                    std::uint8_t* dst, bool is_f32) const;
+                    std::uint8_t* dst, bool is_f32, bool cubic) const;
 };
 
 }

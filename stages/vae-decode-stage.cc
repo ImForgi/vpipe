@@ -1,3 +1,4 @@
+#include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
 
 #include <cstring>
@@ -40,6 +41,15 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   // so the "no model at all" case is reported at initialize()/process() time
   // (when iport connectivity is known), not here.
   _hf_dir    = attr_str("hf_dir");
+  // THE ACCELERATION BAG, built once and handed to a registered family
+  // whole. Written whether the tier is on or off, and with the SETTLED
+  // value, so no family repeats this stage's reading or reaches a
+  // different answer than the log line did. The built-in codecs never
+  // see it: they are compiled with this stage and take their kernels
+  // from their own configs.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
+                         attr_bool("i8_gemm"));
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _fps = attr_real("fps");
   if (!(_fps > 0.0)) { _fps = 24.0; }
@@ -103,6 +113,16 @@ const ConfigKey kAttrs[] = {
           "physical RAM vs the pipeline's weight bytes; \"always\" / "
           "\"never\" force it",
    .def_str = "auto"},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
+          "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
+          "is unimplemented: a codec is the last thing between a latent and "
+          "the pixels a person looks at, so an approximation in it has "
+          "nowhere to be absorbed -- where the same trade inside a DiT is "
+          "followed by dozens of blocks and a decode. It is settable so the "
+          "trade can be MEASURED. Only a REGISTERED family reads it; the "
+          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "latent",
@@ -465,7 +485,7 @@ VaeDecodeStage::declare_memory() const
           session(), root, resolve_vae_dir(root),
           resolve_model(session(), _hf_dir).model_type)) {
     m.holdings = f->declare_holdings(root,
-                                     genai::VaeModelFamily::Role::kVideo);
+                                     genai::VaeModelFamily::kRoleVideo);
     if (!m.holdings.empty()) {
       // The POLICY is this stage's: a decode's weights go at its idle
       // point, which is what `releases` means here.
@@ -510,7 +530,7 @@ VaeDecodeStage::vae_dir_for_release_() const
           session(), root, generic, resolve_model(session(), _hf_dir)
                                         .model_type)) {
     const std::string p =
-        f->vae_path(root, genai::VaeModelFamily::Role::kVideo);
+        f->vae_path(root, genai::VaeModelFamily::kRoleVideo);
     if (!p.empty()) { return p; }
   }
   const std::string h3 = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
@@ -1452,6 +1472,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     UiProgress bar;
     bool bar_open = false;
     genai::VaeDecodeRequest req;
+    req.accel = &_accel;
+    // ALWAYS INSTALLED, even though nothing is named yet: a
+    // family that had to guard every lookup would eventually
+    // forget one, and calling an empty std::function throws.
+    req.input =
+        [](std::string_view, genai::NamedTensor*) { return false; };
+
     req.latent = tbp->as_f32();
     req.shape.reserve(tbp->shape.size());
     for (std::int64_t d : tbp->shape) { req.shape.push_back((int)d); }

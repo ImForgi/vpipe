@@ -392,6 +392,36 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                 "so it cannot be smaller than 32"));
     }
   }
+  // THE BAG, and the typed views are read BACK OUT OF IT rather than
+  // kept beside it. Two spellings of one decision drift; one spelling
+  // with two readers cannot. The in-tree models still take a typed
+  // Config -- they are compiled with this stage and have no ABI to
+  // protect -- and a plugin family gets the bag itself.
+  //
+  // Written whether the tier is on or off, and with the SETTLED value:
+  // `sol_key_block` here is what the check above fell back to, not what
+  // the graph said, so no family has to repeat that validation or can
+  // reach a different answer than the log line did.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm, _i8_gemm);
+  genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
+  genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
+                            _sage.dense_layers);
+  genai::accel::set_flag(&_accel, genai::accel::kSolAttn, _sol.enabled);
+  genai::accel::set_real(&_accel, genai::accel::kSolTau, (double)_sol.tau);
+  genai::accel::set_integer(&_accel, genai::accel::kSolKeyBlock,
+                            _sol.key_block);
+  genai::accel::set_integer(&_accel, genai::accel::kSolDenseLayers,
+                            _sol.dense_layers);
+  genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
+                            _sol.local_radius);
+  // ...and back out, which is the half that makes it one decision. If a
+  // key is ever written under one name and read under another, this is
+  // where it stops being true rather than three plugins away.
+  _sol  = genai::sol::config_from_flex(&_accel);
+  _sage = genai::sage::config_from_flex(&_accel);
+  _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+
   _seed   = (std::uint64_t)attr_int("seed");
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
@@ -1314,8 +1344,7 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   req.steps  = _steps;
   req.seed   = _seed;
 
-  req.sage    = _sage;
-  req.i8_gemm = _i8_gemm;
+  req.accel = &_accel;
 
   req.cond          = cond;
   req.cond_rows     = cond_rows;
@@ -1393,6 +1422,11 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
     return !ctx.stop_requested();
   };
 
+  // ALWAYS INSTALLED, even though nothing is named yet. A family that
+  // had to guard every lookup would eventually forget one, and calling
+  // an empty std::function throws -- which on this path is a family
+  // taking the host down for asking a question the answer to is "no".
+  req.input = [](std::string_view, genai::NamedTensor*) { return false; };
   try {
     const bool ok = _plugin_gen->generate(req, out);
     bar.finish();
@@ -1440,8 +1474,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // What the graph asked for, so a plugin family can build the same
     // kernel variants the in-tree ones do. Nothing here is applied on
     // the family's behalf: these are what it was ASKED, not what it got.
-    args.sage    = _sage;
-    args.i8_gemm = _i8_gemm;
+    args.accel = &_accel;
     // The clip this graph intends to make, through the family's own
     // rounding, so a load-time decision that scales with the beat has the
     // right order of magnitude instead of a constant. Left at 0 when the

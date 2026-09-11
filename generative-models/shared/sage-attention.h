@@ -1,6 +1,8 @@
 #ifndef GENERATIVE_MODELS_SHARED_SAGE_ATTENTION_H
 #define GENERATIVE_MODELS_SHARED_SAGE_ATTENTION_H
 
+#include "generative-models/shared/accel-settings.h"
+
 // SageAttention: the QK^T product of a flash attention run in INT8.
 //
 // thu-ml/SageAttention (Zhang et al., arXiv:2410.02367). This is a
@@ -83,6 +85,25 @@ struct Config {
   // run a model.
   bool smooth_k = true;
 };
+
+// The same settings out of the acceleration BAG a generating stage hands
+// every family (accel-settings.h). Header-only, so it compiles into the
+// caller and an old plugin reads the keys its own host documented; see
+// the note beside sol::config_from_flex for why that matters.
+//
+// `smooth_k` is NOT a key. It is the A/B that shows why the smoothing
+// exists, not a supported way to run a model, so it stays a compile-time
+// decision of whoever is measuring rather than something a graph can
+// turn off.
+inline Config
+config_from_flex(const FlexData* bag)
+{
+  Config c;
+  c.enabled = accel::flag(bag, accel::kSageAttn, c.enabled);
+  c.dense_layers =
+      (int)accel::integer(bag, accel::kSageDenseLayers, c.dense_layers);
+  return c;
+}
 
 // The key mean is a reduction over the whole sequence, and doing it with
 // one thread per channel is D * heads threads each walking every token --

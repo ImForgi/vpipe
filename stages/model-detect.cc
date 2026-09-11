@@ -1,5 +1,7 @@
 #include "stages/model-detect.h"
 
+#include "generative-models/detect-profile.h"
+
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 
 #include "common/flex-data.h"
@@ -185,8 +187,6 @@ family_version_(const std::string& mt, std::string& family,
       {"flux2",                  "FLUX",        "2"},
       {"flux2-lora",             "FLUX",        "2"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
-      {"mage-flow",              "Mage-Flow",   "Gen"},
-      {"mage-flow-edit",         "Mage-Flow",   "Edit"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
       {"wan-i2v",                "Wan",         "2.2-I2V"},
@@ -206,6 +206,21 @@ family_version_(const std::string& mt, std::string& family,
   };
   for (const auto& r : kRows) {
     if (mt == r.mt) { family = r.family; version = r.version; return; }
+  }
+  // A REGISTERED family's own labels. The table above is the families
+  // this tree implements; a plugin's belongs with the plugin, and
+  // without it an out-of-tree checkpoint shows in a browser as a model
+  // type and no name.
+  if (const FlexData* p = genai::detect::for_model_type(mt)) {
+    const std::string f = genai::detect::text(p, genai::detect::kLabelFamily,
+                                              "");
+    if (!f.empty()) { family = f; }
+    const bool is_edit =
+        genai::detect::text(p, genai::detect::kModelTypeEdit, "") == mt;
+    const std::string v = genai::detect::text(
+        p, is_edit ? genai::detect::kLabelVersionEdit
+                   : genai::detect::kLabelVersion, "");
+    if (!v.empty()) { version = v; }
   }
 }
 
@@ -265,12 +280,18 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   // NOT inferred from the name the way `edit` is below: a wrong `edit` guess
   // picks a sibling checkpoint, while a wrong recipe guess silently produces
   // wrong IMAGES from a model that loads and runs perfectly.
+  // A REGISTERED family, asked FIRST only in the sense that its answer
+  // is checked before the fall-through below -- the built-in names are
+  // still matched first, so a plugin cannot take a class name this tree
+  // owns. Without this a checkpoint of an out-of-tree family sitting in
+  // a models directory cannot be named at all.
+  //
+  // Deliberately a LABELLING answer, not a loading one: what runs a
+  // checkpoint is `claims()` on the model registries, which reads the
+  // weights rather than a table.
   if (cls == "Flux2Transformer2DModel")      { return "flux2"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }
-  if (cls == "MageFlow") {
-    return edit ? "mage-flow-edit" : "mage-flow";
-  }
   if (cls == "BooguImageTransformer2DModel") {
     // The t2i and edit repos ship the SAME transformer config (only the
     // weights differ), so the name is the only signal.
@@ -297,7 +318,9 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     if (partition == "ref2va") { return "minimax-h3-ref2va"; }
     return {};
   }
-  return {};
+  // Last: a REGISTERED family. Asked after every built-in name so a
+  // plugin cannot take a class this tree owns.
+  return genai::detect::model_type_for_class(cls, edit);
 }
 
 // ---- a Comfy-Org repack ----------------------------------------------
@@ -912,6 +935,13 @@ resolve_vae_dir(const std::string& root)
   // Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
   // complete pipelines, and detection over a Ref2VA-only checkout that
   // probed FL2VA alone found no VAE at all.
+  // VOSR ships its autoencoder under the name of the model it was
+  // extracted from rather than under `vae/`, so a graph pointing every
+  // stage at one checkpoint root would otherwise find no VAE and open
+  // the root itself.
+  if (fs::exists(fs::path(root) / "Qwen-Image-vae-2d" / "config.json")) {
+    return (fs::path(root) / "Qwen-Image-vae-2d").string();
+  }
   for (const fs::path& p : {fs::path(root) / "video_vae",
                             fs::path(root) / "FL2VA" / "video_vae",
                             fs::path(root) / "Ref2VA" / "video_vae"}) {
