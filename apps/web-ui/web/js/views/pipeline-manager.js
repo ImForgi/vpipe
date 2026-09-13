@@ -1,7 +1,7 @@
 // Pipeline Manager view: three panes -- pipeline list (1/4), stage
 // graph (1/2), and the config panel (1/4).
 
-import { el, clear, append, toast, openModal, openMenu, kbd }
+import { el, clear, append, toast, openModal, openErrorModal, openMenu, kbd }
   from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
@@ -742,8 +742,19 @@ function mountEditor(container, opts = {}) {
       await api[op](id);
       toast(t('pl.op_done', { op: opLabel[op] || op, id }), 'ok');
     } catch (e) {
-      toast(t('pl.op_failed', { op: opLabel[op] || op, msg: e.message }),
-            'error');
+      // A refused START carries the runtime's reason for refusing it,
+      // which is the same kind of text a refused load carries; pause
+      // and stop fail with one line and stay toasts.
+      if (op === 'launch') {
+        openErrorModal({
+          title: t('pl.launch_failed_title'),
+          message: e.message,
+          okLabel: t('common.close'),
+        });
+      } else {
+        toast(t('pl.op_failed', { op: opLabel[op] || op, msg: e.message }),
+              'error');
+      }
     } finally {
       state.inflight.delete(id);
     }
@@ -2315,7 +2326,14 @@ function mountEditor(container, opts = {}) {
           const d = await api.loadPipeline(p);
           state.selectedId = d.id; await refreshList();
         } catch (e) {
-          toast(t('pl.load_failed', { msg: e.message }), 'error');
+          // A spec the loader refused says exactly what it objected to
+          // and where. That belongs in front of whoever picked the
+          // file, not in a toast that expires before it can be read.
+          openErrorModal({
+            title: t('pl.load_failed_title'),
+            message: e.message,
+            okLabel: t('common.close'),
+          });
         }
       },
     });

@@ -52,7 +52,8 @@ const ConfigKey kAttrs[] = {
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+   .suggest_db_type = "krea2,flux2,qwen-image,qwen-image-edit,"
+       "mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
@@ -343,6 +344,12 @@ constexpr const char* kPrefix =
     "size, texture, quantity, text, spatial relationships of the objects and "
     "background:<|im_end|>\n<|im_start|>user\n";
 constexpr const char* kSuffix = "<|im_end|>\n<|im_start|>assistant\n";
+// The drop counts are the TOKEN length of each prefix, so they are a
+// property of the tokenizer as much as of the string. MEASURED against
+// Qwen-Image-2512's own Qwen2Tokenizer, encoded the way encode_with_
+// specials_ encodes: kPrefix is exactly 34 ids and kQiePrefix exactly
+// 64. A prefix edited without re-counting silently shifts every
+// conditioning row by the difference.
 constexpr int kDropPrefix = 34;
 const int kSelectLayers[12] = {2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35};
 const int kFluxTaps[3] = {9, 18, 27};
@@ -685,6 +692,45 @@ std::string family_(const std::string& transformer_dir)
   return "krea2";
 }
 
+// Which of the TWO Qwen-Image recipes a checkpoint takes.
+//
+// Qwen publishes one architecture as two diffusers pipelines --
+// QwenImagePipeline (text-to-image: Qwen-Image, Qwen-Image-2512) and
+// QwenImageEditPlusPipeline (Qwen-Image-Edit-2511) -- and they condition
+// through DIFFERENT system prompts. The weights cannot tell them apart:
+// 2512 and Edit-2511 are identical tensor for tensor, names, dtypes and
+// shapes alike, so `_class_name` in transformer/config.json says
+// QwenImageTransformer2DModel for both.
+//
+// So the recipe is READ, never inferred from whether a reference image
+// happens to be wired. Boogu-Image does infer it that way and is right
+// to: ITS pipeline picks the system prompt by whether an input image is
+// present. Qwen's picks by which pipeline you called, and the same
+// checkpoint run text-only still uses its own template -- which is why
+// the edit model's text-only golden exists and must keep passing.
+//
+// Two signals, in order of authority: what the registry recorded when
+// the model was fetched (the catalogue's model_type, which is explicit),
+// then the pipeline the checkpoint itself declares in model_index.json.
+// Neither present -- a bare directory of weights -- keeps the edit
+// answer, which is the only one this tree had before and the only one
+// any existing graph can be relying on.
+bool
+qwen_image_is_t2i_(const std::string& root, const std::string& model_type)
+{
+  if (model_type == "qwen-image") { return true; }
+  if (model_type == "qwen-image-edit") { return false; }
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(root) / "model_index.json");
+  if (!in) { return false; }
+  FlexData fd = FlexData::from_json(in);
+  if (!fd.is_object()) { return false; }
+  auto obj = fd.as_object();
+  if (!obj.contains("_class_name")) { return false; }
+  return std::string(obj.at("_class_name").as_string("")) ==
+         "QwenImagePipeline";
+}
+
 // Extract prompt text from a FlexData beat (string or {text: ...}).
 std::string flex_text_(const FlexData& fd)
 {
@@ -775,13 +821,29 @@ DiffusionConditionerStage::load_dinov2_(metal_compute::MetalCompute* mc,
   // model-fetch writes. The tower is a SEPARATE download -- the VOSR
   // release ships its own weights and lets torch.hub fetch DINOv2 -- so
   // there is no fourth place where it might be hiding.
+  // A registry MISS RETURNS THE REFERENCE UNCHANGED, because a plain
+  // filesystem path has to keep working (see resolve_model). So a key
+  // that is not registered comes back looking like an answer, and taking
+  // it as a directory is how a missing tower reported "no readable
+  // DINOv2 config.json in 'facebook/dinov2-large'" and then failed to
+  // open it -- two messages about a path that was never a path, instead
+  // of the one below that says what to do. Accept a resolution only when
+  // the registry knew it or the directory is really there.
+  auto resolved_dir = [this](const std::string& ref) -> std::string {
+    const ResolvedModel rm = resolve_model(session(), ref);
+    std::error_code rec;
+    if (rm.from_registry || fs::is_directory(fs::path(rm.dir), rec)) {
+      return rm.dir;
+    }
+    return std::string();
+  };
   std::string dir;
   if (!_venc_dir.empty()) {
-    dir = resolve_model_dir(session(), _venc_dir);
+    dir = resolved_dir(_venc_dir);
     if (dir.empty()) {
       session()->error(fmt(
-          "DiffusionConditionerStage('{}'): encoder_dir '{}' does not "
-          "resolve", this->id(), _venc_dir));
+          "DiffusionConditionerStage('{}'): encoder_dir '{}' is neither a "
+          "registered model nor a directory", this->id(), _venc_dir));
       return false;
     }
   }
@@ -790,12 +852,15 @@ DiffusionConditionerStage::load_dinov2_(metal_compute::MetalCompute* mc,
     dir = (fs::path(root) / "dinov2").string();
   }
   if (dir.empty()) {
-    dir = resolve_model_dir(session(), "facebook/dinov2-large");
+    dir = resolved_dir("facebook/dinov2-large");
   }
   if (dir.empty()) {
     session()->error(fmt(
         "DiffusionConditionerStage('{}'): VOSR needs a DINOv2 checkpoint and "
-        "none was found. Fetch facebook/dinov2-large, or set encoder_dir",
+        "none was found. It is a SEPARATE download -- the restorer's own repo "
+        "ships the tower only as a torch.hub pickle -- so fetch "
+        "facebook/dinov2-large with model-fetch (the prepare-vosr-2 recipe "
+        "fetches it beside the restorer), or point encoder_dir at a copy",
         this->id()));
     return false;
   }
@@ -1325,6 +1390,8 @@ DiffusionConditionerStage::ensure_loaded_()
   // read here rather than there so the lookup happens once.
   _model_type = resolve_model(session(), _hf_dir).model_type;
   _family = family_((std::filesystem::path(root) / "transformer").string());
+  _qie_t2i = (_family == "qwen-image-edit")
+             && qwen_image_is_t2i_(root, _model_type);
   // Seeded here and again below: the H3 probe can still change the
   // family, and `_ground` has to describe whichever one wins.
   apply_model_config_();
@@ -2212,17 +2279,44 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // QIE-2511 is MULTI-reference: one "Picture N: " labelled block per wired
     // picture, each expanded to its own vision-token count.
     const int nref = (img_aware && pad_id >= 0) ? _img_n : 0;
+    // WHICH template, decided by the CHECKPOINT (see qwen_image_is_t2i_)
+    // and not by whether a reference is wired. QwenImageEditPlusPipeline
+    // opens "Describe the key features of the input image";
+    // QwenImagePipeline opens "Describe the image by detailing", which
+    // kPrefix already holds for Krea-2 and Mage-Flow. The edit model
+    // uses its own template even when it is run text-only -- that is
+    // what its text-only golden pins -- so keying this on the reference
+    // would have changed an answer that is already verified. Without the
+    // distinction, a text-to-image checkpoint (Qwen-Image-2512, whose
+    // weights are the edit model's architecture tensor for tensor) would
+    // load, run, and condition on a system prompt describing an input
+    // image it was never given.
+    const bool edit_tmpl = !_qie_t2i;
+    // A reference wired to a text-to-image checkpoint has nowhere to go:
+    // its template carries no vision block, so the tower's rows would be
+    // encoded and then dropped. Said once per generation rather than
+    // per encode, and said at all because the alternative is a graph
+    // that looks wired and conditions as if it were not.
+    if (!edit_tmpl && nref > 0 && std::strcmp(which, "prompt") == 0) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): {} reference image(s) wired to a "
+          "TEXT-TO-IMAGE Qwen-Image checkpoint; ignored -- use an edit "
+          "checkpoint (Qwen-Image-Edit) to condition on a picture",
+          this->id(), nref));
+    }
+    const int drop = edit_tmpl ? kQieDropPrefix : kDropPrefix;
     std::string tmpl =
-        std::string(kQiePrefix) + ref_blocks_(nref, "Picture") +
-        text + std::string(kQieSuffix);
+        (edit_tmpl ? std::string(kQiePrefix) + ref_blocks_(nref, "Picture")
+                   : std::string(kPrefix)) +
+        text + (edit_tmpl ? std::string(kQieSuffix) : std::string(kSuffix));
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
     std::vector<std::pair<int, int>> runs;
     if (nref > 0) {
       runs = expand_pads_(ids, pad_id, _img_tok, nref);
     }
-    if ((int)ids.size() <= kQieDropPrefix) { return {}; }
+    if ((int)ids.size() <= drop) { return {}; }
     const int n = (int)ids.size();
-    const int n_real = n - kQieDropPrefix;
+    const int n_real = n - drop;
     SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
     if (x.empty()) { return {}; }
     {
@@ -2279,7 +2373,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
     auto* op = static_cast<std::uint16_t*>(txt.contents());
     for (int p = 0; p < n_real; ++p) {
-      const auto* row = tp + (std::size_t)(p + kQieDropPrefix) * EH;
+      const auto* row = tp + (std::size_t)(p + drop) * EH;
       double ss = 0.0;
       for (int h = 0; h < EH; ++h) { const double v = bf16_to_f32_(row[h]);
                                      ss += v * v; }
@@ -2292,7 +2386,10 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     n_real_out = n_real;
     session()->log_debug(fmt("DiffusionConditionerStage('{}'): [{}] qie -> "
                              "[{}, {}]{}", this->id(), which, n_real, TD,
-                             img_aware ? ", image-aware" : ""));
+                             edit_tmpl
+                                 ? (img_aware ? ", image-aware (edit template)"
+                                              : " (edit template)")
+                                 : " (text-to-image template)"));
     return txt;
   }
 

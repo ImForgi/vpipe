@@ -1,4 +1,7 @@
 #include "minitest.h"
+#include "apple-silicon/metal-compute/command-stream.h"
+#include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "apple-silicon/metal-compute/texture.h"
@@ -9,9 +12,11 @@
 #include <Metal/Metal.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 using namespace vpipe;
 using namespace vpipe::metal_compute;
@@ -398,4 +403,129 @@ TEST(metal_compute_residency, a_subview_adds_the_whole_parent) {
   }
   const std::size_t held = mc->memory_budget().allocated;
   EXPECT_TRUE(held >= base + kBytes / 2);
+}
+
+// WHERE A FREED GPU BUFFER'S PAGES GO. A probe, not a check.
+//
+// After a 1920x1152 Wan decode the process footprint stayed at 11 GB with
+// 278 MB of live SharedBuffers, and the graphics ledger said it was GPU
+// memory. Nothing in this tree retains a freed buffer -- the residency set
+// is empty, command buffers are released in local pools -- so this asks
+// the driver directly, one release strategy at a time: device
+// currentAllocatedSize, the process graphics ledger, the footprint and the
+// live-handle count after each step. VPIPE_FREED_MEMORY_PROBE to run.
+TEST(metal_compute_residency, freed_buffer_pages_probe) {
+  if (std::getenv("VPIPE_FREED_MEMORY_PROBE") == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib = mc->load_library("llm_elementwise");
+  ComputeFunction clamp = lib.function("clamp_f16");
+  ASSERT_TRUE(clamp.valid());
+  if (!clamp.valid()) { return; }
+
+  constexpr std::size_t kBytes = 1ull << 30;
+  auto snap = [&](const char* what) {
+    const auto mb = mc->memory_budget();
+    std::printf("  %-32s allocated %6zu  graphics %6zu  footprint %6zu  "
+                "live %6zu  (MB)\n", what, mb.allocated >> 20,
+                mb.self_graphics >> 20, mb.self_footprint >> 20,
+                shared_buffer_memory_stats().live_bytes >> 20);
+  };
+  // Every element read and written by a GPU dispatch, in place.
+  auto gpu_touch = [&](SharedBuffer& b) {
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      const int n = (int)(b.byte_size() / 2);
+      enc.set_function(clamp);
+      enc.set_buffer(0, b); enc.set_buffer(1, b);
+      enc.set_constant(2, n);
+      enc.set_constant(3, -1.0e4f); enc.set_constant(4, 1.0e4f);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    }
+    st.commit().wait();
+  };
+  auto settle = [](int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  };
+
+  snap("start");
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    ASSERT_TRUE(!b.empty());
+    if (b.empty()) { return; }
+    std::memset(b.contents(), 0, kBytes);
+    snap("A cpu-touched, live");
+  }
+  snap("A freed");
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    if (b.empty()) { return; }
+    gpu_touch(b);
+    snap("B gpu-touched, live");
+  }
+  snap("B freed");
+  settle(2000);
+  snap("B freed + 2 s");
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    if (b.empty()) { return; }
+    gpu_touch(b);
+    b.mtl_buffer()->setPurgeableState(MTL::PurgeableStateEmpty);
+    snap("C purgeable-empty, live");
+  }
+  snap("C freed");
+  {
+    SharedBuffer b = mc->make_shared_buffer(kBytes);
+    if (b.empty()) { return; }
+    gpu_touch(b);
+    snap("D same size again, live");
+  }
+  snap("D freed");
+  {
+    SharedBuffer b = mc->make_shared_buffer(2 * kBytes);
+    if (b.empty()) { return; }
+    gpu_touch(b);
+    snap("E twice the size, live");
+  }
+  snap("E freed");
+  settle(2000);
+  snap("E freed + 2 s");
+
+  // HOW LONG, and does GPU work flush it. Free a GPU-touched buffer and
+  // poll the graphics ledger every 20 ms until it is back within 64 MB of
+  // where it started; with `flush`, a tiny unrelated command buffer is
+  // submitted and waited on right after the free.
+  SharedBuffer tiny = mc->make_shared_buffer(1 << 20);
+  if (tiny.empty()) { return; }
+  auto time_release = [&](std::size_t bytes, bool flush) {
+    const std::size_t base = mc->memory_budget().self_graphics;
+    {
+      SharedBuffer b = mc->make_shared_buffer(bytes);
+      if (b.empty()) { return; }
+      gpu_touch(b);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (flush) { gpu_touch(tiny); }
+    const std::size_t held = mc->memory_budget().self_graphics;
+    double ms = -1.0;
+    for (int i = 0; i < 500; ++i) {
+      if (mc->memory_budget().self_graphics <= base + (64ull << 20)) {
+        ms = std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count();
+        break;
+      }
+      settle(20);
+    }
+    std::printf("  release %zu MB%s: held %zu MB just after, back in %s\n",
+                bytes >> 20, flush ? " + flush" : "        ",
+                held > base ? (held - base) >> 20 : 0,
+                ms < 0 ? "> 10 s" : fmt("{:.0f} ms", ms)().c_str());
+    settle(500);
+  };
+  for (std::size_t gb : {1, 2, 4}) {
+    time_release(gb << 30, false);
+    time_release(gb << 30, true);
+  }
 }

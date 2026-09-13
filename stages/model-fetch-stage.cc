@@ -1101,7 +1101,17 @@ ModelFetchStage::process(RuntimeContext& ctx)
   const bool want_tok = _prepare_tokenizer && entry
                         && entry->needs_tokenizer_json;
   if (want_tok) {
-    const fs::path tj = local_dir / "tokenizer.json";
+    // WHERE the sources live varies by repo, and the answer is simply
+    // where vocab.json is: the ASR repos put it at the root, a diffusers
+    // pipeline puts it in tokenizer/ beside the pipeline's other
+    // subfolders. Synthesize in that same directory, because that is
+    // also where every reader looks for the result.
+    fs::path tok_dir = local_dir;
+    if (!fs::exists(local_dir / "vocab.json")
+        && fs::exists(local_dir / "tokenizer" / "vocab.json")) {
+      tok_dir = local_dir / "tokenizer";
+    }
+    const fs::path tj = tok_dir / "tokenizer.json";
     std::error_code ec;
     if (fs::exists(tj) && fs::file_size(tj, ec) > 0 && !ec) {
       s->info(fmt("ModelFetchStage('{}'): tokenizer.json already present",
@@ -1112,7 +1122,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
                   this->id()));
       string perr;
       tokenizer_ready =
-          prepare_qwen_asr_tokenizer_json(local_dir.string(), perr);
+          prepare_qwen_asr_tokenizer_json(tok_dir.string(), perr);
       if (tokenizer_ready) {
         s->info(fmt("ModelFetchStage('{}'): tokenizer.json prepared",
                     this->id()));
@@ -1177,6 +1187,46 @@ ModelFetchStage::process(RuntimeContext& ctx)
 
   s->info(fmt("ModelFetchStage('{}'): registered '{}' in the model "
               "registry", this->id(), reg_key));
+
+  // THE SUPPLEMENTS THIS MODEL HAS, and which of them are still absent.
+  //
+  // A supplement is a second checkpoint some stage looks for at RUN
+  // time: VOSR cross-attends to a DINOv2 tower that its own repo ships
+  // only as a torch.hub pickle, a CoreML vision tower sits beside an LM.
+  // The catalogue already records the link -- that is what
+  // `parent_model_type` is -- but nothing acted on it, so the gap
+  // surfaced as a pipeline refusing much later, in a stage that knows
+  // nothing about fetching. Said HERE the answer is one more fetch.
+  //
+  // LISTED, not fetched: the catalogue does not record whether a
+  // supplement is required or optional (a vision tower is a choice, a
+  // DINOv2 tower is not), and downloading gigabytes nobody asked for on
+  // a guess is the worse error of the two.
+  if (entry != nullptr && !entry->model_type.empty()) {
+    vector<string> absent;
+    {
+      LmdbDb  sdb(*env, kModelRegistryDb);
+      LmdbTxn stxn(*env, LmdbTxn::Mode::ReadOnly);
+      for (const ModelCatalogEntry& sup : model_catalog()) {
+        if (sup.parent_model_type != entry->model_type) { continue; }
+        if (!sup.parent_param_class.empty()
+            && sup.parent_param_class != entry->param_class) {
+          continue;
+        }
+        const string skey = sup.name.empty() ? sup.hf_path : sup.name;
+        if (sdb.get(stxn, skey).has_value()) { continue; }
+        absent.push_back(skey);
+      }
+    }
+    if (!absent.empty()) {
+      s->warn(fmt(
+          "ModelFetchStage('{}'): the catalogue lists {} companion "
+          "checkpoint(s) for this model that are NOT fetched: {}. A stage "
+          "that wants one will refuse at launch; fetch each with "
+          "model-fetch model_path=<key>", this->id(), absent.size(),
+          join_(absent)));
+    }
+  }
   ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
   ro.insert_or_assign("text", FlexData::make_string(
       fmt("[model-fetch] {}\n  -> {}\n  {} file(s), {} bytes",

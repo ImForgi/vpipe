@@ -22,6 +22,13 @@ LibraryHandle::LibraryHandle(const LogSinkIntf* log,
   }
   const char* err = ::dlerror();
   string err_msg = err ? err : "unknown error";
+  // No sink is a legitimate caller: `vpipe --list-models` loads plugins
+  // before any session exists. A plugin with an unresolved host symbol
+  // (built against an older libvpipe) failed dlopen here and took the
+  // process down with it, before the ABI check could refuse it.
+  if (_log == nullptr) {
+    return;
+  }
   if (mode == LoadMode::Required) {
     _log->error(
       fmt("dlopen failed for {}: {}", _path, err_msg));
@@ -87,7 +94,7 @@ void*
 LibraryHandle::require_symbol(string_view name) const
 {
   void* sym = get_symbol(name);
-  if (sym) {
+  if (sym || _log == nullptr) {
     return sym;
   }
   _log->error(

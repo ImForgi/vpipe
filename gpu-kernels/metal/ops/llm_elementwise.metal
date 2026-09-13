@@ -4339,17 +4339,18 @@ kernel void group_norm_apply_f16(
 // hardware-conv path uses (out-channel fastest), so no extra weight twin.
 //   0:x 1:whwio 2:bias 3:out 4:Wd 5:Hd 6:cin 7:cout 8:has_bias
 //   grid {Wd, Hd}: one thread per output pixel.
-kernel void conv3x3_hwc_small_cout_f16(
-    const device VPIPE_ELT* x     [[buffer(0)]],
-    const device VPIPE_ELT* whwio [[buffer(1)]],
-    const device VPIPE_ELT* bias  [[buffer(2)]],
-    device VPIPE_ELT*       out   [[buffer(3)]],
-    constant int&           Wd       [[buffer(4)]],
-    constant int&           Hd       [[buffer(5)]],
-    constant int&           cin      [[buffer(6)]],
-    constant int&           cout_n   [[buffer(7)]],
-    constant int&           has_bias [[buffer(8)]],
-    uint3 gid [[thread_position_in_grid]])
+//
+// The _acc twin ADDS to what `out` already holds, so a causal 3x3x3 conv
+// runs as one call per temporal tap against that tap's [3,3,cin,cout]
+// block, with no three-frame concat (the Wan VAE's head, 3x96 -> 3 at
+// full resolution). Same contract.
+static inline void
+conv3x3_small_cout_body_(const device VPIPE_ELT* x,
+                         const device VPIPE_ELT* whwio,
+                         const device VPIPE_ELT* bias,
+                         device VPIPE_ELT* out, int Wd, int Hd, int cin,
+                         int cout_n, int has_bias, uint3 gid,
+                         bool accumulate)
 {
   const int px = (int)gid.x;
   const int py = (int)gid.y;
@@ -4376,10 +4377,43 @@ kernel void conv3x3_hwc_small_cout_f16(
     }
     const long ob = ((long)py * (long)Wd + (long)px) * (long)cout_n + (long)o0;
     for (int t = 0; t < nt; ++t) {
-      const float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
+      float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
+      if (accumulate) { r += float(out[ob + (long)t]); }
       out[ob + (long)t] = VPIPE_ELT(r);
     }
   }
+}
+
+kernel void conv3x3_hwc_small_cout_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* whwio [[buffer(1)]],
+    const device VPIPE_ELT* bias  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&           Wd       [[buffer(4)]],
+    constant int&           Hd       [[buffer(5)]],
+    constant int&           cin      [[buffer(6)]],
+    constant int&           cout_n   [[buffer(7)]],
+    constant int&           has_bias [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  conv3x3_small_cout_body_(x, whwio, bias, out, Wd, Hd, cin, cout_n, has_bias,
+                           gid, /*accumulate=*/false);
+}
+
+kernel void conv3x3_hwc_small_cout_acc_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* whwio [[buffer(1)]],
+    const device VPIPE_ELT* bias  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&           Wd       [[buffer(4)]],
+    constant int&           Hd       [[buffer(5)]],
+    constant int&           cin      [[buffer(6)]],
+    constant int&           cout_n   [[buffer(7)]],
+    constant int&           has_bias [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  conv3x3_small_cout_body_(x, whwio, bias, out, Wd, Hd, cin, cout_n, has_bias,
+                           gid, /*accumulate=*/true);
 }
 
 // ---- Wan VAE: causal 3D convolution ---------------------------------
@@ -4459,6 +4493,276 @@ kernel void im2col_hwc_3x3x3_tiled_f16(
     val = (kt == 0u) ? t0[si] : (kt == 1u) ? t1[si] : t2[si];
   }
   out[gid] = val;
+}
+
+// FlashVSR's patchify PACK: a channel-first f32 latent gathered into the
+// rows a dense GEMM against the patch embedding consumes.
+//
+// The patch embedding is a Conv3d with kernel and stride both (1,2,2),
+// so it never overlaps and is a linear map over one 1x2x2 patch of every
+// channel. Packed as (channel, row, column) with the column fastest,
+// which is how the 5-D weight [dim, C, 1, 2, 2] flattens.
+//
+// THE UNPACK IS NOT THE MIRROR OF THIS, and that is the trap. The head's
+// output un-patchifies as `(x y z c)` -- channel FASTEST -- where this
+// packs channel SLOWEST. The two orders are genuinely different and both
+// produce a correctly shaped tensor, so a port that mirrors one into the
+// other is wrong in a way only a golden shows.
+//
+//   0:src f32 [C, T, H8, W8]  1:out [T*h*w, C*4]  2:C 3:T 4:H8 5:W8
+//   grid {C*4, T*(H8/2)*(W8/2)}.
+kernel void flashvsr_patch_pack_f16(
+    const device float* src [[buffer(0)]],
+    device VPIPE_ELT*   out [[buffer(1)]],
+    constant int&       C   [[buffer(2)]],
+    constant int&       T   [[buffer(3)]],
+    constant int&       H8  [[buffer(4)]],
+    constant int&       W8  [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint h = (uint)H8 / 2u, w = (uint)W8 / 2u;
+  const uint cols = (uint)C * 4u;
+  const uint col = tpig.x, row = tpig.y;
+  if (col >= cols || row >= (uint)T * h * w) { return; }
+  const uint c  = col / 4u;
+  const uint ky = (col % 4u) / 2u;
+  const uint kx = col % 2u;
+  const uint x = row % w;
+  const uint y = (row / w) % h;
+  const uint t = row / (w * h);
+  const ulong si = (((ulong)c * (uint)T + t) * (uint)H8 + (2u * y + ky)) *
+                       (uint)W8 + (2u * x + kx);
+  out[(ulong)row * cols + col] = (VPIPE_ELT)src[si];
+}
+
+// The inverse, for the head's output. Column order is
+// ((kt*ph + ky)*pw + kx)*C + c -- channel FASTEST. See the warning
+// above: this is deliberately not the mirror of the pack.
+//
+//   0:src [T*h*w, C*4]  1:out f32 [C, T, H8, W8]  2:C 3:T 4:H8 5:W8
+//   grid {C*4, T*(H8/2)*(W8/2)}.
+kernel void flashvsr_patch_unpack_f16(
+    const device VPIPE_ELT* src [[buffer(0)]],
+    device float*           out [[buffer(1)]],
+    constant int&           C   [[buffer(2)]],
+    constant int&           T   [[buffer(3)]],
+    constant int&           H8  [[buffer(4)]],
+    constant int&           W8  [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint h = (uint)H8 / 2u, w = (uint)W8 / 2u;
+  const uint cols = (uint)C * 4u;
+  const uint col = tpig.x, row = tpig.y;
+  if (col >= cols || row >= (uint)T * h * w) { return; }
+  const uint c  = col % (uint)C;
+  const uint sp = col / (uint)C;      // (ky*pw + kx), patch_t being 1
+  const uint ky = sp / 2u;
+  const uint kx = sp % 2u;
+  const uint x = row % w;
+  const uint y = (row / w) % h;
+  const uint t = row / (w * h);
+  const ulong di = (((ulong)c * (uint)T + t) * (uint)H8 + (2u * y + ky)) *
+                       (uint)W8 + (2u * x + kx);
+  out[di] = (float)src[(ulong)row * cols + col];
+}
+
+// The 3-D window permutation FlashVSR's attention runs in.
+//
+// Tokens laid out (frame, row, column) are gathered into (2,8,8) windows
+// of 128, which is what makes a "block" of the block-sparse attention a
+// contiguous run the flash kernel can span. `inverse` sends the
+// attention's output back.
+//
+// The window order is (wf, wh, ww) outer and (f, h, w) within, matching
+// the reference's partition; getting the two nestings the wrong way
+// round permutes the picture without changing its shape.
+//
+//   0:src  1:out  2:F 3:H 4:W 5:D 6:inverse.  grid {D, F*H*W}.
+kernel void flashvsr_window_permute_f16(
+    const device VPIPE_ELT* src     [[buffer(0)]],
+    device VPIPE_ELT*       out     [[buffer(1)]],
+    constant int&           F       [[buffer(2)]],
+    constant int&           H       [[buffer(3)]],
+    constant int&           W       [[buffer(4)]],
+    constant int&           D       [[buffer(5)]],
+    constant int&           inverse [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint d = tpig.x, r = tpig.y;
+  if (d >= (uint)D || r >= (uint)(F * H * W)) { return; }
+  // r is the NATURAL index (f, h, w).
+  const uint w_ = r % (uint)W;
+  const uint h_ = (r / (uint)W) % (uint)H;
+  const uint f_ = r / ((uint)W * (uint)H);
+  const uint nh = (uint)H / 8u, nw = (uint)W / 8u;
+  const uint wf = f_ / 2u, wh = h_ / 8u, ww = w_ / 8u;
+  const uint if_ = f_ % 2u, ih = h_ % 8u, iw = w_ % 8u;
+  const uint blk = (wf * nh + wh) * nw + ww;
+  const uint idx = (if_ * 8u + ih) * 8u + iw;
+  const ulong perm = (ulong)(blk * 128u + idx) * (uint)D + d;
+  const ulong nat  = (ulong)r * (uint)D + d;
+  if (inverse != 0) { out[nat] = src[perm]; }
+  else              { out[perm] = src[nat]; }
+}
+
+// Per-window-block means of a head-major sequence, which is the proxy
+// FlashVSR's routing scores blocks by.
+//
+// out[h][b][d] = mean over the 128 tokens of block b. Reduced here
+// rather than on the host because the alternative is reading a whole
+// head-major q and k back per block per chunk -- 5 MB a time, sixty
+// times a clip at the smallest useful geometry.
+//
+// THE TWO STRIDES ARE INDEPENDENT, and conflating them is the bug this
+// signature exists to prevent. The source may be a key/value CACHE whose
+// per-head slab is sized for the largest chunk (`in_seq` tokens) while
+// only its live prefix is being reduced, so the destination's per-head
+// stride is `out_nb` blocks and has nothing to do with the source's.
+// Deriving one from the other made eleven of twelve heads read the
+// previous head's tail -- and it was nearly invisible, because a freshly
+// allocated buffer reads as zeros and a zero proxy still routes
+// plausibly.
+//
+//   0:src [H, in_seq, HD]  1:out [H, out_nb, HD]
+//   2:HD 3:in_seq 4:blk 5:out_nb
+//   grid {HD, out_nb, H}.
+kernel void flashvsr_block_mean_f16(
+    const device VPIPE_ELT* src    [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    constant int&           HD     [[buffer(2)]],
+    constant int&           in_seq [[buffer(3)]],
+    constant int&           blk    [[buffer(4)]],
+    constant int&           out_nb [[buffer(5)]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  const uint d = tpig.x, b = tpig.y, h = tpig.z;
+  if (d >= (uint)HD || b >= (uint)out_nb) { return; }
+  const device VPIPE_ELT* s =
+      src + ((ulong)h * (uint)in_seq + b * (uint)blk) * (uint)HD + d;
+  float acc = 0.0f;
+  for (int i = 0; i < blk; ++i) { acc += (float)s[(ulong)i * (uint)HD]; }
+  out[((ulong)h * (uint)out_nb + b) * (uint)HD + d] =
+      (VPIPE_ELT)(acc / (float)blk);
+}
+
+// The 16x16 pixel unshuffle that opens FlashVSR's source projection,
+// fused with the u8 -> [-1, 1] scale.
+//
+// FUSED because the two together are the only thing standing between a
+// beat's pixels and the first GEMM, and doing them apart means a full
+// f32 copy of the clip: 1.2 GB at 1408x768 over a hundred frames, held
+// only to be read once. As one kernel the u8 frame is the only copy.
+//
+// The channel order is the reference's rearrange and is not free to
+// choose: 'b c (h hh) (w ww) -> b (c hh ww) h w' puts the COLOUR
+// slowest and the unshuffled column fastest, so channel = c*256 +
+// ky*16 + kx. Getting this wrong is silent -- the shapes agree and the
+// first convolution simply reads a permuted image.
+//
+//   0:src planar u8 [3,H,W]  1:out [(H/16)*(W/16), 768]
+//   2:H 3:W.  grid {768, (H/16)*(W/16)}.
+kernel void pixel_unshuffle16_u8_hwc_f16(
+    const device uchar*  src [[buffer(0)]],
+    device VPIPE_ELT*    out [[buffer(1)]],
+    constant int&        H   [[buffer(2)]],
+    constant int&        W   [[buffer(3)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint OW = (uint)W / 16u;
+  const uint OH = (uint)H / 16u;
+  const uint ch = tpig.x;                    // c*256 + ky*16 + kx
+  const uint r  = tpig.y;                    // oy*OW + ox
+  if (ch >= 768u || r >= OH * OW) { return; }
+  const uint c  = ch / 256u;
+  const uint ky = (ch % 256u) / 16u;
+  const uint kx = ch % 16u;
+  const uint oy = r / OW;
+  const uint ox = r % OW;
+  const uint y  = oy * 16u + ky;
+  const uint x  = ox * 16u + kx;
+  const ulong si = ((ulong)c * (uint)H + y) * (uint)W + x;
+  // Spelled as the reference spells it -- divide, then scale -- rather
+  // than folded into one multiply. The two differ in the last bit, and
+  // matching a golden is worth more here than one fused operation.
+  const float v = (float)src[si] / 255.0f * 2.0f - 1.0f;
+  out[(ulong)r * 768u + ch] = (VPIPE_ELT)v;
+}
+
+// The FOUR-tap causal conv3d im2col, for FlashVSR's source projection.
+//
+// Two things separate it from im2col_hwc_3x3x3_tiled_f16 above, and both
+// are properties of the module it serves rather than choices.
+//
+// FOUR temporal taps, not three. The projection halves the frame count
+// twice to meet the VAE's 4x temporal compression, so its kernel is
+// (4,3,3) at stride (2,1,1) and one output frame reads four input
+// frames. The stride is in TIME ONLY -- the spatial grid is unchanged,
+// which is why there is no OH/OW here.
+//
+// REPLICATE padding, not zero, and that is not a near miss. The
+// reference pads every edge by edge replication; a zero border darkens
+// the frame edge into rows the denoiser adds straight into its residual
+// stream, and it survives as a vignette on the restored video. There is
+// no tap_valid mask for the same reason: a tap before the start of the
+// sequence REPEATS the first frame rather than reading zero, and the
+// host says so by binding that frame's pointer twice. That keeps one
+// rule in one place and costs a binding.
+//
+// out[r, ((kt*3+ky)*3+kx)*C + c]
+//     = t{kt}[clamp(y+ky-1, 0, H-1)*W + clamp(x+kx-1, 0, W-1), c],
+// with r = y*W + x. A dense_gemm over W[Cout, 36*C] then realizes the
+// convolution. Row-tiled like its 3-tap twin: only output rows
+// [row_off, row_off+row_cnt) are written, into a TILE-LOCAL out, so the
+// column scratch is one band rather than the full [H*W, 36*C] -- four
+// thirds of the 3-tap scratch, so the banding matters at least as much.
+//   0:t0 1:t1 2:t2 3:t3 (each [H*W,C]) 4:out[row_cnt,36*C]
+//   5:H 6:W 7:C 8:row_off 9:row_cnt.
+//   grid {36*C, row_cnt}.
+kernel void im2col_hwc_4x3x3_rep_tiled_f16(
+    const device VPIPE_ELT* t0  [[buffer(0)]],
+    const device VPIPE_ELT* t1  [[buffer(1)]],
+    const device VPIPE_ELT* t2  [[buffer(2)]],
+    const device VPIPE_ELT* t3  [[buffer(3)]],
+    device VPIPE_ELT*       out [[buffer(4)]],
+    constant int&      H       [[buffer(5)]],
+    constant int&      W       [[buffer(6)]],
+    constant int&      C       [[buffer(7)]],
+    constant int&      row_off [[buffer(8)]],
+    constant int&      row_cnt [[buffer(9)]],
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
+{
+  // 32-bit index math on the documented 2D grid -- see the note on
+  // im2col_hwc_3x3_f16 for why the 64-bit div/mod form is the slow path.
+  const uint cols = (uint)(36 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {36*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // (kt*3 + ky)*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 36u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
+  const uint kt = j / 9u;
+  const uint ks = j % 9u;
+  const int x = (int)(r % (uint)W);
+  const int y = (int)(r / (uint)W);
+  int sy = y + (int)(ks / 3u) - 1;
+  int sx = x + (int)(ks % 3u) - 1;
+  sy = max(0, min(sy, H - 1));               // replicate, never zero
+  sx = max(0, min(sx, W - 1));
+  const ulong si = ((ulong)sy * W + sx) * (uint)C + c;
+  out[gid] = (kt == 0u) ? t0[si]
+           : (kt == 1u) ? t1[si]
+           : (kt == 2u) ? t2[si]
+                        : t3[si];
 }
 
 // Same causal 3D im2col, but with REFLECT spatial padding and an output

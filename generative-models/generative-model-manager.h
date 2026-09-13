@@ -283,6 +283,11 @@ public:
   // 20 GB checkpoint streamed block-by-block keeps only its pinned
   // prefix, and left at its on-disk estimate it would push every peer
   // into streaming they do not need.
+  //
+  // HELD AT THE DECLARED FLOOR: a nonzero revision below it is raised to
+  // it, because a model reporting straight after load has not built its
+  // streaming slots yet, and the floor already counts them. 0 still
+  // withdraws the declaration outright.
   void revise_declaration(const std::string& dir, std::size_t bytes);
 
   // Drop every declaration. PipelineRuntime calls this at the start of

@@ -23,7 +23,8 @@
 // accepted only while the pipeline is STOPPED; the backend reports that
 // per stage as `editable` and the fields go read-only when it is false.
 
-import { el, clear, toast, openModal, openMenu } from '../dom.js';
+import { el, clear, toast, openModal, openErrorModal, openMenu }
+  from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t, tOr } from '../i18n.js';
@@ -487,7 +488,15 @@ export function mountPhonePipelines({ body, actions, setTitle }) {
       await api[op](id);
       toast(t('pl.op_done', { op: label, id }), 'ok');
     } catch (e) {
-      toast(t('pl.op_failed', { op: label, msg: e.message }), 'error');
+      if (op === 'launch') {
+        openErrorModal({
+          title: t('pl.launch_failed_title'),
+          message: e.message,
+          okLabel: t('common.close'),
+        });
+      } else {
+        toast(t('pl.op_failed', { op: label, msg: e.message }), 'error');
+      }
     } finally {
       state.inflight = null;
     }
@@ -559,7 +568,13 @@ export function mountPhonePipelines({ body, actions, setTitle }) {
           await refresh();
           toast(t('phone.loaded', { id: d.id }), 'ok');
         } catch (e) {
-          toast(t('pl.load_failed', { msg: e.message }), 'error');
+          // See the desktop view: a refused spec explains itself, and
+          // the explanation is the message.
+          openErrorModal({
+            title: t('pl.load_failed_title'),
+            message: e.message,
+            okLabel: t('common.close'),
+          });
         }
       },
     });

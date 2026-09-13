@@ -92,6 +92,9 @@ add_vpipe_metal_kernel(sdpa_bf16 SRC attention/sdpa.metal
 add_vpipe_metal_kernel(sol_attn_mma SRC attention/sol_attn_mma.metal)
 add_vpipe_metal_kernel(sol_attn_mma_bf16 SRC attention/sol_attn_mma.metal
                        DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(flashvsr_route SRC attention/flashvsr_route.metal)
+add_vpipe_metal_kernel(flashvsr_route_bf16 SRC attention/flashvsr_route.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(qwen3_5_gated_delta
                        SRC gated-delta/qwen3_5_gated_delta.metal)
 add_vpipe_metal_kernel(qwen3_5_gated_delta_bf16

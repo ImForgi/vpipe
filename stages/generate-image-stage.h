@@ -386,6 +386,7 @@ private:
   // Latent-space tiling for the restorer, in PIXELS as the reference
   // spells it. 0 disables, which is the reference default.
   int _tile_size = 0;
+  bool _tile_size_set = false;
   int _tile_overlap = 32;
   bool        _boogu_stream   = false;
   bool load_boogu_dit_();

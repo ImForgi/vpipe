@@ -126,6 +126,38 @@ TEST(vosr, the_shipped_config_reads)
   EXPECT_TRUE(cfg.dinov2_size == 448);
 }
 
+TEST(vosr, a_picture_past_the_trained_grid_tiles_by_default)
+{
+  // The rule that decides it, pinned here because the decision is made
+  // in a stage that needs a 1.4B checkpoint to reach.
+  //
+  // WHY THE TRAINED GRID and not "as large as fits": the reference's
+  // one-step sampler applies a rotary table built once for that grid,
+  // so it cannot run any other token count at all, and its tiling
+  // exists to put every tile back on it. Running a bigger grid through
+  // a rescaled table puts every other token on a position the weights
+  // never saw -- a periodic weave, reported from the field on faces at
+  // a 1024 output and absent both at 512 and tiled.
+  genai::MetalVosrTransformer::Config cfg;   // 32 x patch 2 = 64 cells
+  EXPECT_TRUE(cfg.train_grid == 32);
+  EXPECT_TRUE(cfg.patch == 2);
+
+  // 512 output pixels is the trained grid exactly: one pass, no seams.
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(64, 64, cfg) == 0);
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(32, 48, cfg) == 0);
+  // Past it on either axis, tile AT the trained grid.
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(128, 128, cfg) == 64);
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(65, 64, cfg) == 64);
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(64, 96, cfg) == 64);
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(512, 384, cfg) == 64);
+
+  // A checkpoint whose grid did not read stays out of the way rather
+  // than dividing by it.
+  genai::MetalVosrTransformer::Config bad;
+  bad.train_grid = 0;
+  EXPECT_TRUE(genai::MetalVosrTransformer::default_tile(128, 128, bad) == 0);
+}
+
 TEST(vosr, the_config_is_found_from_the_weights_directory)
 {
   // args.json sits at the checkpoint ROOT and the weights a level below,
@@ -319,8 +351,6 @@ TEST(vosr, the_restorer_keys_are_on_generate_image)
   if (spp == nullptr) { return; }
   const StageSpec& sp = *spp;
   EXPECT_TRUE(has_key_(sp, "reference_mode"));
-  EXPECT_TRUE(has_key_(sp, "tile_size"));
-  EXPECT_TRUE(has_key_(sp, "tile_overlap"));
   const ConfigKey* rm = key_(sp, "reference_mode");
   ASSERT_TRUE(rm != nullptr);
   if (rm == nullptr) { return; }
@@ -329,11 +359,40 @@ TEST(vosr, the_restorer_keys_are_on_generate_image)
   // the family it names, and a restoration graph does not have to know
   // this key exists.
   EXPECT_TRUE(rm->def_str == "auto");
+  // ...and the TILING is not here any more. It is one family's knob on a
+  // stage that serves seven, which is what vosr-model-config is for, and
+  // an unknown key is reported nowhere -- so a key left behind here
+  // would read as configured and do nothing.
+  EXPECT_FALSE(has_key_(sp, "tile_size"));
+  EXPECT_FALSE(has_key_(sp, "tile_overlap"));
+}
+
+TEST(vosr, the_tiling_keys_are_on_the_vosr_config_source)
+{
+  const StageSpec* spp = StageRegistry::get().spec("vosr-model-config");
+  ASSERT_TRUE(spp != nullptr);
+  if (spp == nullptr) { return; }
+  const StageSpec& sp = *spp;
+  EXPECT_TRUE(sp.category == StageCategory::ModelSpecificConfig);
   const ConfigKey* ts = key_(sp, "tile_size");
+  const ConfigKey* to = key_(sp, "tile_overlap");
   ASSERT_TRUE(ts != nullptr);
-  if (ts == nullptr) { return; }
+  ASSERT_TRUE(to != nullptr);
+  if (ts == nullptr || to == nullptr) { return; }
   EXPECT_TRUE(ts->type == ConfigType::Int);
-  EXPECT_TRUE(ts->def_int == 0);   // the reference default: no tiling
+  EXPECT_TRUE(to->type == ConfigType::Int);
+  EXPECT_TRUE(to->def_int == 32);
+  // Neither is required: UNSET is the answer a graph should get without
+  // asking, which is to tile at the grid the weights were distilled at.
+  EXPECT_FALSE(ts->required);
+  EXPECT_FALSE(to->required);
+  // The trigger iport is the contract every config source shares, and
+  // the oport carries the tag a model_config iport accepts.
+  ASSERT_TRUE(sp.iports.size() == 1);
+  ASSERT_TRUE(sp.oports.size() == 1);
+  if (sp.oports.empty()) { return; }
+  EXPECT_TRUE(std::string(sp.oports[0].name) == "model_config");
+  EXPECT_TRUE(std::string(sp.oports[0].tags) == "model-config");
 }
 
 TEST(vosr, the_tower_keys_are_on_the_conditioner)

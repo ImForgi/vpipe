@@ -506,6 +506,10 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     m->_lib_convhw = mc->load_library("conv2d_mma");
     m->_fn_conv_hw_s1 = m->_lib_convhw.function("conv2d_hw_3x3_s1_f16");
     m->_fn_conv_hw_s2 = m->_lib_convhw.function("conv2d_hw_3x3_s2_f16");
+    m->_fn_conv_hw_s1_c32 =
+        m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_f16");
+    m->_fn_conv_hw_s2_c32 =
+        m->_lib_convhw.function("conv2d_hw_3x3_s2_c32_f16");
     if (!m->_fn_bias_add.valid()) {
       m->_fn_bias_add = m->_lib_elt.function("bias_add_rows_f16");
     }
@@ -794,7 +798,14 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
 {
   if (!_use_hwconv || c.whwio.empty()) { return false; }
   const int OH = H / stride, OW = W / stride;
-  if ((OW % 8) != 0 || (OH % 8) != 0 || (c.cout % 64) != 0) { return false; }
+  // A 64-channel destination tile, or a 32-channel one for base_dim 96's
+  // full-resolution convs: the decoder's resblocks and upsample conv, and
+  // the encoder's first downsample at stride 2.
+  const bool c32_ok = stride == 2 ? _fn_conv_hw_s2_c32.valid()
+                                  : _fn_conv_hw_s1_c32.valid();
+  const int tile = (c.cout % 64 == 0) ? 64
+                 : ((c.cout % 32) == 0 && c32_ok) ? 32 : 0;
+  if ((OW % 8) != 0 || (OH % 8) != 0 || tile == 0) { return false; }
   // The MPP conv op indexes its source/dest through int32 tensor extents; fall
   // back to the (uint-safe) im2col path before cin*W*H or cout*OW*OH would
   // overflow a signed int (~3K px), so a very large decode degrades to im2col
@@ -804,7 +815,9 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
       (std::size_t)c.cout * OW * OH > kIdxMax) {
     return false;
   }
-  enc.set_function(stride == 2 ? _fn_conv_hw_s2 : _fn_conv_hw_s1);
+  enc.set_function(stride == 2
+                       ? (tile == 32 ? _fn_conv_hw_s2_c32 : _fn_conv_hw_s2)
+                       : (tile == 32 ? _fn_conv_hw_s1_c32 : _fn_conv_hw_s1));
   enc.set_buffer(0, in);
   enc.set_buffer(1, c.whwio);
   enc.set_buffer(2, out);
@@ -816,7 +829,7 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
     enc.set_constant(7, 3);
   }
   enc.dispatch({(unsigned)((OW / 8) * 128), (unsigned)(OH / 8),
-                (unsigned)(c.cout / 64)}, {128, 1, 1});
+                (unsigned)(c.cout / tile)}, {128, 1, 1});
   if (!c.b.empty()) {          // fold bias (the hw op has no bias slot)
     const std::size_t rows = (std::size_t)OH * OW;
     const std::size_t total = rows * c.cout;
@@ -896,7 +909,7 @@ MetalKrea2Vae::conv_route_(int cin, int cout, int stride) const
 // itself pushes it off (a grid that is not a multiple of 8, or cin*W*H past
 // int32), which is what the pyramid walk below checks.
 void
-MetalKrea2Vae::maybe_tune_conv_(int H, int W, const SharedBuffer& col,
+MetalKrea2Vae::maybe_tune_conv_(int H, int W, SharedBuffer& col,
                                 std::size_t cap)
 {
   if (_mc == nullptr) { return; }
@@ -933,7 +946,12 @@ MetalKrea2Vae::maybe_tune_conv_(int H, int W, const SharedBuffer& col,
   std::vector<std::tuple<int, int, int>> shapes;
   auto want = [&](const Conv& c, int stride) {
     if (c.cin <= 0 || c.cout <= kSmallCoutMax) { return; }
-    if (!all && (c.cout % 64) == 0) { return; }   // the hardware conv has it
+    // The hardware conv has it: the 64-channel tile, or the 32-channel one.
+    const bool c32_ok = stride == 2 ? _fn_conv_hw_s2_c32.valid()
+                                    : _fn_conv_hw_s1_c32.valid();
+    if (!all && ((c.cout % 64) == 0 || ((c.cout % 32) == 0 && c32_ok))) {
+      return;
+    }
     const auto key = std::make_tuple(c.cin, c.cout, stride);
     if (_conv_pick.find(key) != _conv_pick.end()) { return; }
     for (const auto& s : shapes) { if (s == key) { return; } }
@@ -954,6 +972,10 @@ MetalKrea2Vae::maybe_tune_conv_(int H, int W, const SharedBuffer& col,
     want(_enc_conv_out, 1);
   }
   if (shapes.empty()) { return; }
+  // The probe runs over the caller's REAL scratch, which exists only once
+  // something gathers -- and a shape to tune is exactly that.
+  if (col.empty()) { col = _mc->make_shared_buffer(cap * 2); }
+  if (col.empty()) { return; }
   autotune_conv3x3_(_mc, shapes, col, cap);
 }
 
@@ -1060,6 +1082,21 @@ MetalKrea2Vae::decode_peak_bytes(int h8, int w8) const noexcept
   const std::size_t base = (std::size_t)_cfg.base_dim;
   const std::size_t im2col = Hout * Wout * 9 * base * 2;
   if (std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") == nullptr) {
+    // ON THE HARDWARE CONV nothing gathers: every level's grid is a multiple
+    // of 8 when the latent's is, the 32-channel tile takes the base-96
+    // full-resolution convs, and conv_out takes the small-cout conv -- so
+    // the im2col band is never allocated and the peak is the top level's
+    // activations. MEASURED (M5, krea2_vae.decode_bench): 240 MB at 512x512
+    // and 960 MB at 1024x1024, five full-resolution base-channel f16
+    // tensors at both sizes; booked at five and a half.
+    const bool gathers =
+        !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (h8 % 8) != 0 ||
+        (w8 % 8) != 0 ||
+        base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout > 0x7fffffffull;
+    if (!gathers) {
+      const std::size_t top = Hout * Wout * base * 2;
+      return top * 5 + top / 2;
+    }
     return im2col + im2col / 2;                        // split on: one level
   }
   // Split off: the whole up-path is one command buffer -- keep the summed,
@@ -1326,10 +1363,13 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     const long r = std::atol(e);
     if (r > 0) { im2col_cap = (std::size_t)r * 9 * wide; }
   }
-  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-  if (im2col_scratch.empty()) {
-    return fail("im2col band scratch allocation failed (out of GPU memory)");
-  }
+  // Allocated by the first conv that GATHERS, or by the tune when it has a
+  // shape to probe. On a GPU with the hardware conv no decoder conv gathers
+  // at an ordinary size -- the 32-channel tile took the full-resolution
+  // 96-channel ones -- and the eager scratch was a band of up to ~906 MB
+  // that nothing read: MEASURED at 512x512, a 1104 MB peak against the 648
+  // MB the preflight booked.
+  SharedBuffer im2col_scratch;
   // First decode: measure the 3x3 fallback. Over THIS scratch and cap, so the
   // probe bands exactly as the convs below it will.
   maybe_tune_conv_(Hout, Wout, im2col_scratch, im2col_cap);
@@ -1365,6 +1405,10 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       // hardware conv (cout % 64) nor an im2col that is worth its scratch.
       if (conv3x3_small_cout_(enc, in, c, out, H, W, /*stride=*/1)) {
         return out;
+      }
+      if (im2col_scratch.empty()) {
+        im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+        if (im2col_scratch.empty()) { alloc_ok = false; return out; }
       }
       conv3x3_fallback_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
                         im2col_cap);
@@ -1698,8 +1742,8 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
     const long r = std::atol(e);
     if (r > 0) { im2col_cap = (std::size_t)r * 9 * base; }
   }
-  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-  if (im2col_scratch.empty()) { return {}; }
+  // Lazily, as in decode(): only a conv that gathers pays for the band.
+  SharedBuffer im2col_scratch;
   maybe_tune_conv_(H, W, im2col_scratch, im2col_cap);
 
   CommandStream stream = mc->make_command_stream();
@@ -1732,6 +1776,10 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       // Fused conv2d where the tune picked it, else row-tiled im2col (which
       // streams bands through im2col_scratch; the s1 and s2 tiled kernels
       // share the tpig.y*(9*cin)+tpig.x layout).
+      if (im2col_scratch.empty()) {
+        im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+        if (im2col_scratch.empty()) { alloc_ok = false; return out; }
+      }
       conv3x3_fallback_(enc, in, out, H, W, c, stride2 ? 2 : 1, im2col_scratch,
                         im2col_cap);
       return out;

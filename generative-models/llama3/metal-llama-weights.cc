@@ -2,6 +2,7 @@
 
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/shared/torch-zip.h"
 #include "generative-models/model-loader.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
@@ -48,6 +49,47 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
     return false;
   }
   const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+
+  // A torch.save() checkpoint. Its tensors lie in the file as contiguous
+  // bytes exactly as a safetensors file's do; only the table of contents
+  // differs (a pickle instead of a JSON header). So it is mapped the same
+  // way, with a data section that starts at byte 0 and offsets taken from
+  // the archive -- and every read path below serves it unchanged. See
+  // shared/torch-zip.h for what the reader accepts and refuses.
+  if (torch_zip::looks_like_zip(fd)) {
+    std::vector<torch_zip::Tensor> tz;
+    std::string terr;
+    if (!torch_zip::read_index(fd, file_size, &tz, &terr)) {
+      ::close(fd);
+      return false;
+    }
+    void* tbase = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (tbase == MAP_FAILED) {
+      ::close(fd);
+      return false;
+    }
+    const int tidx = static_cast<int>(_shards.size());
+    Shard sh;
+    sh.fd = fd;
+    sh.fd_stream = ::open(safetensors_path.c_str(), O_RDONLY);
+#ifdef F_NOCACHE
+    if (sh.fd_stream >= 0) { (void)::fcntl(sh.fd_stream, F_NOCACHE, 1); }
+#endif
+    sh.base = tbase;
+    sh.map_size = file_size;
+    sh.data_start = 0;
+    _shards.push_back(sh);
+    for (torch_zip::Tensor& t : tz) {
+      TensorInfo ti;
+      ti.dtype = std::move(t.dtype);
+      ti.shape = std::move(t.shape);
+      ti.offset = t.offset;
+      ti.nbytes = t.nbytes;
+      ti.shard = tidx;
+      _tensors.emplace(std::move(t.name), std::move(ti));
+    }
+    return true;
+  }
 
   // safetensors: u64 LE header length, then that many JSON bytes,
   // then the tensor data blob (data_offsets are relative to it).
@@ -746,17 +788,56 @@ MetalLlamaWeights::load_mapped(const std::string& name,
     return load(name, mc);
   }
 
-  // Lazily wrap the whole shard once (newBufferWithBytesNoCopy over the mmap).
+  // Lazily wrap the whole shard once (newBufferWithBytesNoCopy over the
+  // mmap). One buffer per shard, every tensor a subview of it, which is
+  // both the cheapest and the most shareable arrangement.
   if (_shard_maps.size() < _shards.size()) {
     _shard_maps.resize(_shards.size());
   }
-  if (_shard_maps[si].empty()) {
-    _shard_maps[si] = mc->make_no_copy_buffer(sh.base, sh.map_size);
-    if (_shard_maps[si].empty()) {
-      return load(name, mc);        // wrap failed -> copy
-    }
+  if (_shard_over_max_said.size() < _shards.size()) {
+    _shard_over_max_said.resize(_shards.size(), false);
   }
-  return _shard_maps[si].subview(goff, ti->nbytes);
+  const std::size_t cap = mc->max_buffer_length();
+  const bool over_cap = cap != 0 && sh.map_size > cap;
+
+  // A SHARD CAN BE BIGGER THAN ANY BUFFER THAT COULD DESCRIBE IT, and
+  // that is not a failure to report per tensor. maxBufferLength is a
+  // fraction of installed RAM, so it shrinks exactly where mapping
+  // matters most: LTX-2.5's 24.5 GB bf16 text encoder fits under the
+  // 38.9 GB a 64 GB M4 Pro allows and does not fit on a smaller box.
+  //
+  // The answer is a WINDOW, not a copy. Wrapping the pages this one
+  // tensor needs keeps the whole point of Residency::Mapped -- clean,
+  // file-backed pages the kernel can drop and re-fault -- where falling
+  // back to load() would hand back dirty anonymous memory, which is the
+  // opposite of what the caller asked for and worst on the box that
+  // forced it. It costs one MTL::Buffer per mapped tensor instead of
+  // one per shard; nothing is copied either way.
+  if (!over_cap && _shard_maps[si].empty()) {
+    _shard_maps[si] = mc->make_no_copy_buffer(sh.base, sh.map_size);
+  }
+  if (!_shard_maps[si].empty()) {
+    return _shard_maps[si].subview(goff, ti->nbytes);
+  }
+  if (over_cap && mc->session() != nullptr && !_shard_over_max_said[si]) {
+    _shard_over_max_said[si] = true;
+    mc->session()->log_debug(fmt(
+        "weights: shard {} is {} MB, over this device's {} MB "
+        "maxBufferLength, so it is mapped one WINDOW per tensor rather "
+        "than wrapped whole. Still zero-copy; one Metal buffer per "
+        "mapped tensor instead of one per shard",
+        si, sh.map_size >> 20, cap >> 20));
+  }
+  const std::size_t page =
+      static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const std::size_t win_off = goff & ~(page - 1);
+  const std::size_t within  = goff - win_off;
+  metal_compute::SharedBuffer win = mc->make_no_copy_buffer(
+      static_cast<char*>(sh.base) + win_off, within + ti->nbytes);
+  if (win.empty()) {
+    return load(name, mc);          // wrap refused for another reason
+  }
+  return win.subview(within, ti->nbytes);
 }
 
 }  // namespace vpipe::genai

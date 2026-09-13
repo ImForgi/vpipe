@@ -91,6 +91,16 @@ class MetalVosrTransformer {
   static bool read_config(const std::string& dir, Config* cfg,
                           std::string* why = nullptr);
 
+  // THE TILE A RUN SHOULD TAKE when the graph did not choose one, in
+  // LATENT cells; 0 when the picture already fits the grid the weights
+  // were distilled at and nothing needs splitting.
+  //
+  // Pure arithmetic, and public, because it is a decision a stage has to
+  // make BEFORE it builds a request and a test has to be able to pin
+  // without a checkpoint. See the note on RestoreRequest::tile for why
+  // the answer is the trained grid rather than "as large as fits".
+  static int default_tile(int lh, int lw, const Config& cfg);
+
   // The DIRECTORY the weights sit in under a VOSR checkpoint root:
   // `checkpoints/` beside `args.json`, or that directory itself. Empty
   // when neither holds a readable safetensors. This is what the memory
@@ -133,10 +143,28 @@ class MetalVosrTransformer {
     // cannot agree on a pseudo-random field, so the check has to hold
     // it fixed and compare what the model does with it.
     const float* noise = nullptr;
-    // Latent-space tile side and overlap. 0 disables tiling, which is
-    // the reference default and the only reference-exact path: a tiled
-    // run CROPS the conditioning grid per tile where the reference
-    // re-runs its tower on the tile's pixels.
+    // Latent-space tile side and overlap. 0 runs the whole picture in
+    // one pass.
+    //
+    // ONE PASS IS ONLY THE REFERENCE'S PATH AT THE TRAINED GRID, and
+    // this is the sentence to read before changing it. The reference's
+    // one-step sampler calls a forward that applies `self.feat_rope`
+    // unconditionally -- a table built once for the training grid -- so
+    // at any other token count its `q * freqs_cos` does not broadcast
+    // and the run cannot happen at all. Its answer for a bigger picture
+    // is to tile, and its tile arithmetic exists to put every tile back
+    // on that grid. We instead build a table for whatever grid we are
+    // handed, which is the reference's `forward_flexible`, a function it
+    // ships and never calls here: the rescale then puts every other
+    // token on a half-integer position the weights never saw, two axes
+    // at period two, which is a checkerboard over exactly the content
+    // the model has to synthesise rather than pass through. Reported
+    // from the field on faces at a 1024 output, clean at 512 and clean
+    // tiled. So default_tile() above, not 0.
+    //
+    // A tiled run does still differ from the reference in one way: it
+    // CROPS the conditioning grid per tile where the reference re-runs
+    // its tower on the tile's pixels.
     int tile = 0;
     int tile_overlap = 0;
     // False ABORTS. `step` is one-based and counts finished steps.

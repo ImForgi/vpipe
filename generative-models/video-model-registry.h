@@ -437,6 +437,28 @@ public:
     return 0;
   }
 
+  // Bytes a generation of this geometry ALLOCATES beyond the weights
+  // declare_resources() claims -- activation scratch, per-clip caches --
+  // which the stage declares as scratch in the denoise phase. 0, the
+  // default, means "cannot say", and nothing is declared.
+  //
+  // For a family whose largest allocation is not its checkpoint.
+  // FlashVSR's key/value window at 1920x1152 is three times its weights;
+  // a plan that sees only the weights admits a graph the box cannot run,
+  // and on a 16 GB M5 that is a kernel panic rather than a refusal.
+  //
+  // `model_config` is the family's own model-config beat when the graph
+  // wired one as a constant, so a knob that changes the size is honoured;
+  // null means the family's defaults. The geometry is already through
+  // size_grid and align_frames.
+  virtual std::size_t
+  denoise_scratch_bytes(const std::string& /*root*/, int /*width*/,
+                        int /*height*/, int /*frames*/,
+                        const FlexData* /*model_config*/) const
+  {
+    return 0;
+  }
+
   // The soundtrack terms, for a family that generates one alongside the
   // video. False -- the default -- means this family emits no audio, and
   // the stage declares none.

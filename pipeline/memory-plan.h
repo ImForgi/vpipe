@@ -97,6 +97,38 @@ struct StageHolding {
   }
 };
 
+// Correct a holding to what its model reports holding once LOADED.
+//
+// A block-streaming model builds its slot pair on its first forward, not
+// in load(), so a figure read straight after load is its trunk plus
+// whatever it pinned -- two blocks per stack under the floor the stage
+// declared for it. Written over both columns as said, that replaced a
+// floor that had been planned correctly, and under-counting is the
+// direction that admits a graph the box cannot hold.
+//
+// So the floor is the LARGER of the declared floor and what the model
+// held at load, and it stays there; the preload is what the model holds
+// NOW, never less than that floor. Pass `load_floor` = 0 for the
+// load-time correction, and the value it returned for every later one --
+// after a generation, when the slots exist and a resident set may have
+// grown or shed. Growth moves only the preload: a residency policy sheds
+// it again under pressure, so it is not part of the least the model can
+// be held at.
+//
+// With no declared floor there is no smaller form, and the load-time
+// figure is the floor -- which is what a model that does not stream
+// holds. Returns the floor.
+inline std::size_t
+correct_loaded_holding(StageHolding& h, std::size_t held,
+                       std::size_t load_floor = 0)
+{
+  std::size_t f = load_floor > 0 ? load_floor : held;
+  if (h.floor > f) { f = h.floor; }
+  h.floor   = f;
+  h.preload = held > f ? held : f;
+  return f;
+}
+
 // What one stage costs the box, in its own terms.
 //
 // Two numbers per holding because the plan, not the stage, should decide

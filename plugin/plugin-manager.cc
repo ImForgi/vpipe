@@ -39,8 +39,16 @@ canonical_(std::string_view path)
 PluginManager&
 PluginManager::get() noexcept
 {
-  static PluginManager instance;
-  return instance;
+  // LEAKED, never destroyed -- which is what "never dlclose'd" has to
+  // mean at exit too. A function-local static is destroyed in reverse
+  // order of construction, and its `_handles` dlclose every plugin. Any
+  // registry constructed BEFORE the first load (VideoModelRegistry is,
+  // by a built-in family's static registration) is destroyed AFTER that,
+  // and then deletes a plugin's family through a vtable in an unmapped
+  // image: SIGSEGV in __cxa_finalize, on every clean exit of a process
+  // that loaded a video-family plugin.
+  static PluginManager* const instance = new PluginManager();
+  return *instance;
 }
 
 bool

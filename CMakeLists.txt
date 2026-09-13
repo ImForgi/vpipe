@@ -419,6 +419,12 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfigVersion.cmake
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipePluginHelpers.cmake
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipe-embed-metallib.cmake
+    # The RUNTIME-COMPILE fallback, which vpipe_add_metal_library takes
+    # when the box has no offline Metal shader compiler. Shipping only
+    # the metallib embedder made the host's two modes unreachable from a
+    # plugin: the host quietly fell back and the plugin failed at build
+    # time with a raw xcrun error.
+    ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/cmake/embed-metal-source.cmake
     DESTINATION lib/cmake/vpipe)
 
 # Curated SDK headers, installed under include/ preserving their

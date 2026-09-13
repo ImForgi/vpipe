@@ -4,6 +4,8 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/stream-sizing.h"
+#include "generative-models/wan/metal-wan-vae.h"
+#include "stages/model-detect.h"
 #include "interfaces/session-context-intf.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "interfaces/session-services-intf.h"
@@ -91,7 +93,12 @@ dir_weights_bytes(const std::string& dir)
   // worse than no accounting at all, because every peer then plans
   // against a box that does not exist.
   if (fs::is_regular_file(fs::path(dir), ec) && !ec) {
-    if (fs::path(dir).extension() != ".safetensors") { return 0; }
+    // A torch.save() file maps as a shard too (shared/torch-zip.h), so a
+    // component named by one weighs what it holds.
+    const std::string ext = fs::path(dir).extension().string();
+    if (ext != ".safetensors" && ext != ".pth" && ext != ".ckpt") {
+      return 0;
+    }
     const std::uintmax_t n = fs::file_size(fs::path(dir), ec);
     return ec ? 0 : (std::size_t)n;
   }
@@ -426,6 +433,25 @@ video_decode_scratch_bytes(int width, int height, int frames)
       (std::size_t)height * (std::size_t)width * (std::size_t)frames;
   return px * 3 * 2      // the decode's own output, bf16
        + px * 3;         // the planar-U8 clip the stage buffers behind it
+}
+
+std::size_t
+video_vae_working_bytes(const std::string& root, int width, int height)
+{
+  namespace fs = std::filesystem;
+  if (root.empty() || width <= 0 || height <= 0) { return 0; }
+  const std::string vae = resolve_vae_dir(root);
+  if (vae.empty()) { return 0; }
+  // A file is a natively-named checkpoint (FlashVSR's Wan2.1_VAE.pth); a
+  // directory has a diffusers config that says which class it is.
+  genai::MetalWanVae::Config cfg;
+  std::error_code ec;
+  const bool wan =
+      fs::is_regular_file(fs::path(vae), ec) && !ec
+          ? genai::MetalWanVae::config_for_native_checkpoint(vae, cfg)
+          : genai::MetalWanVae::config_from_json(vae, cfg);
+  if (!wan) { return 0; }
+  return genai::MetalWanVae::decode_peak_bytes(cfg, height / 8, width / 8);
 }
 
 std::vector<ResourceClaim>

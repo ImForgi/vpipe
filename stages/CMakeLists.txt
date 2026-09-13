@@ -24,10 +24,13 @@ set(LOCAL_SOURCES
   generate-video-stage.cc
   wan2-model-config-stage.cc
   minimax-h3-model-config-stage.cc
+  flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
   qwen-image-edit-model-config-stage.cc
+  vosr-model-config-stage.cc
+  flashvsr-model-config-stage.cc
   scheduler-select-stage.cc
   diffusion-conditioner-stage.cc
   generate-image-stage.cc
@@ -91,6 +94,7 @@ set(LOCAL_HEADERS
   generate-video-stage.h
   wan2-model-config-stage.h
   minimax-h3-model-config-stage.h
+  flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h

@@ -11,6 +11,7 @@ set(LOCAL_TEST_SOURCES
   console-writer.cc
   credential-store.cc
   denoise-progress.cc
+  diagnostic-capture.cc
   gpu-thermal.cc
   detection-overlay-stage.cc
   feedback-pair.cc
@@ -167,6 +168,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         sol-attention.cc
         sol-attention-h3.cc
         sol-attention-mma.cc
+        flashvsr-lq-proj.cc
+        flashvsr-dit-load.cc
+        flashvsr-vae.cc
+        flashvsr-family.cc
+        flashvsr-accel.cc
+        flashvsr-kv.cc
+        torch-zip.cc
         wan-vae.cc
         wan-umt5.cc
         wan-unipc.cc

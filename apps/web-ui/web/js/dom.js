@@ -93,6 +93,34 @@ export function openModal({ title, body, actions = [], className = '' }) {
   return close;
 }
 
+// A refusal the user has to READ, rather than a toast they can miss.
+//
+// The backend now answers a rejected load or launch with the reason the
+// loader gave -- a parse position, a stage id, the field it objected to
+// -- and that text is the whole point of the message: it is often more
+// than one line, and it is usually something to go and fix in an
+// editor. A toast shows it for three seconds in a corner and takes it
+// away again, and it cannot be selected while it is there. So this.
+//
+// `message` is the server's text as-is. Its first line is the summary
+// (what failed) and anything after it is the reason, which is rendered
+// preformatted so a line/column or an indented list survives.
+export function openErrorModal({ title, message, okLabel = 'Close' }) {
+  const text = String(message == null ? '' : message);
+  const nl = text.indexOf('\n');
+  const summary = nl < 0 ? text : text.slice(0, nl);
+  const detail = nl < 0 ? '' : text.slice(nl + 1);
+  const body = el('div', { class: 'err-body' },
+    summary ? el('div', { class: 'err-summary' }, summary) : null,
+    detail ? el('pre', { class: 'err-detail' }, detail) : null);
+  return openModal({
+    title,
+    body,
+    className: 'error-modal',
+    actions: [{ label: okLabel, kind: 'primary', onClick: (c) => c() }],
+  });
+}
+
 // A lightweight context menu anchored at viewport point (x, y). `items`
 // is a list of { label, danger?, onClick }; a null entry renders a
 // divider. The menu closes on selection, click-away, Escape, scroll or

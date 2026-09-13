@@ -179,3 +179,22 @@ const RegSrc_${KERNEL_NAME} g_regsrc_${KERNEL_NAME};
 
 }  // namespace
 ")
+
+
+# THE TWO SYMBOLS A PLUGIN LINKS AGAINST, in both modes.
+#
+# A plugin's vpipe_plugin_register hands `<name>_metallib` and its length
+# to register_metal_library, and it must not have to know which mode its
+# build machine chose. In SOURCE mode there are no metallib bytes -- the
+# static initialiser above has already registered the MSL -- so the pair
+# is emitted empty, and the host reads a zero length with a non-null
+# pointer as "already provided by the other route" rather than as an
+# empty library. Only when the caller asks: the host's own kernels do not
+# go through register_metal_library and want no such symbols.
+if(EMIT_METALLIB_STUB)
+  file(APPEND "${OUTPUT}"
+"
+extern \"C\" const unsigned char ${KERNEL_NAME}_metallib[1] = {0};
+extern \"C\" const unsigned long ${KERNEL_NAME}_metallib_len = 0;
+")
+endif()

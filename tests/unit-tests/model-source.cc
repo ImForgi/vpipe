@@ -186,6 +186,8 @@ TEST(model_source, mirror_paths) {
   EXPECT_TRUE(mirror_repo("modelscope", "mgwr/M87", out)
               == MirrorStatus::Absent);
   EXPECT_TRUE(out.empty());
+  EXPECT_TRUE(mirror_repo("modelscope", "JunhaoZhuang/FlashVSR-v1.1", out)
+              == MirrorStatus::Absent);
 
   // The rename is per-SOURCE: on HuggingFace the upstream path stands.
   EXPECT_TRUE(mirror_repo("huggingface", "MiniMaxAI/MiniMax-H3", out)

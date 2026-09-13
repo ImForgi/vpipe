@@ -3,6 +3,7 @@ set(LOCAL_SOURCES
   console-writer.cc
   credential-store.cc
   db-log-delegate.cc
+  diagnostic-capture.cc
   ffmpeg-libraries.cc
   ffmpeg-log-tap.cc
   flex-data.cc

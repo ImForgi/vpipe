@@ -723,7 +723,12 @@ GenerateVideoStage::declare_resources() const
   int aw = _width, ah = _height, af = _frames;
   std::size_t arena_bytes = model_memory::kUnknownArena;
   if (planned_geometry_(root, &aw, &ah, &af)) {
-    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af);
+    // The clip, and what the VAE holds to make it -- which for the Wan
+    // VAE at FlashVSR's 1920x1152 is several times the clip. Booked as
+    // the clip alone, that decode read as 530 MB and ran into 9.5 GB of
+    // swap.
+    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af) +
+                  model_memory::video_vae_working_bytes(root, aw, ah);
   } else {
     session()->log_debug(fmt(
         "GenerateVideoStage('{}'): no rounding rule for '{}', so the decode "
@@ -766,6 +771,21 @@ GenerateVideoStage::declare_resources() const
                fmt("{}-latent", this->id())(), latent,
                model_memory::kPhaseDenoise, model_memory::kPhaseDecode)) {
         arena.push_back(std::move(c));
+      }
+    }
+    // What the DENOISE allocates beyond its weights: a family's activation
+    // scratch and its per-clip caches. The latent above is what LEAVES the
+    // stage; this is what the stage holds while making it, and for a
+    // family like FlashVSR it is the larger of the two by far.
+    if (fam != nullptr) {
+      const std::size_t den = fam->denoise_scratch_bytes(
+          root, aw, ah, af, _model_cfg.is_object() ? &_model_cfg : nullptr);
+      if (den > 0) {
+        for (auto& c : model_memory::scratch_claims(
+                 fmt("{}-denoise", this->id())(), den,
+                 model_memory::kPhaseDenoise)) {
+          arena.push_back(std::move(c));
+        }
       }
     }
     // The SOUNDTRACK, on the same principle: its length comes from this
@@ -916,6 +936,10 @@ GenerateVideoStage::declare_memory() const
     if (!planned_geometry_(root, &fw, &fh, &ff)) { return m; }
     m.outputs.resize(2, 0);
     m.outputs[0] = fam->latent_bytes(root, fw, fh, ff);
+    // Same figure as the denoise claim in declare_resources, in this
+    // ledger's terms, so the two plans cannot disagree about it.
+    m.scratch = fam->denoise_scratch_bytes(
+        root, fw, fh, ff, _model_cfg.is_object() ? &_model_cfg : nullptr);
     std::size_t alat = 0, apcm = 0, aarena = 0;
     if (_fps > 0.0 &&
         fam->audio_cost(root, ff, _fps, &alat, &apcm, &aarena)) {
@@ -1430,6 +1454,9 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   try {
     const bool ok = _plugin_gen->generate(req, out);
     bar.finish();
+    // What the family holds NOW. After a clip a streaming family has
+    // built its slot pair, and its resident set has grown or shed.
+    correct_plugin_holding_("after a clip");
     return ok;
   } catch (const std::exception& e) {
     session()->error(fmt(
@@ -1442,6 +1469,46 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
         "exception during generation", this->id(), _family));
     return false;
   }
+}
+
+// The plugin arm's plan correction, from the number a family owes the
+// host. The rule is correct_loaded_holding's (pipeline/memory-plan.h);
+// what this adds is WHEN it is asked.
+//
+// Straight after load is too early to be the only time. A block-streaming
+// family builds its slot pair on its first forward, so resident_bytes()
+// then leaves out two blocks per stack, and taking that figure as both
+// columns wrote a plan below the floor the family had declared. The
+// load-time read now fixes the floor at no less than the declared one,
+// and the read after each clip -- slots built, resident set grown or
+// shed -- moves the preload.
+void
+GenerateVideoStage::correct_plugin_holding_(const char* when)
+{
+  if (!_plugin_gen) { return; }
+  const std::size_t held = (std::size_t)_plugin_gen->resident_bytes();
+  // 0 is the documented "cannot answer cheaply". Overwriting a real
+  // plan-time figure with a decline would report the checkpoint as free.
+  if (held == 0) { return; }
+  StageMemory m = declare_memory();
+  // ONE holding only. resident_bytes() is the generator's TOTAL, so a
+  // family that declared several cannot have it apportioned between
+  // them -- and splitting it by a guess would replace figures that were
+  // at least individually honest. Left alone in that case, which means
+  // the correction is available to any family that wants it by declaring
+  // the checkpoint it streams as one entry.
+  if (m.holdings.size() != 1) { return; }
+  const bool first = _plugin_load_floor_ == 0;
+  _plugin_load_floor_ =
+      correct_loaded_holding(m.holdings[0], held, _plugin_load_floor_);
+  // Per clip, and a revision replans the whole graph: only when it moved.
+  if (!first && m.holdings[0].preload == _plugin_revised_) { return; }
+  _plugin_revised_ = m.holdings[0].preload;
+  revise_memory(m);
+  session()->log_debug(fmt(
+      "GenerateVideoStage('{}'): '{}' holds {} MB {}; the plan holds it at "
+      "{} MB, floor {} MB", this->id(), _family, held >> 20, when,
+      m.holdings[0].preload >> 20, m.holdings[0].floor >> 20));
 }
 
 bool
@@ -1515,27 +1582,43 @@ GenerateVideoStage::ensure_expert_(int which)
     // already owes the host: resident_bytes(), which docs/MODEL-MEMORY.md
     // requires of any family whose weights a WeightSet cannot see.
     //
-    // Both columns, because a streaming family has no larger form left
-    // to grow back into within this launch. Skipped at 0, which is the
-    // documented "cannot answer cheaply" -- overwriting a real plan-time
-    // figure with a decline would report the checkpoint as free.
-    // ONE holding only. resident_bytes() is the generator's TOTAL, so a
-    // family that declared several cannot have it apportioned between
-    // them -- and splitting it by a guess would replace figures that
-    // were at least individually honest. Left alone in that case, which
-    // means the correction is available to any family that wants it by
-    // declaring the checkpoint it streams as one entry.
-    const std::uint64_t held = _plugin_gen->resident_bytes();
-    StageMemory m = declare_memory();
-    if (held > 0 && m.holdings.size() == 1 &&
-        m.holdings[0].preload != (std::size_t)held) {
-      m.holdings[0].preload = (std::size_t)held;
-      m.holdings[0].floor   = (std::size_t)held;
-      revise_memory(m);
-      session()->log_debug(fmt(
-          "GenerateVideoStage('{}'): '{}' holds {} MB after loading; the "
-          "plan is corrected from what the checkpoint weighs",
-          this->id(), _family, (std::size_t)held >> 20));
+    // Not the last correction: it runs again after every clip, because
+    // what a family reports straight after load is not yet what it runs
+    // on. See correct_plugin_holding_.
+    _plugin_load_floor_ = 0;
+    _plugin_revised_    = 0;
+    correct_plugin_holding_("after loading");
+    // THE IDLE POLICY, which this arm never resolved: under `auto` a
+    // registered family kept its DiT for the life of the run, beside a
+    // VAE decode that needs the room. MEASURED with FlashVSR at 1920x1152
+    // on a 24 GB box: the decode was refused with ~12.7 GB reclaimable
+    // against the ~13 GB it holds, while the idle 1.3B DiT sat resident.
+    //
+    // Tight is what the streaming verdict above already said, or a box
+    // that cannot hold this checkpoint beside the decode arena the plan
+    // booked for it, with the usual headroom.
+    if (!_unload_resolved) {
+      _unload_resolved = true;
+      switch (_unload_cfg) {
+        case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+        case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+        default: {
+          const std::size_t ram = model_memory::phys_ram();
+          const std::size_t need =
+              model_memory::weight_footprint(session(), {_root}) +
+              model_memory::scratch_footprint(session(),
+                                              model_memory::kPhaseDecode) +
+              model_memory::kHeadroom;
+          _unload_idle = args.prefer_streaming || (ram != 0 && ram < need);
+          break;
+        }
+      }
+      if (_unload_idle) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): memory-bounded -- '{}' lets go of its "
+            "DiT after each clip so the VAE decode has the room, and reloads "
+            "on the next", this->id(), _family));
+      }
     }
     return true;
   }
@@ -1722,15 +1805,15 @@ GenerateVideoStage::ensure_expert_(int which)
         // The same correction on the topological plan. What the plan
         // could only bound -- the checkpoint's size on disk -- the model
         // now knows exactly, because it has finished deciding what to
-        // keep. Both floors are set to what is actually held: a
-        // streaming DiT has no larger form left to grow back into
-        // within this launch.
+        // keep. Both columns are set to what is actually held -- but
+        // never below the floor it was planned at, because the set does
+        // not see the slot pair the first forward builds. See
+        // correct_loaded_holding.
         {
           StageMemory m = declare_memory();
           for (StageHolding& h : m.holdings) {
             if (h.source != dit_dir) { continue; }
-            h.preload = held;
-            h.floor = held;
+            correct_loaded_holding(h, held);
           }
           revise_memory(m);
         }
@@ -2697,7 +2780,51 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           "4-D video latent; nothing to publish", this->id(), _family));
       co_return;
     }
-    if (_unload_idle) { _plugin_gen->release_idle(); }
+    // THE SAME THREE STEPS THE BUILT-IN ARM TAKES, and they were missing
+    // here. `release_idle()` is the FAMILY letting go of what it holds;
+    // it is not the manager giving the bytes back, and it is not the
+    // phase promise being kept. A registered family therefore declared
+    // its DiT phase-limited, ran, and left the checkpoint resident in
+    // the manager for the life of the session -- with the only evidence
+    // a line at the end of the launch saying the promise was broken.
+    //
+    // MEASURED on the LTX-2.5 plugin's own text-to-video graph: the
+    // process sat at 24 GB of resident weights with the pipeline
+    // drained and nothing left to run.
+    //
+    // drop_weights / pool_weights can only return what the family has
+    // actually stopped borrowing -- a generator still holding its
+    // shared_ptr<WeightSet> keeps the set alive and the manager says so
+    // rather than parking under a live reader. That diagnostic is the
+    // point: a family whose release_idle() keeps its borrow now hears
+    // about it instead of being silently ineffective.
+    if (_unload_idle) {
+      // The family's own release, then the generator itself: a family
+      // with nothing to release (FlashVSR's holds one DiT and no cache)
+      // would otherwise keep its WeightSet borrowed, and the drop below
+      // could return nothing. ensure_expert_ rebuilds it on the next
+      // clip.
+      _plugin_gen->release_idle();
+      _plugin_gen.reset();
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        if (!_dit_dir_declared_.empty()) {
+          // `auto` DROPS here too. It only unloads once it has judged the
+          // box tight, and pooling is not a release for a family whose
+          // weights are derived() -- a conversion has no source to re-read,
+          // so it cannot be parked and stays resident, unborrowed. MEASURED
+          // with FlashVSR (f32 checkpoint, every matrix a bf16 derive): the
+          // 1920x1152 decode found 3.56 GB still live in GPU buffers and was
+          // refused ~0.4 GB short, with the 1.3B DiT long finished.
+          if (_unload_cfg == model_memory::UnloadPolicy::kDestroy ||
+              _unload_cfg == model_memory::UnloadPolicy::kAuto) {
+            mgr->drop_weights(_dit_dir_declared_);
+          } else {
+            mgr->pool_weights(_dit_dir_declared_);
+          }
+          mgr->note_phase_released(_dit_dir_declared_);
+        }
+      }
+    }
 
     auto vout = std::make_unique<TensorBeatPayload>();
     vout->dtype = TensorBeat::DType::F32;

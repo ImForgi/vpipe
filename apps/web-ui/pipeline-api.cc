@@ -1,6 +1,7 @@
 #include "apps/web-ui/pipeline-api.h"
 #include "apps/web-ui/api-common.h"
 
+#include "common/diagnostic-capture.h"
 #include "common/graph.h"
 #include "common/i18n.h"
 #include "common/vertex.h"
@@ -37,6 +38,29 @@ using namespace std;
 namespace vpipe::webui {
 
 namespace {
+
+// A refusal the operator can act on: what failed, then why it did.
+//
+// The reasons are whatever the operation reported while `why` was open
+// (see common/diagnostic-capture.h) -- the same lines the console
+// panel shows, carried in the response that refused so the browser can
+// put them in front of whoever pressed the button instead of sending
+// them to go and look. A refusal that reported NOTHING says so rather
+// than trailing an empty colon: that combination is a missing warn()
+// at the site that refused, and naming it is how it gets found.
+string
+with_reason_(string what, const DiagnosticCapture& why)
+{
+  if (why.empty()) {
+    return what + " (no reason was reported)";
+  }
+  what += ":\n";
+  what += why.text();
+  if (why.truncated()) {
+    what += "\n(further messages omitted -- see the console)";
+  }
+  return what;
+}
 
 // Demangled, human-readable name for a payload type_info. Null (an
 // "untyped" port) renders as "any".
@@ -660,9 +684,15 @@ PipelineApi::h_load_pipeline_(const HttpRequest& req)
   }
 
   lock_guard<mutex> lk(_ctx.mu);
+  // Hold the reasons the loader reports while it reads this file. A
+  // malformed spec is the operator's own file and almost always their
+  // own typo, so the one thing the answer must carry is WHICH line,
+  // stage or field the loader objected to.
+  DiagnosticCapture why;
   PipelineHandle h = _ctx.session->load_pipeline(real.string());
   if (!h.valid()) {
-    return HttpResponse::error(400, "failed to load '" + path + "'");
+    return HttpResponse::error(
+        400, with_reason_("failed to load '" + path + "'", why));
   }
   Pipeline* pl = live_pipeline(h);
   if (!pl) {
@@ -888,10 +918,12 @@ PipelineApi::h_launch_pipeline_(const HttpRequest& req)
   if (p->state != State::Stopped) {
     return HttpResponse::error(409, "pipeline is already running");
   }
+  DiagnosticCapture why;
   Status s = _ctx.session->launch_pipeline(*p->handle);
   if (s.code != 0) {
-    return HttpResponse::error(500, "launch failed (status " +
-                               to_string(s.code) + ")");
+    return HttpResponse::error(
+        500, with_reason_("launch failed (status " +
+                          to_string(s.code) + ")", why));
   }
   p->state = State::Running;
   return HttpResponse::json(200, pipe_summary_(*p).to_json());

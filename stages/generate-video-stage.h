@@ -359,6 +359,13 @@ private:
   // beat goes down unread in the request. See video-model-registry.h.
   genai::VideoModelFamily*              _plugin_family = nullptr;
   std::unique_ptr<genai::VideoGenerator> _plugin_gen;
+  // Corrects this stage's plan holding from _plugin_gen->resident_bytes(),
+  // after load and after every clip; `when` is for the log line. The
+  // floor it fixed at load (0 until then), and the preload it last
+  // revised the plan to, so a clip that moved nothing does not replan.
+  void correct_plugin_holding_(const char* when);
+  std::size_t _plugin_load_floor_ = 0;
+  std::size_t _plugin_revised_    = 0;
   // The plugin branch of process(), mirroring run_h3_: builds the
   // request from the beats already read and publishes what came back.
   // False means the family warned and produced nothing.

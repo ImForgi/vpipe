@@ -94,7 +94,8 @@ const ConfigKey kAttrs[] = {
           "model-select source, or set this key directly, so the DiT "
           "stages keep pointing at the model",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image-edit,mage-flow,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,qwen-image-edit,"
+       "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va,vosr",
@@ -218,6 +219,18 @@ vae_family_(const std::string& vae_dir)
         // whole 4x16x16 pixel block -- not an upsampling conv stack.
         if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
       }
+    }
+  }
+  // A natively-named Wan 2.1 VAE with no config anywhere -- FlashVSR's
+  // `Wan2.1_VAE.pth`, which resolve_vae_dir() hands back by file. Its
+  // tensors say what it is; without asking them the default below would
+  // open it as a Qwen-Image VAE. Files only, so a directory never pays
+  // for the probe.
+  std::error_code ec;
+  if (fs::is_regular_file(fs::path(vae_dir), ec) && !ec) {
+    genai::MetalWanVae::Config probe;
+    if (genai::MetalWanVae::config_for_native_checkpoint(vae_dir, probe)) {
+      return "wan";
     }
   }
   return "krea2";
@@ -819,7 +832,8 @@ VaeDecodeStage::ensure_loaded_()
   if (_family == "wan") {
     genai::MetalWanVae::Config wcfg;
     std::string werr;
-    if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr)) {
+    if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr) &&
+        !genai::MetalWanVae::config_for_native_checkpoint(vae_dir, wcfg)) {
       session()->error(fmt(
           "VaeDecodeStage('{}'): {}; inert", this->id(), werr));
       return;
@@ -1715,9 +1729,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       return true;
     };
     {
+      // The clip, and what the decode holds to make it: carries for the
+      // whole clip and a full-resolution chunk pool, several times the
+      // clip at 1920x1152.
       const std::size_t px =
           (std::size_t)F * (std::size_t)H * (std::size_t)W;
-      revise_decode_arena_(px * 3 * 2 + px * 3);
+      revise_decode_arena_(px * 3 * 2 + px * 3 +
+                           _wan_vae->decode_peak_bytes(h8, w8));
     }
     std::string derr;
     bool ok = false;

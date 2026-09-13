@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,17 @@ class MetalWanVae {
   // file is missing or is not an AutoencoderKLWan config.
   static bool config_from_json(const std::string& vae_dir, Config& out,
                                std::string* err = nullptr);
+
+  // A Config for a natively-named Wan 2.1 VAE that has NO config of its
+  // own -- FlashVSR publishes `Wan2.1_VAE.pth` bare, with nothing beside
+  // it. The TENSORS decide: native names (`conv1`, `decoder.conv1`, not
+  // diffusers' `quant_conv` / `conv_in`) and a 32-wide `conv1`, which is
+  // z_dim 16 -- the Wan 2.2 VAE is a different, wider net and is refused.
+  // The geometry is then Wan 2.1's fixed one and the whitening statistics
+  // its published ones. False, `out` untouched, for anything else.
+  static bool config_for_native_checkpoint(const std::string& path,
+                                           Config& out,
+                                           std::string* err = nullptr);
 
   // `with_encoder` also loads the encoder weights (the image-to-video
   // conditioning path needs them); a decode-only graph leaves it false so
@@ -169,10 +181,17 @@ class MetalWanVae {
   metal_compute::SharedBuffer
   unwhiten(const metal_compute::SharedBuffer& z, int T, int h8, int w8);
 
-  // Conservative estimate of the peak GPU memory (bytes) one decode CHUNK
-  // at the given latent size needs. Per chunk, not per clip -- the clip is
-  // streamed. For a preflight memory_budget() check.
+  // The GPU memory (bytes) a decode at this latent size holds at its peak,
+  // for the preflight and for the plan. NOT per chunk, although the clip
+  // streams: the causal carries -- two input frames of every 3x3x3 conv,
+  // seven of them at full resolution -- are allocated by the first chunk
+  // and held to the last, and they are the largest term. The im2col band
+  // is not in it; the band takes whatever headroom this leaves.
+  // `frame_split` is whether the post-temporal tail runs a frame at a time
+  // (the default; VPIPE_WAN_VAE_NO_FRAME_SPLIT turns it off).
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
+  static std::size_t decode_peak_bytes(const Config& cfg, int h8, int w8,
+                                       bool frame_split = true) noexcept;
 
   const Config& config() const { return _cfg; }
 
@@ -208,8 +227,17 @@ class MetalWanVae {
   //   plain 3x3    : K =  9*Cin, flattened (ky,kx,cin)     -- kt = 1
   //   time (3,1,1) : K =  3*Cin, flattened (kt,cin)        -- kt = 3, ks = 1
   //   1x1          : K =    Cin                            -- kt = 1, ks = 1
+  // DIFFUSERS name -> the spelling this checkpoint actually uses. Empty
+  // for a diffusers-named one; see wname_() in the .cc.
+  std::unordered_map<std::string, std::string> _names;
+  const std::string& wname_(const std::string& diffusers_name) const;
+
   struct Conv {
     metal_compute::SharedBuffer w, b;
+    // HWIO twin for the hardware conv, [3,3,Cin',Cout] out-channel
+    // fastest, where Cin' is 3*cin for a 3x3x3 conv run over its three
+    // taps CONCATENATED channel-wise. Empty when that route is off.
+    metal_compute::SharedBuffer whwio;
     int cin = 0, cout = 0, k = 0;
     int kt = 1;      // temporal taps
     int ks = 1;      // spatial taps (9 for 3x3, else 1)
@@ -334,6 +362,17 @@ class MetalWanVae {
                    const metal_compute::SharedBuffer& out,
                    std::size_t out_row0, int H, int W, int stride);
 
+  // The same output frame on the gather-free hardware conv: a 3x3x3 conv
+  // concatenates its three taps and runs ONE 2D conv over them. False
+  // when the shape does not tile (grid not a multiple of 8, Cout neither
+  // a multiple of 32 nor at most kSmallCoutMax, an int32 extent) and the
+  // caller gathers instead.
+  bool conv3x3_hw_(Ctx& cx, const Conv& c,
+                   const metal_compute::SharedBuffer* const taps[3],
+                   const std::size_t tap_off[3],
+                   const metal_compute::SharedBuffer& out,
+                   std::size_t out_row0, int H, int W);
+
   // Whole-chunk convolution. `in` is [(t_in)*hw, cin] and `carry` supplies
   // the frames before it; `out` gets t_out frames. The mapping from output
   // frame to input frames is the causal one for a 3x3x3 / (3,1,1) stride-1
@@ -395,6 +434,18 @@ class MetalWanVae {
   int  _mma_min_m = 64;
   int  _mma_min_n = 16;
   int  _mma_max_m = kMmaMaxM;
+
+  // The gather-free hardware conv (MPP convolution2d) over a 64- or a
+  // 32-channel destination tile, and the per-pixel small-cout conv for the
+  // head's 3-channel output, which neither tile can serve.
+  // Each has an ACCUMULATING twin (out += conv), so a causal 3x3x3 conv
+  // runs as one call per temporal tap with no three-frame concat.
+  static constexpr int kSmallCoutMax = 32;
+  metal_compute::ComputeLibrary _lib_convhw;
+  metal_compute::ComputeFunction _fn_conv_hw64, _fn_conv_hw32,
+      _fn_conv_small_cout, _fn_conv_hw64_acc, _fn_conv_hw32_acc,
+      _fn_conv_small_cout_acc;
+  bool _use_hwconv = false;
 
   // Mid-block attention, picked by MEASUREMENT at load (vae-mid-attn-tune.h)
   // exactly as in the Qwen-Image VAE -- the attention here is the same

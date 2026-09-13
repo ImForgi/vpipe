@@ -191,6 +191,24 @@ public:
     std::size_t self_compressed = 0;
     // This process's physical footprint, for the same query.
     std::size_t self_footprint = 0;
+    // Of that footprint, what the GPU driver charges this process for
+    // graphics memory (task_vm_info ledger_tag_graphics_footprint). For a
+    // short while it includes buffers already FREED: once the GPU has used
+    // a buffer, the driver drops it from `allocated` at once but returns
+    // its pages ASYNCHRONOUSLY. MEASURED on an M5
+    // (metal_compute_residency.freed_buffer_pages_probe): 24-61 ms for one
+    // 1-4 GB buffer, ~50 ms for the ~2.5 GB a 960x576 Wan decode frees
+    // across hundreds of buffers; on an M5 Pro 30-167 ms for 1-4 GB, and
+    // under 200 ms for the ~8.5 GB of a 1920x1152 decode (8788 MB held at
+    // +0, 1092 at +50 ms, back to the live 282 by +200). Submitting other
+    // GPU work does not hasten it; a buffer the GPU never touched goes
+    // back at once.
+    // Inside that window a new allocation reuses those pages, so graphics
+    // minus the live SharedBuffer bytes is room it takes without asking
+    // the OS -- room available_physical cannot see yet. A sample taken
+    // just as a large free completes reads them as held. 0 when the kernel
+    // does not report the ledger.
+    std::size_t self_graphics = 0;
     // SYSTEM-WIDE wired (unswappable) memory -- vm_statistics64's
     // wire_count. Everything mlock'd by every process plus the kernel's
     // own, so it is not this process's pool: it is the ceiling that pool
@@ -288,6 +306,23 @@ public:
   // Returns empty if the runtime is invalid, `ptr` is null / not page-aligned,
   // or Metal rejects the wrap.
   SharedBuffer make_no_copy_buffer(void* ptr, std::size_t byte_size) const;
+
+  // The largest buffer this device will create, from
+  // MTLDevice.maxBufferLength. Cached after the first query; 0 when
+  // there is no valid device.
+  //
+  // It is a fraction of installed RAM, so it is SMALLER on the boxes
+  // that need mapping most -- measured 38.88 GiB on a 64 GB M4 Pro, and
+  // proportionally less below that. A checkpoint shard can therefore be
+  // larger than any buffer that can describe it, which is not an error
+  // and not a thing a caller can retry: it is a size to check BEFORE
+  // asking, so the fallback can be chosen deliberately rather than read
+  // off a nil return.
+  //
+  // `VPIPE_MAX_BUFFER_MB` lowers the answer (never raises it), so the
+  // over-the-limit path can be exercised on a machine whose device does
+  // not force it. Same idea as VPIPE_RAM_LIMIT_MB.
+  std::size_t max_buffer_length() const noexcept;
 
   // Load a `.metallib` whose bytes were embedded into libvpipe by an
   // add_vpipe_metal_kernel(KERNEL_NAME ...) call in CMake. `name`

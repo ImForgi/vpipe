@@ -161,6 +161,14 @@ private:
   }
   // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
   std::string _family = "krea2";
+  // Within the qwen-image-edit family, WHICH of the two Qwen-Image
+  // recipes this checkpoint takes. They are one architecture published
+  // as two diffusers pipelines with two system prompts, and the weights
+  // cannot tell them apart, so this is read from the pipeline the
+  // checkpoint declares (or the model_type the registry recorded) and
+  // never from whether a reference image happens to be wired. See
+  // qwen_image_is_t2i_.
+  bool _qie_t2i = false;
   // What the models DB recorded for this checkpoint, when a model-select
   // source named one. Only used to ask a registered family's `claims`,
   // which is the one probe a bare weights directory can answer.

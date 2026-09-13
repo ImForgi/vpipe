@@ -1169,6 +1169,21 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 }
 .modal textarea { min-height: 80px; resize: vertical; }
 
+/* ---- Error modal (a refused load / launch, with its reason) ---- */
+.modal.error-modal { width: 560px; }
+.err-summary { margin-bottom: 10px; }
+.err-detail {
+  margin: 0; padding: 8px 10px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px; line-height: 1.45; color: var(--fg);
+  /* The reason is meant to be read and copied, so it wraps rather than
+     scrolling sideways -- a file path or a parse position is exactly
+     the part that would have been off the right edge. */
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 46vh; overflow-y: auto; user-select: text;
+}
+
 /* ---- File open/save dialog ---- */
 .modal.fs-modal { width: 720px; }
 .fs-dialog { display: flex; flex-direction: column; gap: 8px; }

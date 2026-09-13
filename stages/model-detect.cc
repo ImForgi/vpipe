@@ -186,6 +186,7 @@ family_version_(const std::string& mt, std::string& family,
       {"krea2-lora",             "Krea",        "2"},
       {"flux2",                  "FLUX",        "2"},
       {"flux2-lora",             "FLUX",        "2"},
+      {"qwen-image",             "Qwen-Image",  "2512"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
@@ -948,6 +949,18 @@ resolve_vae_dir(const std::string& root)
     if (fs::exists(p / "source" / "model.safetensors") &&
         fs::exists(p / "config.json")) {
       return p.string();
+    }
+  }
+  // FlashVSR as published: its Wan 2.1 VAE is ONE torch file at the root
+  // with no config beside it. Returned by FILE, the way a Comfy-Org
+  // repack's component is, so the root's other checkpoints -- a 5.7 GB
+  // denoiser among them -- are never taken for it. The source
+  // projection's file is part of the test, so a directory that merely
+  // holds a stray VAE of that name is not this.
+  {
+    const fs::path vae = fs::path(root) / "Wan2.1_VAE.pth";
+    if (fs::exists(vae) && fs::exists(fs::path(root) / "LQ_proj_in.ckpt")) {
+      return vae.string();
     }
   }
   return root;

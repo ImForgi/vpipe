@@ -793,10 +793,22 @@ template <
 
   threadgroup_barrier(mem_flags::mem_none);
 
+  // vpipe: A ROW THAT ATTENDED NOTHING IS ZERO. A span list can route a
+  // query to no key block at all, and then sum_score is still its initial
+  // 0 and 1/0 turns the all-zero tile into NaN -- the FlashAttention
+  // answer for a query with no keys is 0, and a NaN row poisons every
+  // later layer. The per-key mask's all-excluded row is the same row
+  // spelled differently: max_score never left the sentinel the mask
+  // writes, and without this it would come out a uniform average of keys
+  // it excluded. The statistics export above is untouched, so Sol still
+  // reads its sentinel.
   metal::vec<AccumType, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    rcp[i] = 1.f / sum_score[i];
+    const bool empty =
+        sum_score[i] == 0 ||
+        (has_block_mask && max_score[i] == Limits<AccumType>::finite_min);
+    rcp[i] = empty ? AccumType(0) : 1.f / sum_score[i];
   }
 
   Otile.template row_bin_op<MulOp>(rcp);

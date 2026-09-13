@@ -348,6 +348,51 @@ TEST(model_memory, a_declared_model_counts_before_it_loads)
   fs::remove_all(root, ec);
 }
 
+// A revision below the DECLARED FLOOR is raised to it. Revisions come
+// from a model that has just loaded, and a block-streaming one builds its
+// slot pair on the first forward -- so what it reports then is below the
+// least it will run on, and taken as said it under-counts.
+TEST(model_memory, a_revision_is_held_at_the_declared_floor)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-floor-revise";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "dit", ec);
+  {
+    std::ofstream f(root / "dit" / "w.safetensors", std::ios::binary);
+    std::string blob(8192, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  const std::string dit = (root / "dit").string();
+
+  // Streamable: 8192 on disk, 4096 at its floor (trunk + slot pair).
+  mgr->declare_weights(dit, 8192, std::string(), std::string(), 4096);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 8192u);
+
+  // Straight after load: the trunk alone. Raised to the floor -- in the
+  // floor ledger too, which takes the smaller of this and the floor and
+  // so read 1024 before.
+  mgr->revise_declaration(dit, 1024);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 4096u);
+  EXPECT_TRUE(mgr->phase_footprint_floor(std::string()) == 4096u);
+
+  // Above the floor -- blocks promoted into free RAM: taken as said.
+  mgr->revise_declaration(dit, 6144);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 6144u);
+
+  // 0 is a withdrawal, not a report, and still withdraws.
+  mgr->revise_declaration(dit, 0);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 0u);
+
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+}
+
 // A claim on a directory that CONTAINS another claim is counted ONCE.
 //
 // dir_weights_bytes() is recursive but the manager keys declarations by

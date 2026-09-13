@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <filesystem>
@@ -1480,4 +1481,93 @@ TEST(weight_set, a_misaligned_pack_does_not_warn)
     std::printf("[weight_set] unexpected: %s\n", l.c_str());
   }
   EXPECT_TRUE(ui->lines.empty());
+}
+
+// A SHARD LARGER THAN ANY BUFFER THAT COULD DESCRIBE IT.
+//
+// MTLDevice.maxBufferLength is a fraction of installed RAM -- 38.88 GiB
+// on a 64 GB M4 Pro, proportionally less below that -- so a checkpoint
+// shard can exceed it, and the whole-shard wrap load_mapped() prefers
+// then returns nil. That used to fall back to a COPY, which is the
+// opposite of what a caller asking for Residency::Mapped wants and is
+// worst on the small box that forced it: dirty anonymous pages instead
+// of clean file-backed ones, on the machine with the least room.
+//
+// The answer is a per-tensor WINDOW over the same mapping. What this
+// pins is that the result is still MAPPED (not owned) and still carries
+// the right bytes.
+//
+// The over-the-limit condition is FORCED rather than found:
+// VPIPE_MAX_BUFFER_MB lowers the device's reported cap, so the path is
+// reachable on a machine whose GPU would not force it -- which is every
+// machine large enough to be comfortable, and therefore every machine
+// this would otherwise go untested on.
+//
+// VPIPE_BIG_SHARD_TEST_PATH names a checkpoint; unset, it skips. It must
+// be one whose tensors are 16-byte aligned, or the earlier alignment
+// guard copies everything and this proves nothing -- the test says so
+// rather than passing.
+TEST(weight_set, a_shard_over_max_buffer_length_still_maps)
+{
+  const char* dir = std::getenv("VPIPE_BIG_SHARD_TEST_PATH");
+  if (dir == nullptr || *dir == '\0') { return; }
+  // Small enough that any real shard is over it.
+  ::setenv("VPIPE_MAX_BUFFER_MB", "64", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::size_t cap = mc->max_buffer_length();
+  ASSERT_TRUE(cap > 0);
+  if (cap == 0) { return; }
+
+  auto raw = genai::MetalLlamaWeights::open_model(dir);
+  ASSERT_TRUE(raw.has_value());
+  if (!raw.has_value()) { return; }
+  const auto align = raw->alignment();
+  if (align.bad_shards > 0 || align.misaligned == align.tensors) {
+    std::printf("[weight_set] '%s' is not 16-byte aligned (%zu bad shards, "
+                "%zu/%zu misaligned tensors) -- the mapped path is a no-op "
+                "for it, so this test cannot say anything. SKIPPED\n",
+                dir, (std::size_t)align.bad_shards, align.misaligned,
+                align.tensors);
+    return;
+  }
+
+  auto ws = genai::WeightSet::open(dir, &sess);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+
+  // The largest tensor in a shard that is itself over the cap, and
+  // 16-byte aligned so the mapped path is reachable at all.
+  const auto& src = ws->src();
+  std::string pick;
+  std::uint64_t best = 0;
+  for (const std::string& n : src.tensor_names()) {
+    const auto* ti = src.info(n);
+    if (ti == nullptr || ti->shard < 0) { continue; }
+    if (ti->nbytes > best) { best = ti->nbytes; pick = n; }
+  }
+  ASSERT_TRUE(!pick.empty());
+  if (pick.empty()) { return; }
+
+  metal_compute::SharedBuffer mapped =
+      ws->read(pick, mc, genai::WeightSet::Residency::Mapped);
+  ASSERT_TRUE(!mapped.empty());
+  if (mapped.empty()) { return; }
+  std::printf("[weight_set] '%s' %llu MB, device cap %zu MB -> %s\n",
+              pick.c_str(),
+              (unsigned long long)(mapped.byte_size() >> 20), cap >> 20,
+              mapped.is_owned() ? "COPIED" : "mapped");
+  // The point of the fix: mapped, not copied, whatever the shard's size.
+  EXPECT_FALSE(mapped.is_owned());
+
+  // And the same bytes a copy would have produced.
+  metal_compute::SharedBuffer copied =
+      ws->read(pick, mc, genai::WeightSet::Residency::Copied);
+  ASSERT_TRUE(!copied.empty());
+  if (copied.empty()) { return; }
+  EXPECT_TRUE(copied.byte_size() == mapped.byte_size());
+  if (copied.byte_size() != mapped.byte_size()) { return; }
+  EXPECT_TRUE(std::memcmp(copied.contents(), mapped.contents(),
+                          mapped.byte_size()) == 0);
 }

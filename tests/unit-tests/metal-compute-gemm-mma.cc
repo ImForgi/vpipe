@@ -5101,3 +5101,184 @@ TEST(gemm_i8, g64_register_acc) {
   EXPECT_TRUE(or_ri < 1e-3 && or_rsi < 1e-3 && or_w < 1e-3 && or_f < 1e-3);
   EXPECT_TRUE(r_rt < 1e-3);
 }
+
+// THE WAN VAE'S CAUSAL 3x3x3 CONV ON THE HARDWARE CONV.
+//
+// The video VAE ran every 3x3x3 conv as im2col3d + matmul2d: a 27*C-wide
+// gather per output pixel, 11.5 GB of it per full-resolution frame at
+// 1920x1152, written and then read back -- and a 1080p decode measured
+// ~3.2 TFLOP/s end to end, bandwidth-bound. A causal conv over frames
+// (t-2, t-1, t) is three 2D 3x3 convs, one per tap, summed -- which the
+// gather-free MPP convolution2d runs with no gather and no concat: the
+// first live tap writes the destination, every later one accumulates
+// onto it (conv2d_hw_3x3_s1{,_c32}_acc_f16).
+//
+// Each tap reads its own [3,3,C,Cout] block of the weight, im2col column
+// ((kt*3+ky)*3+kx)*C + c becoming block kt, tap (ky, kx), channel c. A
+// masked tap (a frame before the sequence) is skipped, so a masked FIRST
+// tap makes the second the one that writes. Checked at small shapes on the
+// 64-channel tile, the 32-channel one (the 96-channel full-resolution
+// convs), and the deep-K GEMM (C=384). VPIPE_HWCONV_WAN_BENCH times both
+// routes at the three real level shapes.
+TEST(conv2d_mma, hw_op_wan_causal_conv3d) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma");
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma");
+  ComputeLibrary lib_elt = mc->load_library("llm_elementwise");
+  ComputeFunction f_hw64 = lib.function("conv2d_hw_3x3_s1_f16");
+  ComputeFunction f_hw32 = lib.function("conv2d_hw_3x3_s1_c32_f16");
+  ComputeFunction f_acc64 = lib.function("conv2d_hw_3x3_s1_acc_f16");
+  ComputeFunction f_acc32 = lib.function("conv2d_hw_3x3_s1_c32_acc_f16");
+  ComputeFunction f_mma = lib_mma.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f_mma_deep =
+      lib_mma.function("dense_gemm_mma_t_n128x256_f16");
+  ComputeFunction f_i2c3 = lib_elt.function("im2col_hwc_3x3x3_tiled_f16");
+  ASSERT_TRUE(f_hw64.valid() && f_hw32.valid() && f_acc64.valid() &&
+              f_acc32.valid() && f_mma.valid() && f_mma_deep.valid() &&
+              f_i2c3.valid());
+  if (!f_acc32.valid() || !f_acc64.valid() || !f_i2c3.valid()) { return; }
+  const int SG = 4;
+
+  auto run = [&](int W, int H, int C, int Cout, int mask, bool check,
+                 int iters) {
+    const std::size_t hw = (std::size_t)W * H;
+    const int K = 27 * C;
+    std::mt19937 rng(71u + (unsigned)(W * 7 + C * 3 + Cout));
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    const float ws = 1.0f / std::sqrt((float)K);
+    // Weights in the VAE loader's im2col layout, and their per-tap HWIO
+    // blocks: block kt, then (ky, kx), then channel, out-channel fastest.
+    std::vector<_Float16> w_col((std::size_t)Cout * K);
+    for (auto& v : w_col) { v = (_Float16)(d(rng) * ws); }
+    const std::size_t blk = (std::size_t)9 * C * Cout;
+    std::vector<_Float16> w_hwio(3 * blk);
+    for (int o = 0; o < Cout; ++o) {
+      for (int kt = 0; kt < 3; ++kt) {
+        for (int s = 0; s < 9; ++s) {
+          for (int c = 0; c < C; ++c) {
+            w_hwio[(((std::size_t)kt * 9 + s) * C + c) * Cout + o] =
+                w_col[(std::size_t)o * K + ((kt * 9 + s) * C + c)];
+          }
+        }
+      }
+    }
+    SharedBuffer taps[3];
+    for (auto& t : taps) {
+      t = mc->make_shared_buffer(hw * C * 2);
+      auto* p = static_cast<_Float16*>(t.contents());
+      for (std::size_t i = 0; i < hw * C; ++i) {
+        p[i] = (_Float16)(d(rng) * 0.5f);
+      }
+    }
+    SharedBuffer wc = mc->make_shared_buffer(w_col.size() * 2);
+    SharedBuffer wh = mc->make_shared_buffer(w_hwio.size() * 2);
+    std::memcpy(wc.contents(), w_col.data(), w_col.size() * 2);
+    std::memcpy(wh.contents(), w_hwio.data(), w_hwio.size() * 2);
+    SharedBuffer o_hw = mc->make_shared_buffer(hw * Cout * 2);
+    SharedBuffer o_i2c = mc->make_shared_buffer(hw * Cout * 2);
+    // The decoder's band: the matmul2d row cap, and under 2^31 bytes.
+    std::size_t rows = std::min<std::size_t>(hw, 262144);
+    rows = std::min<std::size_t>(rows, (std::size_t)0x7fffffff / (2 * K));
+    SharedBuffer col = mc->make_shared_buffer(rows * K * 2);
+    if (col.empty() || o_hw.empty() || o_i2c.empty()) {
+      std::printf("[wan_hwconv] alloc failed at %dx%d C=%d -- skip\n", W, H,
+                  C);
+      return;
+    }
+    const bool c32 = (Cout % 64) != 0;
+    const int TC = c32 ? 32 : 64;
+
+    auto launch_hw = [&](int n) {
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        for (int i = 0; i < n; ++i) {
+          bool first = true;
+          for (int kt = 0; kt < 3; ++kt) {
+            if (((mask >> kt) & 1) == 0) { continue; }
+            enc.set_function(first ? (c32 ? f_hw32 : f_hw64)
+                                   : (c32 ? f_acc32 : f_acc64));
+            enc.set_buffer(0, taps[kt]);
+            enc.set_buffer(1, wh, (std::size_t)kt * blk * 2);
+            enc.set_buffer(2, o_hw);
+            enc.set_constant(3, W); enc.set_constant(4, H);
+            enc.set_constant(5, C); enc.set_constant(6, Cout);
+            enc.dispatch({(unsigned)((W / 8) * SG * 32), (unsigned)(H / 8),
+                          (unsigned)(Cout / TC)}, {(unsigned)(SG * 32), 1, 1});
+            first = false;
+          }
+        }
+      }
+      st.commit().wait();
+    };
+    auto launch_i2c = [&](int n) {
+      const bool deep = K >= 6144;
+      const int BN = deep ? 256 : 128;
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        for (int i = 0; i < n; ++i) {
+          for (std::size_t r0 = 0; r0 < hw; r0 += rows) {
+            const int m = (int)std::min(rows, hw - r0);
+            enc.set_function(f_i2c3);
+            for (int t = 0; t < 3; ++t) {
+              enc.set_buffer((unsigned)t, taps[t]);
+            }
+            enc.set_buffer(3, col);
+            enc.set_constant(4, H); enc.set_constant(5, W);
+            enc.set_constant(6, C); enc.set_constant(7, (int)r0);
+            enc.set_constant(8, m); enc.set_constant(9, mask);
+            enc.dispatch({(unsigned)K, (unsigned)m, 1}, {64, 1, 1});
+            enc.set_function(deep ? f_mma_deep : f_mma);
+            enc.set_buffer(0, col); enc.set_buffer(1, wc);
+            enc.set_buffer(2, wc); enc.set_buffer(3, o_i2c, r0 * Cout * 2);
+            enc.set_constant(4, K); enc.set_constant(5, Cout);
+            enc.set_constant(6, m); enc.set_constant(7, 0);
+            enc.dispatch({(unsigned)(((Cout + BN - 1) / BN) * 256),
+                          (unsigned)((m + 127) / 128), 1}, {256, 1, 1});
+          }
+        }
+      }
+      st.commit().wait();
+    };
+
+    launch_hw(1);
+    launch_i2c(1);
+    if (check) {
+      const auto* a = static_cast<const _Float16*>(o_hw.contents());
+      const auto* b = static_cast<const _Float16*>(o_i2c.contents());
+      double num = 0.0, den = 0.0;
+      for (std::size_t i = 0; i < hw * Cout; ++i) {
+        const double e = (double)a[i] - (double)b[i];
+        num += e * e;
+        den += (double)b[i] * (double)b[i];
+      }
+      const double r = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[wan_hwconv] %dx%d 3x%d->%d mask %d (%s tile): rel-L2 "
+                  "%.3e\n", W, H, C, Cout, mask, c32 ? "32" : "64", r);
+      EXPECT_TRUE(r < 1e-2);
+    }
+    if (iters <= 0) { return; }
+    const auto t0 = std::chrono::steady_clock::now();
+    launch_hw(iters);
+    const auto t1 = std::chrono::steady_clock::now();
+    launch_i2c(iters);
+    const auto t2 = std::chrono::steady_clock::now();
+    const double s_hw = secs_(t0, t1) / iters, s_i2c = secs_(t1, t2) / iters;
+    const double tf = 2.0 * (double)hw * Cout * K / 1e12;
+    std::printf("[wan_hwconv] %4dx%-4d 3x%-3d->%-3d: per-tap hw %.0f ms "
+                "(%.1f TF/s)  im2col3d+mma %.0f ms (%.1f TF/s)  %.2fx\n", W,
+                H, C, Cout, s_hw * 1e3, tf / s_hw, s_i2c * 1e3, tf / s_i2c,
+                s_i2c / s_hw);
+  };
+
+  run(48, 32, 96, 96, 7, /*check=*/true, 0);      // 32-channel tile
+  run(48, 32, 96, 96, 6, /*check=*/true, 0);      // first tap masked
+  run(48, 32, 64, 192, 7, /*check=*/true, 0);     // 64-channel tile
+  run(48, 32, 384, 384, 3, /*check=*/true, 0);    // deep K, last masked
+  if (std::getenv("VPIPE_HWCONV_WAN_BENCH") != nullptr) {
+    run(1920, 1152, 96, 96, 7, /*check=*/true, 3);
+    run(960, 576, 192, 192, 7, /*check=*/true, 3);
+    run(480, 288, 384, 384, 7, /*check=*/true, 3);
+  }
+}

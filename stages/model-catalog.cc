@@ -782,6 +782,76 @@ builtin_catalog_()
                "processor/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // Qwen-Image-2512 (Qwen): the TEXT-TO-IMAGE sibling of Edit-2511 and
+    // architecturally the same model. VERIFIED against it tensor by
+    // tensor over HTTP Range, not inferred from the config: the DiT is
+    // 1933 tensors with identical names, dtypes and shapes (40.86 GB) and
+    // the text encoder 729 (16.58 GB); text_encoder/, vae/ and scheduler/
+    // configs are identical files. The transformer config differs in ONE
+    // key, and it differs correctly -- Edit-2511 sets `zero_cond_t` true,
+    // 2512 omits it, and that flag modulates REFERENCE tokens at timestep
+    // 0, which a model with no references does not have. So the DiT, the
+    // VAE and the encoder load it with nothing new.
+    //
+    // WHAT IS NOT SHARED IS THE RECIPE, which is why this carries its own
+    // model_type instead of joining "qwen-image-edit". The two are
+    // separate diffusers pipelines -- QwenImagePipeline here against
+    // QwenImageEditPlusPipeline there -- and they condition through
+    // DIFFERENT system prompts: the plain "Describe the image by
+    // detailing ..." template (the one kPrefix / kDropPrefix already hold
+    // for Krea-2 and Mage-Flow) against the edit template that opens
+    // "Describe the key features of the input image". Typing this as the
+    // edit model would load and run and quietly condition it on the wrong
+    // prompt, which is the failure nothing downstream can see.
+    //
+    // The conditioner reads that recipe from the registry's model_type
+    // (this field) or, for an unregistered directory, from the pipeline
+    // model_index.json declares -- never from whether a reference image
+    // is wired, which would have flipped the EDIT model's own text-only
+    // conditioning and the golden that pins it.
+    //
+    // `needs_tokenizer_json` is TRUE because the repo ships no
+    // consolidated tokenizer.json, only tokenizer/{vocab.json,
+    // merges.txt, tokenizer_config.json}. The synthesis step now runs in
+    // whichever directory holds vocab.json, so it writes
+    // tokenizer/tokenizer.json here and the repo root for the ASR repos
+    // it was built for.
+    //
+    // No processor/ subdir here, unlike Edit-2511: a model that takes no
+    // reference image needs no image preprocessor, and the chat template
+    // sits in tokenizer/ instead. ~58 GB (20B DiT + 7B VL encoder, bf16).
+    {.family = "Qwen-Image", .version = "2512", .param_class = "20B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2512",
+     .model_type = "qwen-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "tokenizer/special_tokens_map.json",
+               "tokenizer/added_tokens.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
     // separate VAE stages), but the FLUX topology rather than Qwen-Image
@@ -1018,6 +1088,39 @@ builtin_catalog_()
      .parent_model_type = "vosr",
      .files = {"config.json", "model.safetensors",
                "preprocessor_config.json"},
+     .needs_tokenizer_json = false},
+    // ---- FlashVSR (video -> video, streaming RESTORATION) -------------
+    // FlashVSR-v1.1 (OpenImagingLab, arXiv 2510.12747): one-step streaming
+    // 4x video super-resolution. Like VOSR it conditions on no text -- its
+    // context is a constant the checkpoint carries -- and unlike VOSR it
+    // runs on VIDEO, a chunk at a time against a key/value window.
+    //   diffusion_pytorch_model_streaming_dmd.safetensors = the denoiser,
+    //     Wan 2.1-T2V-1.3B tensor for tensor (30 blocks at 1536, 12 x 128
+    //     heads), with block-sparse attention over (2,8,8) windows.
+    //   LQ_proj_in.ckpt = the learned causal source projection, which
+    //     reads the upscaled clip in PIXELS (the flashvsr-src-encoder
+    //     stage runs it).
+    //   Wan2.1_VAE.pth  = the Wan 2.1 VAE, natively named, no config.
+    // Three of those are torch.save() files, READ IN PLACE: they map as
+    // shards (shared/torch-zip.h), so nothing is converted.
+    //
+    // THE CONTEXT IS NOT ON THE MODEL PAGE. The reference keeps it in its
+    // GitHub repo (examples/WanVSR/prompt_tensor/posi_prompt.pth), and a
+    // companion can only name a HuggingFace repo -- so it comes from
+    // deAPI-ai's copy of v1.1, which is BYTE-IDENTICAL to GitHub's
+    // (sha256 4601107a11e4e11a...) as of 2026-09-12. 4 MB. TCDecoder.ckpt
+    // (the reference's tiny decoder) is not fetched: nothing here runs it.
+    {.family = "FlashVSR", .version = "1.1", .param_class = "1.3B",
+     .variant = "one-step streaming 4x (OpenImagingLab)",
+     .hf_path = "JunhaoZhuang/FlashVSR-v1.1",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "model_index.json",
+               "diffusion_pytorch_model_streaming_dmd.safetensors",
+               "LQ_proj_in.ckpt", "Wan2.1_VAE.pth"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
      .needs_tokenizer_json = false},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
@@ -1747,12 +1850,24 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              ) {
     set({"text", "image"}, {"image"});
+  } else if (mt == "qwen-image") {
+    // The text-to-image half of the Qwen-Image family: no reference
+    // image, which is the whole difference between it and the edit
+    // model it is otherwise architecturally identical to. Saying
+    // {"text", "image"} here would offer it to a stage that needs an
+    // image input and hand that stage a checkpoint with nowhere to put
+    // one.
+    set({"text"}, {"image"});
   } else if (mt == "wan-i2v") {
     // The one family here that OUTPUTS video: a prompt plus a first-frame
     // image in, a clip out.
     set({"text", "image"}, {"video"});
   } else if (mt == "wan-t2v") {
     set({"text"}, {"video"});
+  } else if (mt == "flashvsr") {
+    // RESTORATION: a low-quality clip in, the same clip at 4x out. No
+    // prompt -- the conditioning is a constant the checkpoint ships.
+    set({"video"}, {"video"});
   } else if (mt == "minimax-h3-fl2va") {
     // The only entry whose OUTPUT is two modalities: one denoise loop
     // over one packed sequence emits the clip and its soundtrack

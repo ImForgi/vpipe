@@ -259,6 +259,17 @@ std::size_t vae_decode_scratch_bytes(const std::string& root,
 // before the first clip exists.
 std::size_t video_decode_scratch_bytes(int width, int height, int frames);
 
+// What the VAE that decodes such a clip holds BESIDE the clip, when that
+// is not small. Today that is the Wan video VAE: its causal carries are
+// held for the whole clip and its chunk pool is at full resolution, and
+// at FlashVSR's 1920x1152 the two are several times the clip itself. The
+// figure is MetalWanVae::decode_peak_bytes(), the one its own preflight
+// refuses on. 0 for every other VAE, whose video decode stays booked by
+// video_decode_scratch_bytes() alone. Reads the VAE's config (or, for a
+// natively-named checkpoint, its header) -- no model load.
+std::size_t video_vae_working_bytes(const std::string& root, int width,
+                                    int height);
+
 // Should a stage drop its weights between beats, given what this beat
 // actually needs?
 //

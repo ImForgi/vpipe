@@ -102,23 +102,37 @@ A mismatch is reported at debug level and the latent wins.
 
 | key | stage | what it does |
 |---|---|---|
-| `tile_size` | generate-image | Tile the restorer in latent space, in output pixels. `0` (default) does not tile. |
-| `tile_overlap` | generate-image | Overlap between tiles, in output pixels. Default 32. |
+| `tile_size` | vosr-model-config | Tile the restorer in latent space, in output pixels. Unset tiles at the resolution the checkpoint was distilled at; `0` forces one pass. |
+| `tile_overlap` | vosr-model-config | Overlap between tiles, in output pixels. Default 32, raised to an eighth of the tile when smaller. |
 | `steps` | generate-image | Defaults to **1** here. The checkpoint is distilled to one step and gains nothing from more. |
 | `seed` | generate-image | The noise field. One step still starts from noise. |
 | `encoder_dir` | diffusion-conditioner | Where DINOv2 is, if it is not `facebook/dinov2-large` in the models DB. |
 | `unload_when_idle` | diffusion-conditioner | `park` hands the tower's pages back between pictures. |
 
-### When to tile
+### Tiling, and why it is the default
 
-Attention is quadratic in the token count, and the token count is quadratic in
-the output side. A 1024×1024 output is 4096 tokens and comfortable; 2048×2048
-is 16384 and is where a machine starts to feel it.
+Past the resolution the checkpoint was distilled at — 512 px for VOSR 2.0 —
+a restore **tiles at that resolution unless the graph says otherwise**, and
+the two keys above live on their own `vosr-model-config` stage wired to
+`generate-image`'s `model_config` iport. Leave it unwired and you get the
+default.
+
+The reason is not attention cost, though that is real: attention is quadratic
+in the token count and the token count is quadratic in the output side, so a
+1024×1024 output is 4096 tokens and 2048×2048 is 16384. The reason is the
+rotary table. The reference's one-step sampler applies a table built once for
+the trained grid, so it cannot run any other token count at all, and its
+tiling exists to put every tile back on that grid. Running a larger grid
+through a rescaled table puts every other token on a position the weights
+never saw, which weaves a periodic pattern through whatever the model has to
+synthesise rather than pass through — reported from the field as a
+checkerboard on faces at a 1024 output, absent at 512 and absent tiled.
+`tile_size: 0` still gives you one pass, and warns.
 
 Tiling costs something other than time. The reference re-runs its vision tower
 on each tile's own pixels; a graph whose conditioner ran once cannot, so vpipe
-**crops the feature grid** per tile instead. That is the reference's own
-alternative, and it is why an untiled run is the one that matches it exactly.
+**crops the feature grid** per tile instead. That is the one way a tiled run
+still differs from the reference.
 
 ## What it costs
 

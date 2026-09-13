@@ -1766,6 +1766,23 @@ members are invisible to it. Answer with what you are actually holding,
 or the graph sizes itself against a checkpoint it cannot see. This is the
 single most consequential default on this page.
 
+**When the host reads it, and what it does with the answer.** The host
+reads it once right after `load()` and again after every generation. For
+a family that declares exactly one holding, each read corrects that
+holding in the memory plan:
+
+- **The floor** is set at load: the larger of what you report and the
+  floor you declared. It stays there for the rest of the launch.
+- **The preload** follows each later read, as the resident set grows or
+  sheds. It never goes below that floor.
+
+A block-streaming family usually builds its slot pair on the first
+forward, so an answer read at load leaves the slots out. The declared
+floor already counts them, and that floor is what stops the load-time
+answer from under-counting. `revise_declaration()` follows the same rule
+on the manager's side: a nonzero revision below the declared floor is
+raised to it, and 0 still withdraws.
+
 **`release_idle()` is a request, not a contract.** It means "drop what
 you can", and a family with nothing droppable legitimately does nothing.
 Because of that, the host will not subtract your weights from a peer's

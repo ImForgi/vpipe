@@ -258,6 +258,50 @@ TEST(memory_plan, a_stage_revises_into_the_sink_it_was_given)
   EXPECT_TRUE(sink.calls == 1);
 }
 
+// What a model reports straight after load does not yet include the
+// streaming slots its first forward builds, so it must not replace the
+// floor the holding was planned at.
+TEST(memory_plan, a_loaded_holding_is_never_corrected_below_its_floor)
+{
+  // Streaming: 1000 on disk, 300 at the floor, 100 held at load.
+  StageHolding h;
+  h.preload = 1000 * kMB;
+  h.floor   = 300 * kMB;
+  const std::size_t lf = correct_loaded_holding(h, 100 * kMB);
+  EXPECT_TRUE(lf == 300 * kMB);
+  EXPECT_TRUE(h.floor == 300 * kMB);
+  EXPECT_TRUE(h.preload == 300 * kMB);
+
+  // After a clip: slots built, blocks promoted. The preload follows; the
+  // floor does not, since residency sheds that growth under pressure.
+  StageHolding live;
+  live.preload = 1000 * kMB;
+  live.floor   = 300 * kMB;
+  EXPECT_TRUE(correct_loaded_holding(live, 520 * kMB, lf) == 300 * kMB);
+  EXPECT_TRUE(live.floor == 300 * kMB);
+  EXPECT_TRUE(live.preload == 520 * kMB);
+
+  // A later read under the floor stops at it.
+  correct_loaded_holding(live, 40 * kMB, lf);
+  EXPECT_TRUE(live.preload == 300 * kMB);
+
+  // The same checkpoint PRELOADED holds more than its floor and cannot
+  // stream within this launch, so what it holds is the floor.
+  StageHolding pre;
+  pre.preload = 1000 * kMB;
+  pre.floor   = 300 * kMB;
+  EXPECT_TRUE(correct_loaded_holding(pre, 980 * kMB) == 980 * kMB);
+  EXPECT_TRUE(pre.floor == 980 * kMB);
+  EXPECT_TRUE(pre.preload == 980 * kMB);
+
+  // No declared floor: no smaller form, so both columns are what it holds.
+  StageHolding plain;
+  plain.preload = 800 * kMB;
+  correct_loaded_holding(plain, 640 * kMB);
+  EXPECT_TRUE(plain.floor == 640 * kMB);
+  EXPECT_TRUE(plain.preload == 640 * kMB);
+}
+
 // A revision replaces the stage's whole entry, and the peak is
 // recomputed against its PEERS -- which is the reason the sink is an
 // interface rather than a field on the stage. An arena nobody could

@@ -693,7 +693,23 @@ GenerativeModelManager::revise_declaration(const string& dir,
   // Only a checkpoint that was declared can be revised: an undeclared
   // one is not being counted from an estimate, so there is nothing to
   // correct.
-  if (it != _declared.end()) { it->second = bytes; }
+  if (it == _declared.end()) { return; }
+  // NEVER BELOW THE DECLARED FLOOR, short of a withdrawal (0). A floor is
+  // the least this checkpoint can be held at, and revisions come from a
+  // model that has just LOADED -- when a block-streaming one holds its
+  // trunk and has not yet built the slot pair its first forward
+  // allocates. Taken as said, that figure sits two blocks per stack under
+  // the floor the checkpoint was planned against, in BOTH ledgers: this
+  // map is the preload column, and the floor ledger takes the smaller of
+  // it and the floor. Under-counting is the direction that admits a graph
+  // the box cannot hold.
+  if (bytes > 0) {
+    const auto f = _declared_floor.find(key);
+    if (f != _declared_floor.end() && bytes < f->second) {
+      bytes = f->second;
+    }
+  }
+  it->second = bytes;
 }
 
 void

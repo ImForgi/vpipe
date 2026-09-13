@@ -660,8 +660,21 @@ template <
     }
   }
 
-  // Normalize output
-  Otile.template row_bin_op<DivOp>(sum_score);
+  // Normalize output.
+  //
+  // vpipe: A ROW THAT ATTENDED NOTHING IS ZERO, exactly as in the NAX
+  // kernel -- see the note there. Dividing by infinity rather than by the
+  // untouched 0 makes that row 0 whatever the tile holds (nothing, on a
+  // span list; the masked keys' average, on the per-key mask).
+  AccumType divisor[kRowsPT];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    const bool empty =
+        sum_score[i] == 0 ||
+        (has_block_mask && max_score[i] == Limits<AccumType>::finite_min);
+    divisor[i] = empty ? Limits<AccumType>::max : sum_score[i];
+  }
+  Otile.template row_bin_op<DivOp>(divisor);
   threadgroup_barrier(mem_flags::mem_none);
 
   // Store results

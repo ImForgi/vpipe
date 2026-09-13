@@ -77,8 +77,10 @@ class MetalKrea2Vae {
          std::string* err = nullptr);
 
   // Conservative estimate of the peak GPU memory (bytes) a decode() at the
-  // given latent size needs: the reused im2col scratch plus the held
-  // intermediate activations. For a preflight memory_budget() check.
+  // given latent size needs: the held intermediate activations, plus the
+  // im2col scratch when some conv has to gather (no hardware conv, or a
+  // latent grid that is not a multiple of 8). For a preflight
+  // memory_budget() check.
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
 
   // Encode an RGB image [3, H, W] (channel-first, in [-1,1]) into the WHITENED
@@ -281,7 +283,7 @@ class MetalKrea2Vae {
   // Tune from decode()/encode(), once the resolution is known: which shapes
   // reach the fallback at all depends on it. Runs on every call but only ever
   // ADDS shapes -- the encoder half can arrive after the first decode.
-  void maybe_tune_conv_(int H, int W, const metal_compute::SharedBuffer& col,
+  void maybe_tune_conv_(int H, int W, metal_compute::SharedBuffer& col,
                         std::size_t cap);
 
   // NAX hardware convolution2d (M5+, probe-established semantics): the op
@@ -297,6 +299,12 @@ class MetalKrea2Vae {
                    int stride);
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
+  // The same op over a 32-channel destination tile, for a stride-1 conv
+  // whose cout is a multiple of 32 but not of 64: this VAE's base_dim is
+  // 96, so every full-resolution conv -- the ones that dominate a decode --
+  // could reach the hardware conv only through this tile. The stride-2 twin
+  // serves the encoder's first downsample (96 -> 96).
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c32, _fn_conv_hw_s2_c32;
   // Direct 3x3 for a small output-channel count. The hardware conv needs
   // cout % 64 == 0, so this VAE's final convs -- decoder.conv_out (-> 3) and
   // encoder.conv_out (-> 2*z_dim) -- drop to im2col AT FULL RESOLUTION and pay

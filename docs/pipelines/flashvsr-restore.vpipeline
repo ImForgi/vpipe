@@ -1,0 +1,145 @@
+{
+  "id": "flashvsr-restore",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "JunhaoZhuang/FlashVSR-v1.1"
+      }
+    },
+    {
+      "id": "load-video",
+      "type": "load-video",
+      "iports": [],
+      "config": {
+        "input_url": "low-quality.mp4",
+        "enable_audio": false
+      }
+    },
+    {
+      "id": "video-to-rgb",
+      "type": "video-to-rgb",
+      "iports": [
+        {
+          "src": "load-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dtype": "u8"
+      }
+    },
+    {
+      "id": "image-resample",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "video-to-rgb",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 512,
+        "height": 512,
+        "fit": "crop",
+        "algorithm": "bicubic"
+      }
+    },
+    {
+      "id": "temporal-stack",
+      "type": "temporal-stack",
+      "iports": [
+        {
+          "src": "image-resample",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "group_size": 41
+      }
+    },
+    {
+      "id": "flashvsr-src-encoder",
+      "type": "flashvsr-src-encoder",
+      "iports": [
+        {
+          "src": "temporal-stack",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "flashvsr-src-encoder",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 512,
+        "height": 512,
+        "frames": 41,
+        "seed": 0
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "flashvsr-restored.mp4",
+        "enable_audio": false
+      }
+    }
+  ],
+  "subpipelines": [],
+  "aux": {}
+}

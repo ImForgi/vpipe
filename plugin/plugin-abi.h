@@ -50,7 +50,7 @@
 // settings stopped being fields -- see the same header, and
 // docs/PLUGINS.md, "Why a bag and not fields".
 //
-// THREE IS CARRYING TWO CHANGES, and that is only legitimate because it
+// THREE CARRIED TWO CHANGES, which was only legitimate because it
 // never shipped. It was introduced for the acceleration bag and then
 // reused for `register_image_family`, both on the same day, with nothing
 // outside this tree ever having reported 3 -- so no binary exists that
@@ -60,7 +60,15 @@
 // and then misreads. The test is not "has anything been built against
 // it", it is "has anything LEFT" -- check the number's introducing
 // commit against the public remote before ever doing this again.
-#define VPIPE_PLUGIN_ABI_VERSION 3u
+//
+// FOUR CARRIES TWO CHANGES TOO, on the same terms. It was introduced for
+// VideoModelFamily::denoise_scratch_bytes (a new virtual, 722924e) and
+// then absorbed MetalCompute::MemoryBudget::self_graphics (a field added
+// MID-struct, 5ecb0ad) -- a struct plugins get back BY VALUE from
+// memory_budget(), so every field after it moved. Both landed before any
+// plugin was rebuilt against 4, so no binary reports 4 and means only
+// the first.
+#define VPIPE_PLUGIN_ABI_VERSION 4u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

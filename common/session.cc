@@ -1,5 +1,6 @@
 #include "common/session.h"
 #include "common/db-log-delegate.h"
+#include "common/diagnostic-capture.h"
 #include "common/ffmpeg-libraries.h"
 #include "common/flex-data.h"
 #include "common/i18n.h"
@@ -1014,17 +1015,36 @@ Session::store_pipeline(PipelineHandle h, string_view path_sv)
 // error/warn/info are the user-facing channel and route to the UI
 // delegate; the lower log_* levels remain diagnostic logging on the
 // log delegate. error() still reports first, then throws.
+//
+// error() and warn() are also where a refusal says WHY, so both offer
+// what they report to any DiagnosticCapture open on this thread --
+// that is how a caller gets the reason its own load or launch was
+// refused for, instead of a bare null handle. Nothing is diverted:
+// the delegate sees exactly what it saw before. The format callable
+// runs ONCE either way (its contract allows it to be expensive), so
+// the capturing path formats first and hands the delegate the string
+// it already has.
 void
 Session::error(const VpipeFormat& f) const
 {
-  _ui_delegate->error(f);
-  throw runtime_error(f() + "\nError reported\n");
+  const string msg = f();
+  if (DiagnosticCapture::active()) {
+    DiagnosticCapture::note(msg);
+  }
+  _ui_delegate->error(VpipeFormat([msg] { return msg; }));
+  throw runtime_error(msg + "\nError reported\n");
 }
 
 void
 Session::warn(const VpipeFormat& f) const
 {
-  _ui_delegate->warn(f);
+  if (!DiagnosticCapture::active()) {
+    _ui_delegate->warn(f);
+    return;
+  }
+  const string msg = f();
+  DiagnosticCapture::note(msg);
+  _ui_delegate->warn(VpipeFormat([msg] { return msg; }));
 }
 
 void

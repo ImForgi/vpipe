@@ -68,7 +68,7 @@ const ConfigKey kAttrs[] = {
           "pipeline. OPTIONAL: a model-select source on the model iport "
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
-       "krea2,flux2,qwen-image-edit,"
+       "krea2,flux2,qwen-image,qwen-image-edit,"
        "boogu-image,boogu-image-edit,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
@@ -253,17 +253,6 @@ const ConfigKey kAttrs[] = {
           "from the first picture without ever saying so. \"auto\" (the "
           "default) is per_beat for a restorer and latch for everything "
           "else", .def_str = "auto"},
-  {.key = "tile_size", .type = ConfigType::Int, .required = false,
-   .doc = "VOSR only: tile the restorer in LATENT space, this many output "
-          "PIXELS per tile side (rounded to a multiple of 16; 0 = no "
-          "tiling, which is the default and the only path that matches the "
-          "reference exactly). Attention is quadratic in the token count, "
-          "so a 4x upscale of anything much past 512px wants this. "
-          "Overlapping tiles are Gaussian-blended and share one noise "
-          "field", .def_int = 0},
-  {.key = "tile_overlap", .type = ConfigType::Int, .required = false,
-   .doc = "VOSR only: overlap between tiles, in output pixels. Ignored "
-          "when tile_size is 0", .def_int = 32},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -366,8 +355,23 @@ const StageSpec kSpec = {
 // one lookup each and cannot mis-measure a checkpoint that uses only
 // one of them.
 std::size_t
-dit_floor_bytes_(const std::string& dit)
+dit_floor_bytes_(const std::string& root, const std::string& dit)
 {
+  // VOSR HAS NO STREAMING FORM, and its checkpoint looks like one that
+  // does: its 36 blocks are named `blocks.N.`, which the single-stack
+  // stem below matches. MetalVosrTransformer copies every block in at
+  // load, so a floor measured from those names is a promise nothing
+  // keeps -- for VOSR 2.0, 417 MB against the ~2659 MB it holds at bf16,
+  // the error that ADMITS a graph rather than refusing one. The published
+  // layout escaped it only by accident: `checkpoints/ema_model.safetensors`
+  // is not a name open_model() opens in a directory, so the measurement
+  // came back 0; a checkpoint shipped as `model.safetensors` (which the
+  // loader also accepts) would have been booked at the block-name floor.
+  // Zero is "cannot be reduced", and now it is said on purpose.
+  genai::MetalVosrTransformer::Config vc;
+  if (genai::MetalVosrTransformer::read_config(root, &vc, nullptr)) {
+    return 0;
+  }
   // EVERY stack, not just the first. These models stream BOTH of their
   // stacks and keep a slot pair for each, so a stem list that names one
   // leaves the other in the trunk -- MEASURED on FLUX.2-klein-9B, whose
@@ -397,7 +401,26 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
 {
   _hf_dir    = attr_str("hf_dir");
   _dit_dir   = attr_str("dit_dir");
-  _tile_size = (int)attr_int("tile_size");
+  // THE RESTORER'S TILING MOVED to `vosr-model-config`, because it is
+  // one family's knob on a stage that serves seven. A graph that still
+  // carries the keys here is told once rather than left to wonder why
+  // the number stopped mattering -- an unknown key is not otherwise
+  // reported anywhere, which is how a knob set in good faith goes quiet.
+  {
+    const FlexData& cfg = this->config();
+    if (cfg.is_object()) {
+      auto o = cfg.as_object();
+      for (const char* k : {"tile_size", "tile_overlap"}) {
+        if (!o.contains(k)) { continue; }
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): `{}` is no longer read here -- it "
+            "moved to the `vosr-model-config` stage, wired to this stage's "
+            "model_config iport. Unwired, the restorer tiles at the "
+            "resolution its checkpoint was distilled at, which is what "
+            "this key was usually set to", this->id(), k));
+      }
+    }
+  }
   _tile_overlap = (int)attr_int("tile_overlap");
   {
     const std::string rm = attr_str("reference_mode");
@@ -900,7 +923,8 @@ GenerateImageStage::declare_memory() const
     held_by_family = true;
   }
   if (!held_by_family) {
-    m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor_bytes_(dit));
+    m.hold(dit, model_memory::dir_weights_bytes(dit),
+           dit_floor_bytes_(root, dit));
   }
   m.hold(enc, model_memory::dir_weights_bytes(enc));
   // No unload policy on this stage: it holds both for the run. Freeing
@@ -949,7 +973,8 @@ GenerateImageStage::declare_resources() const
   }
   const std::string dit = planning_dit_dir_(root);
   std::vector<ResourceClaim> out{
-      model_memory::weight_claim_streamable(dit, dit_floor_bytes_(dit))};
+      model_memory::weight_claim_streamable(dit,
+                                            dit_floor_bytes_(root, dit))};
   for (auto& c : model_memory::weight_claims({enc})) {
     out.push_back(std::move(c));
   }
@@ -1065,6 +1090,23 @@ GenerateImageStage::apply_model_config_()
         _dit->set_lora_scale(i, s);
       }
     });
+  } else if (_family == "vosr") {
+    // The restorer's tiling. LIVE, not load-time: the tile is an
+    // argument to each restore rather than to the DiT's construction,
+    // so a beat that changes it mid-run takes effect on the next
+    // picture. PRESENCE is the reading: unset means the trained grid
+    // and 0 means one pass, and those are different answers.
+    if (_model_cfg.is_object()) {
+      FlexData cfg = _model_cfg;
+      auto o = cfg.as_object();
+      if (o.contains("tile_size")) {
+        _tile_size     = (int)o.at("tile_size").as_int(0);
+        _tile_size_set = true;
+      }
+      if (o.contains("tile_overlap")) {
+        _tile_overlap = (int)o.at("tile_overlap").as_int(32);
+      }
+    }
   }
   if (!perr.empty() && !_model_cfg.is_null()) {
     session()->warn(fmt("GenerateImageStage('{}'): model_config: {}",
@@ -3760,12 +3802,45 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // stage's text-to-image default of 20.
     rr.steps     = _steps_set ? _scheduler_spec.steps : 1;
     rr.seed      = _seed + (std::uint64_t)_latents_emitted;
-    if (_tile_size > 0) {
-      // Pixels in the config, latent cells in the request: one
-      // conversion, here, so the key means the same thing it means in
-      // the reference's command line.
-      rr.tile         = _tile_size / 8;
+    // TILING IS THE DEFAULT past the grid the weights were distilled at.
+    //
+    // Pixels in the config, latent cells in the request: one conversion,
+    // here, so the key means the same thing it means in the reference's
+    // command line. What the key does NOT do any more is default to a
+    // single pass at every size -- see RestoreRequest::tile. Untiled is
+    // the reference's path at the trained grid and a mode it cannot run
+    // above it, and the artifact that costs is a checkerboard on the
+    // content the model synthesises rather than passes through.
+    const int auto_tile =
+        genai::MetalVosrTransformer::default_tile(lh, lw, _vosr_cfg);
+    if (_tile_size_set) {
+      if (_tile_size > 0) {
+        rr.tile         = _tile_size / 8;
+        rr.tile_overlap = _tile_overlap / 8;
+      } else if (auto_tile > 0 && _latents_emitted == 0) {
+        // A graph that asked for one pass gets one. Said once, because
+        // it is a deliberate setting and not a mistake -- but it is the
+        // setting that produces the artifact, and nothing downstream
+        // will name it.
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): tile_size=0 runs this {}x{} latent in "
+            "ONE pass, on a {}x{} token grid where the weights were "
+            "distilled at {}x{}. The reference tiles instead, and off its "
+            "grid the rotary positions land between the ones the model saw "
+            "-- expect a periodic weave on faces. Unset tile_size to tile "
+            "at {} px", this->id(), lw, lh, lw / _vosr_cfg.patch,
+            lh / _vosr_cfg.patch, _vosr_cfg.train_grid, _vosr_cfg.train_grid,
+            auto_tile * 8));
+      }
+    } else if (auto_tile > 0) {
+      rr.tile         = auto_tile;
       rr.tile_overlap = _tile_overlap / 8;
+      if (_latents_emitted == 0) {
+        session()->info(fmt(
+            "GenerateImageStage('{}'): restoring {}x{} in {} px tiles -- the "
+            "resolution this checkpoint was distilled at; set tile_size to "
+            "override", this->id(), gen_w, gen_h, auto_tile * 8));
+      }
     }
     // The conditioning must be the bf16 DINOv2 grid the vosr
     // conditioner emits. A beat of any other element type is a graph

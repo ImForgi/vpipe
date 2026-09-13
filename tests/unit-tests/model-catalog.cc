@@ -489,7 +489,76 @@ TEST(model_catalog, boogu_image_family_present) {
   EXPECT_FALSE(has_(tin, "image"));
 }
 
+TEST(model_catalog, qwen_image_pair_present) {
+  // The two Qwen-Image checkpoints are the same architecture -- verified
+  // tensor by tensor -- and DIFFERENT recipes: 2512 is the text-to-image
+  // pipeline, Edit-2511 the multi-reference edit one, and they condition
+  // through different system prompts. So they carry different
+  // model_types, and this asserts that rather than leaving it to whoever
+  // next tidies the table: typing 2512 as the edit model would load, run
+  // and quietly condition it on the wrong prompt.
+  const ModelCatalogEntry* t2i = catalog_by_path("Qwen/Qwen-Image-2512");
+  const ModelCatalogEntry* edt =
+      catalog_by_path("Qwen/Qwen-Image-Edit-2511");
+  ASSERT_TRUE(t2i != nullptr);
+  ASSERT_TRUE(edt != nullptr);
+  EXPECT_TRUE(t2i->family == "Qwen-Image");
+  EXPECT_TRUE(edt->family == "Qwen-Image");
+  EXPECT_TRUE(t2i->version == "2512");
+  EXPECT_TRUE(edt->version == "Edit-2511");
+  EXPECT_TRUE(t2i->param_class == "20B");
+  EXPECT_TRUE(t2i->model_type == "qwen-image");
+  EXPECT_TRUE(edt->model_type == "qwen-image-edit");
+  // 2512 ships vocab.json + merges.txt under tokenizer/ and no
+  // consolidated tokenizer.json, so it needs the synthesis step; the
+  // edit repo carries one in processor/ and does not.
+  EXPECT_TRUE(t2i->needs_tokenizer_json);
+  EXPECT_FALSE(edt->needs_tokenizer_json);
+  // The 20B DiT ships in nine shards here against Edit-2511's five, so a
+  // copied file list would fetch a partial checkpoint that still has an
+  // index pointing at the shards it lacks.
+  EXPECT_TRUE(has_(t2i->files,
+                   "transformer/diffusion_pytorch_model-00009-of-00009."
+                   "safetensors"));
+  EXPECT_FALSE(has_(t2i->files,
+                    "transformer/diffusion_pytorch_model-00001-of-00005."
+                    "safetensors"));
+  EXPECT_TRUE(has_(t2i->files,
+                   "transformer/diffusion_pytorch_model.safetensors.index."
+                   "json"));
+  EXPECT_TRUE(has_(t2i->files, "vae/diffusion_pytorch_model.safetensors"));
+  EXPECT_TRUE(has_(t2i->files, "scheduler/scheduler_config.json"));
+  // No processor/ here: a model that takes no reference image needs no
+  // image preprocessor, and its chat template sits in tokenizer/.
+  EXPECT_TRUE(has_(t2i->files, "tokenizer/chat_template.jinja"));
+  EXPECT_FALSE(has_(t2i->files, "processor/preprocessor_config.json"));
+  EXPECT_TRUE(has_(edt->files, "processor/preprocessor_config.json"));
+  // Text in and image out, where the edit sibling also takes an image:
+  // a picker that filters on need_inputs must not offer this one to a
+  // stage wanting an image input, since it has nowhere to put one.
+  FlexData tf = catalog_entry_to_flex(*t2i);
+  auto tin = flex_arr_(tf, "inputs");
+  EXPECT_TRUE(tin.size() == 1);
+  EXPECT_TRUE(has_(tin, "text"));
+  EXPECT_TRUE(has_(flex_arr_(tf, "outputs"), "image"));
+  FlexData ef = catalog_entry_to_flex(*edt);
+  EXPECT_TRUE(has_(flex_arr_(ef, "inputs"), "image"));
+  EXPECT_TRUE(catalog_category(*t2i) == "model");
+}
+
 TEST(model_catalog, mage_flow_family_present) {
+  // The six Mage-Flow rows are NOT in kCatalog any more: they moved into
+  // the vpipe-mage-flow plugin, which registers them at load (see the
+  // "Mage-Flow: NOT HERE" note in model-catalog.cc). Without that plugin
+  // they are absent, and this test used to assert them straight into a
+  // null dereference at `*catalog_by_path(...)` below -- which did not
+  // fail the test, it SEGFAULTED the binary, so every model_catalog test
+  // alphabetically after this one stopped running and nobody could see
+  // that either. Assert them only when the plugin has registered them.
+  if (catalog_by_path("microsoft/Mage-Flow-Base") == nullptr) {
+    std::printf("[catalog] vpipe-mage-flow plugin not loaded; skipped\n");
+    return;
+  }
   struct Row { const char* path; const char* ver; const char* mt; };
   const Row rows[] = {
       {"microsoft/Mage-Flow-Base", "Gen", "mage-flow"},
@@ -632,6 +701,22 @@ TEST(model_catalog, supplement_parent_linkage) {
     EXPECT_TRUE(e->parent_model_type == "krea2");
   }
 
+  // VOSR's DINOv2 tower. This link is what the fetch stage reads to
+  // say, at the end of a VOSR fetch, that a second checkpoint is still
+  // missing -- so the key it names has to be the one the conditioner
+  // then looks up, and with no `name` override that is the hf path.
+  const ModelCatalogEntry* dino = catalog_by_path("facebook/dinov2-large");
+  ASSERT_TRUE(dino != nullptr);
+  EXPECT_TRUE(catalog_category(*dino) == "supplement");
+  EXPECT_TRUE(dino->parent_model_type == "vosr");
+  EXPECT_TRUE(dino->parent_param_class.empty());
+  EXPECT_TRUE(dino->name.empty());
+  EXPECT_TRUE(has_(dino->files, "model.safetensors"));
+  EXPECT_TRUE(has_(dino->files, "config.json"));
+  const ModelCatalogEntry* vosr = catalog_by_name("VOSR-2.0");
+  ASSERT_TRUE(vosr != nullptr);
+  EXPECT_TRUE(vosr->model_type == "vosr");
+
   // A plain model has no parent linkage.
   const ModelCatalogEntry* lm =
       catalog_by_path("lmstudio-community/Qwen3.5-4B-MLX-4bit");
@@ -640,6 +725,38 @@ TEST(model_catalog, supplement_parent_linkage) {
 
   EXPECT_TRUE(catalog_by_name("nope") == nullptr);
   EXPECT_TRUE(catalog_by_name("") == nullptr);
+}
+
+// FlashVSR is fetched AS PUBLISHED and read in place: three of its files
+// are torch.save() archives that map as shards, so the entry pins those
+// files rather than a conversion of them. The one thing the model page
+// lacks is the fixed context, which the reference keeps on GitHub; a
+// companion can only name a HuggingFace repo, so it names a copy verified
+// byte-identical to GitHub's.
+TEST(model_catalog, flashvsr_fetches_the_published_files) {
+  const ModelCatalogEntry* e = catalog_by_path("JunhaoZhuang/FlashVSR-v1.1");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->model_type == "flashvsr");
+  EXPECT_TRUE(e->parent_model_type.empty());
+  EXPECT_TRUE(catalog_category(*e) != "supplement");
+  for (const char* f : {"diffusion_pytorch_model_streaming_dmd.safetensors",
+                        "LQ_proj_in.ckpt", "Wan2.1_VAE.pth"}) {
+    EXPECT_TRUE(has_(e->files, f));
+  }
+  // The reference's tiny decoder: nothing in this tree runs it.
+  EXPECT_TRUE(!has_(e->files, "TCDecoder.ckpt"));
+  ASSERT_TRUE(e->companion_files.size() == 1);
+  if (e->companion_files.size() != 1) { return; }
+  EXPECT_TRUE(e->companion_files[0].repo == "deAPI-ai/flashvsr-v1-1");
+  EXPECT_TRUE(e->companion_files[0].file == "posi_prompt.pth");
+  EXPECT_TRUE(e->companion_files[0].dest == "posi_prompt.pth");
+  // A copy registered from disk reads the same modalities as a fetch.
+  std::vector<std::string> in, out;
+  catalog_default_io("flashvsr", in, out);
+  EXPECT_TRUE(in == e->inputs && out == e->outputs);
+  EXPECT_TRUE(in == std::vector<std::string>({"video"}));
+  EXPECT_TRUE(out == std::vector<std::string>({"video"}));
 }
 
 TEST(model_catalog, normalize_paths) {

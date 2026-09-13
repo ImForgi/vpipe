@@ -212,6 +212,8 @@ struct MetalCompute::Impl {
   MTL::Heap*           small_heap            = nullptr;
   std::size_t          alloc_buffers_heap    = 0;
   std::size_t          alloc_buffers_device  = 0;
+  // MTLDevice.maxBufferLength, cached on first query under alloc_mu.
+  mutable std::size_t  max_buffer_len        = 0;
 
   // PSO binary archive (Metal 3+). Allocated by
   // set_binary_archive_path; nullptr means "archive disabled".
@@ -780,6 +782,9 @@ MetalCompute::memory_budget() const noexcept
                     reinterpret_cast<task_info_t>(&ti), &c) == KERN_SUCCESS) {
       out.self_compressed = (std::size_t)ti.compressed;
       out.self_footprint  = (std::size_t)ti.phys_footprint;
+      if (c > TASK_VM_INFO_REV2_COUNT && ti.ledger_tag_graphics_footprint > 0) {
+        out.self_graphics = (std::size_t)ti.ledger_tag_graphics_footprint;
+      }
     }
   }
   {
@@ -892,6 +897,31 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   return out;
 }
 
+std::size_t
+MetalCompute::max_buffer_length() const noexcept
+{
+  if (!_impl->valid || _impl->device == nullptr) { return 0; }
+  std::lock_guard<std::mutex> g(_impl->alloc_mu);
+  if (_impl->max_buffer_len == 0) {
+    _impl->max_buffer_len =
+        static_cast<std::size_t>(_impl->device->maxBufferLength());
+    // SIMULATE A SMALLER DEVICE, the way VPIPE_RAM_LIMIT_MB simulates a
+    // smaller box. The limit scales with installed RAM, so the code that
+    // handles a shard larger than it is only reachable on the machines
+    // that have least of it -- which is the wrong place to discover it
+    // does not work. Lowering the number here makes the path testable
+    // anywhere; it can only ever lower it.
+    if (const char* e = std::getenv("VPIPE_MAX_BUFFER_MB")) {
+      const long long mb = std::atoll(e);
+      if (mb > 0) {
+        const std::size_t want = static_cast<std::size_t>(mb) << 20;
+        if (want < _impl->max_buffer_len) { _impl->max_buffer_len = want; }
+      }
+    }
+  }
+  return _impl->max_buffer_len;
+}
+
 SharedBuffer
 MetalCompute::make_no_copy_buffer(void* ptr, std::size_t byte_size) const
 {
@@ -915,9 +945,24 @@ MetalCompute::make_no_copy_buffer(void* ptr, std::size_t byte_size) const
       ptr, static_cast<NS::UInteger>(mapped_len),
       MTL::ResourceStorageModeShared, nullptr);
   if (buf == nullptr) {
-    session()->warn(fmt(
-        "MetalCompute::make_no_copy_buffer: newBufferWithBytesNoCopy failed "
-        "(byte_size={})", byte_size));
+    // NAME THE LIMIT, not the call. `newBufferWithBytesNoCopy failed`
+    // told a reader which API said no and nothing about why, and the
+    // why is almost always one number: a device will not create a
+    // buffer longer than maxBufferLength, which is a fraction of
+    // installed RAM and so is smallest on the boxes that map the most.
+    // A caller that checked max_buffer_length() first never gets here.
+    const std::size_t cap = max_buffer_length();
+    if (cap != 0 && mapped_len > cap) {
+      session()->warn(fmt(
+          "MetalCompute::make_no_copy_buffer: {} MB is over this device's "
+          "{} MB maxBufferLength, so it cannot be wrapped without a copy",
+          byte_size >> 20, cap >> 20));
+    } else {
+      session()->warn(fmt(
+          "MetalCompute::make_no_copy_buffer: the device refused a {} MB "
+          "no-copy wrap (maxBufferLength is {} MB, so this is not a size "
+          "limit)", byte_size >> 20, cap >> 20));
+    }
     pool->release();
     return SharedBuffer{};
   }
@@ -1036,6 +1081,27 @@ MetalCompute::register_metal_library(std::string_view     name,
                                      const unsigned char* bytes,
                                      std::size_t          n) const
 {
+  // A PLUGIN BUILT IN RUNTIME-COMPILE MODE HAS NO BYTES TO GIVE, and
+  // that is a success rather than an omission: its object registered the
+  // MSL SOURCE from a static initializer as it loaded, and
+  // load_library() will compile it on first use. The plugin's call site
+  // is identical in both modes -- which is the point, since a plugin
+  // should not have to know which toolchain its build machine had -- so
+  // an empty pair here means "already provided, by the other route" and
+  // must not warn.
+  if (n == 0 && bytes != nullptr) {
+    const char*  src  = nullptr;
+    std::size_t  len  = 0;
+    int          lang = 0;
+    if (_embedded::find_embedded_metal_source(name, &src, &len, &lang)) {
+      if (session() != nullptr) {
+        session()->log_normal(fmt(
+            "MetalCompute: runtime metal library '{}' is embedded as SOURCE "
+            "({} bytes of MSL, compiled at first use)", name, len));
+      }
+      return true;
+    }
+  }
   if (_embedded::register_runtime_metallib(name, bytes, n)) {
     if (session() != nullptr) {
       session()->log_normal(fmt(

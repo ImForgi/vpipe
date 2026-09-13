@@ -75,31 +75,117 @@ endfunction()
 #
 # `name` is the runtime library name used with load_library(). DEFINES are
 # passed as -D to the metal compiler (e.g. VPIPE_ELT=bfloat for a bf16
-# twin). Requires the Xcode metal toolchain (xcrun).
+# twin).
+#
+# TWO MODES, chosen by PROBING, exactly as the host chooses for its own
+# kernels. The offline Metal shader compiler (the `metal` and `metallib`
+# xcrun subcommands) ships with Xcode's Metal Toolchain, which is a
+# separately downloadable component -- so a Command-Line-Tools-only box,
+# and a full-Xcode box that has not fetched the component, both lack it.
+# When it is there, the kernel is compiled to a .metallib and its bytes
+# are embedded. When it is not, the include-flattened MSL SOURCE is
+# embedded instead and compiled at load through newLibraryWithSource:.
+#
+# THE PLUGIN'S CALL SITE IS THE SAME EITHER WAY. Both modes define the
+# two symbols below, and in source mode the length is zero and the
+# registration has already happened from a static initialiser --
+# register_metal_library takes that pair as "already provided" rather
+# than as an empty library. A plugin author should not have to know
+# which toolchain the build machine had, which is the whole reason the
+# host probes for its own kernels and the reason this now does too.
+#
+#   extern "C" const unsigned char <name>_metallib[];
+#   extern "C" const unsigned long <name>_metallib_len;
+#
+# Force either mode with -DVPIPE_METAL_RUNTIME_COMPILE=ON/OFF.
 function(vpipe_add_metal_library objlib name)
   cmake_parse_arguments(K "" "SRC" "DEFINES" ${ARGN})
   if(NOT K_SRC)
     message(FATAL_ERROR "vpipe_add_metal_library(${objlib}): SRC is required")
   endif()
-  set(_defs "")
-  foreach(d IN LISTS K_DEFINES)
-    list(APPEND _defs "-D${d}")
-  endforeach()
-  set(_air "${CMAKE_CURRENT_BINARY_DIR}/${name}.air")
-  set(_lib "${CMAKE_CURRENT_BINARY_DIR}/${name}.metallib")
-  set(_cc  "${CMAKE_CURRENT_BINARY_DIR}/${name}_metallib.cc")
   get_filename_component(_src_abs "${K_SRC}" ABSOLUTE)
-  add_custom_command(
-    OUTPUT "${_cc}"
-    COMMAND xcrun -sdk macosx metal ${_defs} -c "${_src_abs}" -o "${_air}"
-    COMMAND xcrun -sdk macosx metallib "${_air}" -o "${_lib}"
-    COMMAND ${CMAKE_COMMAND}
-            -DINPUT=${_lib} -DOUTPUT=${_cc} -DNAME=${name}
-            -P "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
-    DEPENDS "${_src_abs}"
-            "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
-    COMMENT "vpipe_add_metal_library: ${name}.metal -> embedded metallib"
-    VERBATIM)
+  set(_cc  "${CMAKE_CURRENT_BINARY_DIR}/${name}_metallib.cc")
+
+  # Probe once per project, and cache the verdict so every kernel in a
+  # plugin agrees and the reason is printed once.
+  if(NOT DEFINED VPIPE_METAL_RUNTIME_COMPILE)
+    find_program(VPIPE_XCRUN_EXECUTABLE xcrun)
+    set(_vp_have_metal FALSE)
+    if(VPIPE_XCRUN_EXECUTABLE)
+      execute_process(COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx -f metal
+          RESULT_VARIABLE _vp_m_rc OUTPUT_QUIET ERROR_QUIET)
+      execute_process(COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx -f metallib
+          RESULT_VARIABLE _vp_ml_rc OUTPUT_QUIET ERROR_QUIET)
+      if(_vp_m_rc EQUAL 0 AND _vp_ml_rc EQUAL 0)
+        set(_vp_have_metal TRUE)
+      endif()
+    endif()
+    if(_vp_have_metal)
+      set(VPIPE_METAL_RUNTIME_COMPILE OFF CACHE BOOL
+          "Embed .metal SOURCE and compile at load (no Metal toolchain)")
+    else()
+      set(VPIPE_METAL_RUNTIME_COMPILE ON CACHE BOOL
+          "Embed .metal SOURCE and compile at load (no Metal toolchain)")
+      message(STATUS
+          "vpipe plugin kernels: RUNTIME-COMPILE mode -- `xcrun -sdk macosx "
+          "-f metal` found no offline shader compiler, so .metal SOURCE is "
+          "embedded and compiled at load. The Metal Toolchain is a separate "
+          "Xcode component: `xcodebuild -downloadComponent MetalToolchain` "
+          "(and `sudo xcode-select -s /Applications/Xcode.app` if this box "
+          "is on the Command Line Tools) to build metallibs instead")
+    endif()
+  endif()
+
+  if(VPIPE_METAL_RUNTIME_COMPILE)
+    set(_embed "${VPIPE_PLUGIN_CMAKE_DIR}/embed-metal-source.cmake")
+    if(NOT EXISTS "${_embed}")
+      message(FATAL_ERROR
+          "vpipe_add_metal_library(${objlib}): no Metal toolchain, and the "
+          "installed vpipe does not ship embed-metal-source.cmake, so there "
+          "is no fallback. Install the Metal Toolchain "
+          "(`xcodebuild -downloadComponent MetalToolchain`), or use a vpipe "
+          "install new enough to carry the script")
+    endif()
+    # '|'-joined, not ';': the lists have to survive add_custom_command's
+    # argument splitting as single arguments.
+    set(_def_arg "")
+    string(JOIN "|" _def_arg ${K_DEFINES})
+    get_filename_component(_src_dir "${_src_abs}" DIRECTORY)
+    add_custom_command(
+      OUTPUT "${_cc}"
+      COMMAND ${CMAKE_COMMAND}
+              -D KERNEL_NAME=${name}
+              -D SRC=${_src_abs}
+              -D OUTPUT=${_cc}
+              -D INCLUDE_DIRS=${_src_dir}
+              -D DEFINES=${_def_arg}
+              -D LANG=0
+              -D EMIT_METALLIB_STUB=1
+              -P "${_embed}"
+      DEPENDS "${_src_abs}" "${_embed}"
+      COMMENT "vpipe_add_metal_library: ${name}.metal SOURCE (runtime-compile)"
+      VERBATIM)
+  else()
+    set(_air "${CMAKE_CURRENT_BINARY_DIR}/${name}.air")
+    set(_lib "${CMAKE_CURRENT_BINARY_DIR}/${name}.metallib")
+    set(_defs "")
+    foreach(d IN LISTS K_DEFINES)
+      list(APPEND _defs "-D${d}")
+    endforeach()
+    add_custom_command(
+      OUTPUT "${_cc}"
+      COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx metal ${_defs}
+              -c "${_src_abs}" -o "${_air}"
+      COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx metallib
+              "${_air}" -o "${_lib}"
+      COMMAND ${CMAKE_COMMAND}
+              -DINPUT=${_lib} -DOUTPUT=${_cc} -DNAME=${name}
+              -P "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
+      DEPENDS "${_src_abs}"
+              "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
+      COMMENT "vpipe_add_metal_library: ${name}.metal -> embedded metallib"
+      VERBATIM)
+  endif()
   add_library(${objlib} OBJECT "${_cc}")
   set_target_properties(${objlib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endfunction()

@@ -696,6 +696,11 @@ TEST(krea2_vae, decode_bench)
     std::string err;
     m->decode(z, side, side, &err);                  // warm
     double best = 1e18;
+    // The measured peak beside the estimate: live SharedBuffer bytes above
+    // what was held before the timed decodes.
+    const std::size_t live0 =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    metal_compute::shared_buffer_reset_peak();
     for (int i = 0; i < 3; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       SharedBuffer o = m->decode(z, side, side, &err);
@@ -703,9 +708,63 @@ TEST(krea2_vae, decode_bench)
           std::chrono::steady_clock::now() - t0).count();
       if (!o.empty() && ms < best) { best = ms; }
     }
-    std::printf("[krea2_vae] decode %dx%d: %.1f ms (peak est %llu MB)\n",
-                side * 8, side * 8, best,
+    const std::size_t pk =
+        metal_compute::shared_buffer_memory_stats().peak_bytes;
+    std::printf("[krea2_vae] decode %dx%d: %.1f ms (peak %zu MB, est %llu "
+                "MB)\n", side * 8, side * 8, best,
+                pk > live0 ? (pk - live0) >> 20 : 0,
                 (unsigned long long)(m->decode_peak_bytes(side, side) >> 20));
+    // The preflight must not book less than a decode takes.
+    EXPECT_TRUE(m->decode_peak_bytes(side, side) >=
+                (pk > live0 ? pk - live0 : 0));
+  }
+}
+
+// Encode wall-clock and measured peak at 512 and 1024, the same way as the
+// decode bench. The encoder's first stride-2 downsample (96 -> 96) is the
+// one 3x3 its hardware conv could not take before a stride-2 32-channel
+// tile existed. VPIPE_KREA2_TEST_MODEL_PATH gated; skips without encoder.
+TEST(krea2_vae, encode_bench)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string vdir = std::string(root) + "/vae";
+  MetalKrea2Vae::Config cfg;
+  // encode() whitens with per-channel statistics and returns {} without
+  // them; unit ones cost the same as the real ones.
+  cfg.latents_mean.assign(cfg.z_dim, 0.0f);
+  cfg.latents_std.assign(cfg.z_dim, 1.0f);
+  auto m = MetalKrea2Vae::load(vdir, mc, cfg, /*with_encoder=*/true);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr || !m->has_encoder()) { return; }
+  for (int side : {512, 1024}) {
+    const std::size_t n = (std::size_t)3 * side * side;
+    SharedBuffer img = mc->make_shared_buffer(n * 2);
+    std::uint32_t s = 0x2545f491u;
+    auto* d = static_cast<_Float16*>(img.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      s = s * 1664525u + 1013904223u;
+      d[i] = (_Float16)((float)(s >> 8) / 8388608.0f - 1.0f);
+    }
+    m->encode(img, side, side);                      // warm
+    const std::size_t live0 =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    metal_compute::shared_buffer_reset_peak();
+    double best = 1e18;
+    for (int i = 0; i < 3; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      SharedBuffer z = m->encode(img, side, side);
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (!z.empty() && ms < best) { best = ms; }
+    }
+    const std::size_t pk =
+        metal_compute::shared_buffer_memory_stats().peak_bytes;
+    std::printf("[krea2_vae] encode %dx%d: %.1f ms (peak %zu MB)\n", side,
+                side, best, pk > live0 ? (pk - live0) >> 20 : 0);
   }
 }
 

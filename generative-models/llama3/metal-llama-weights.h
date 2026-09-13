@@ -241,6 +241,10 @@ private:
   // noise. `mutable` for the same reason as _shard_maps: load_mapped is
   // const and this is bookkeeping, not state a caller can observe.
   mutable std::vector<bool>                       _shard_unmappable_said;
+  // Shards larger than the device's maxBufferLength, which cannot be
+  // wrapped WHOLE and are mapped a window at a time instead. Latched so
+  // the explanation is said once rather than per tensor.
+  mutable std::vector<bool>                       _shard_over_max_said;
   std::unordered_map<std::string, TensorInfo> _tensors;
   std::map<std::string, std::string> _metadata;
   // Non-null when this checkpoint was loaded from a `.gguf`; owns the

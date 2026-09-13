@@ -217,7 +217,8 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it. May also name a STANDALONE VAE "
           "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image-edit,mage-flow,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,qwen-image-edit,"
+       "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",

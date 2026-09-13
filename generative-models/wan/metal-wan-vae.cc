@@ -1,6 +1,7 @@
 #include "generative-models/wan/metal-wan-vae.h"
 
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/wan-vae-names.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -121,6 +122,21 @@ struct MetalWanVae::Ctx {
       if (&s.buf == &b) { s.used = false; return; }
     }
   }
+
+  // The band, sized to the conv that GATHERS rather than to the cap: the
+  // temporal (3,1,1) conv needs 3*cin a row, where the cap is set by the
+  // 27-tap one, and on the hardware conv it is the only conv that gathers
+  // at all. Grows if a later conv needs more; never beyond col_cap.
+  bool
+  ensure_col(MetalCompute* mc, std::size_t elems)
+  {
+    elems = std::min(elems, col_cap);
+    if (col.byte_size() >= elems * 2) { return true; }
+    col = SharedBuffer{};
+    col = mc->make_shared_buffer(elems * 2);
+    if (col.empty()) { alloc_ok = false; return false; }
+    return true;
+  }
 };
 
 // ---- config ------------------------------------------------------------
@@ -203,15 +219,65 @@ MetalWanVae::config_from_json(const std::string& vae_dir, Config& out,
   return true;
 }
 
+bool
+MetalWanVae::config_for_native_checkpoint(const std::string& path,
+                                          Config& out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  auto w = MetalLlamaWeights::open_model(path);
+  if (!w.has_value()) { return fail("no readable checkpoint at " + path); }
+  const auto* q  = w->info("conv1.weight");           // the 2*z quant conv
+  const auto* e1 = w->info("encoder.conv1.weight");   // [base, 3, 3, 3, 3]
+  if (q == nullptr || e1 == nullptr || !w->has("decoder.conv1.weight") ||
+      q->shape.size() != 5 || e1->shape.size() != 5) {
+    return fail(path + " is not a natively-named Wan VAE");
+  }
+  if (q->shape[0] != 32 || e1->shape[0] != 96) {
+    return fail(fmt("{} is a natively-named Wan VAE, but not 2.1's (z_dim "
+                    "{}, base {})", path, q->shape[0] / 2, e1->shape[0])());
+  }
+  // The geometry is the struct's own default, which IS Wan 2.1's. The
+  // statistics are the ones its reference module un-whitens with.
+  Config c;
+  c.latents_mean = {-0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f,
+                    0.9653f,  -0.1517f, 1.5508f,  0.4134f, -0.0715f,
+                    0.5517f,  -0.3632f, -0.1922f, -0.9497f, 0.2503f,
+                    -0.2921f};
+  c.latents_std  = {2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f,
+                    2.6052f, 2.0743f, 3.2687f, 2.1526f, 2.8652f, 1.5579f,
+                    1.6382f, 1.1253f, 2.8251f, 1.9160f};
+  out = std::move(c);
+  return true;
+}
+
 // ---- weight loading ----------------------------------------------------
 
 // A causal conv3d [Cout,Cin,3,3,3] as a dense-GEMM weight [Cout, 27*Cin],
 // flattened (kt,ky,kx,cin) to pair with im2col_hwc_3x3x3_tiled.
+// TWO SPELLINGS OF ONE VAE. A natively-named checkpoint (FlashVSR ships
+// `Wan2.1_VAE.pth`, ComfyUI ships `*_vae.safetensors`) carries the same
+// 194 tensors under the upstream research names rather than the
+// diffusers ones every loader here reads. shared/wan-vae-names.h is the
+// structural bijection between them; this routes every name through it.
+//
+// The map is EMPTY for a diffusers checkpoint, so that path is unchanged
+// and pays one failed hash lookup. The derived() cache keys deliberately
+// stay in the DIFFUSERS spelling: they name a transform, which does not
+// change with the file's naming.
+const std::string&
+MetalWanVae::wname_(const std::string& diffusers_name) const
+{
+  return wan_vae::resolve(_names, diffusers_name);
+}
+
 MetalWanVae::Conv
 MetalWanVae::load_conv3d_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.size() < 5) { return c; }
   const auto& sh = info->shape;
   const int Cout = (int)sh[0], Cin = (int)sh[1];
@@ -224,7 +290,7 @@ MetalWanVae::load_conv3d_(WeightSet& ws, const std::string& nm)
   c.cin = Cin; c.cout = Cout; c.kt = 3; c.ks = 9; c.k = 27 * Cin;
   c.w = ws.derived(std::string(kKey) + "c3d|" + nm, [&]() -> SharedBuffer {
     std::size_t n = 0;
-    std::vector<float> w = read_f32_(ws.src(), _mc, nm + ".weight", n);
+    std::vector<float> w = read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
     if (w.empty()) { return {}; }
     std::vector<float> flat((std::size_t)Cout * 27 * Cin, 0.0f);
     for (int o = 0; o < Cout; ++o) {
@@ -245,6 +311,36 @@ MetalWanVae::load_conv3d_(WeightSet& ws, const std::string& nm)
     return f16_buf_(_mc, flat.data(), flat.size());
   }, _part);
   if (c.w.empty()) { return Conv{}; }
+  // The hardware conv's twin: one [3,3,Cin,Cout] HWIO block PER TEMPORAL
+  // TAP, contiguous in tap order, so tap kt binds the twin at offset
+  // kt * 9 * Cin * Cout (see conv3x3_hw_).
+  if (_use_hwconv) {
+    c.whwio = ws.derived(std::string(kKey) + "c3d-hwio-tap|" + nm,
+                         [&]() -> SharedBuffer {
+      std::size_t n = 0;
+      std::vector<float> w =
+          read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
+      if (w.empty()) { return {}; }
+      std::vector<float> hwio((std::size_t)27 * Cin * Cout, 0.0f);
+      for (int o = 0; o < Cout; ++o) {
+        for (int i = 0; i < Cin; ++i) {
+          for (int t = 0; t < 3; ++t) {
+            for (int ky = 0; ky < 3; ++ky) {
+              for (int kx = 0; kx < 3; ++kx) {
+                const std::size_t si =
+                    ((((std::size_t)o * Cin + i) * 3 + t) * 3 + ky) * 3 + kx;
+                const std::size_t di =
+                    ((((std::size_t)t * 3 + ky) * 3 + kx) * Cin + i) *
+                        Cout + o;
+                hwio[di] = w[si];
+              }
+            }
+          }
+        }
+      }
+      return f16_buf_(_mc, hwio.data(), hwio.size());
+    }, _part);
+  }
   c.b = load_vec_(ws, nm + ".bias");
   return c;
 }
@@ -255,14 +351,14 @@ MetalWanVae::Conv
 MetalWanVae::load_conv2d_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.size() < 4) { return c; }
   const auto& sh = info->shape;
   const int Cout = (int)sh[0], Cin = (int)sh[1];
   c.cin = Cin; c.cout = Cout; c.kt = 1; c.ks = 9; c.k = 9 * Cin;
   c.w = ws.derived(std::string(kKey) + "c2d|" + nm, [&]() -> SharedBuffer {
     std::size_t n = 0;
-    std::vector<float> w = read_f32_(ws.src(), _mc, nm + ".weight", n);
+    std::vector<float> w = read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
     if (w.empty()) { return {}; }
     std::vector<float> flat((std::size_t)Cout * 9 * Cin, 0.0f);
     for (int o = 0; o < Cout; ++o) {
@@ -281,6 +377,30 @@ MetalWanVae::load_conv2d_(WeightSet& ws, const std::string& nm)
     return f16_buf_(_mc, flat.data(), flat.size());
   }, _part);
   if (c.w.empty()) { return Conv{}; }
+  if (_use_hwconv) {                    // HWIO twin, out-channel fastest
+    c.whwio = ws.derived(std::string(kKey) + "c2d-hwio|" + nm,
+                         [&]() -> SharedBuffer {
+      std::size_t n = 0;
+      std::vector<float> w =
+          read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
+      if (w.empty()) { return {}; }
+      std::vector<float> hwio((std::size_t)9 * Cin * Cout, 0.0f);
+      for (int o = 0; o < Cout; ++o) {
+        for (int i = 0; i < Cin; ++i) {
+          for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+              const std::size_t si =
+                  (((std::size_t)o * Cin + i) * 3 + ky) * 3 + kx;
+              const std::size_t di =
+                  (((std::size_t)ky * 3 + kx) * Cin + i) * Cout + o;
+              hwio[di] = w[si];
+            }
+          }
+        }
+      }
+      return f16_buf_(_mc, hwio.data(), hwio.size());
+    }, _part);
+  }
   c.b = load_vec_(ws, nm + ".bias");
   return c;
 }
@@ -291,7 +411,7 @@ MetalWanVae::Conv
 MetalWanVae::load_time_conv_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.size() < 5) { return c; }
   const auto& sh = info->shape;
   const int Cout = (int)sh[0], Cin = (int)sh[1];
@@ -299,7 +419,7 @@ MetalWanVae::load_time_conv_(WeightSet& ws, const std::string& nm)
   c.cin = Cin; c.cout = Cout; c.kt = 3; c.ks = 1; c.k = 3 * Cin;
   c.w = ws.derived(std::string(kKey) + "ct|" + nm, [&]() -> SharedBuffer {
     std::size_t n = 0;
-    std::vector<float> w = read_f32_(ws.src(), _mc, nm + ".weight", n);
+    std::vector<float> w = read_f32_(ws.src(), _mc, wname_(nm + ".weight"), n);
     if (w.empty()) { return {}; }
     std::vector<float> flat((std::size_t)Cout * 3 * Cin, 0.0f);
     for (int o = 0; o < Cout; ++o) {
@@ -323,7 +443,7 @@ MetalWanVae::Conv
 MetalWanVae::load_conv1x1_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  const auto* info = ws.src().info(nm + ".weight");
+  const auto* info = ws.src().info(wname_(nm + ".weight"));
   if (info == nullptr || info->shape.size() < 2) { return c; }
   const auto& sh = info->shape;
   c.cout = (int)sh[0]; c.cin = (int)sh[1];
@@ -342,7 +462,7 @@ MetalWanVae::load_vec_(WeightSet& ws, const std::string& nm)
 {
   return ws.derived(std::string(kKey) + "f16|" + nm, [&]() -> SharedBuffer {
     std::size_t n = 0;
-    std::vector<float> v = read_f32_(ws.src(), _mc, nm, n);
+    std::vector<float> v = read_f32_(ws.src(), _mc, wname_(nm), n);
     if (v.empty()) { return {}; }
     return f16_buf_(_mc, v.data(), n);
   }, _part);
@@ -376,8 +496,8 @@ MetalWanVae::load_attn_(WeightSet& ws, const std::string& pre, Attn& a,
   std::vector<float> qkv, qkvb;
   auto read_qkv = [&]() {
     if (!qkv.empty()) { return; }
-    qkv  = read_f32_(ws.src(), _mc, qbase + ".weight", n);
-    qkvb = read_f32_(ws.src(), _mc, qbase + ".bias", nb);
+    qkv  = read_f32_(ws.src(), _mc, wname_(qbase + ".weight"), n);
+    qkvb = read_f32_(ws.src(), _mc, wname_(qbase + ".bias"), nb);
   };
   const int C = dim;
   auto slice = [&](int off) {
@@ -430,6 +550,27 @@ MetalWanVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_ws = std::move(ws_in);
   m->_mc = mc;
   m->_cfg = cfg;
+
+  // WHICH SPELLING this checkpoint uses, before anything is read.
+  // build_name_map refuses a PARTIAL map rather than returning one: at
+  // any given level every tensor has the same shape, so a name the rule
+  // cannot place would load some other level's weights and decode a
+  // plausible, wrong clip.
+  {
+    std::string nerr;
+    if (!wan_vae::build_name_map(wts.src().tensor_names(), m->_names,
+                                 &nerr)) {
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt("MetalWanVae: {}", nerr));
+      }
+      return nullptr;
+    }
+    if (!m->_names.empty() && mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "MetalWanVae: natively-named Wan VAE checkpoint; {} names "
+          "translated", m->_names.size()));
+    }
+  }
 
   m->_lib_gemm = mc->load_library("dense_gemm");
   m->_lib_elt  = mc->load_library("llm_elementwise");
@@ -490,12 +631,39 @@ MetalWanVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     }
     m->autotune_mid_attn_(mc, mid_d);
   }
+  // The gather-free hardware conv for every 3x3 and 3x3x3 conv (see
+  // conv3x3_hw_). Decided BEFORE the weights load, because the loaders
+  // build the HWIO twins only when it is on. VPIPE_VAE_NO_HWCONV turns it
+  // off, the same switch the image VAEs honour.
+  if (mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_VAE_NO_HWCONV") == nullptr) {
+    m->_lib_convhw = mc->load_library("conv2d_mma");
+    m->_fn_conv_hw64 = m->_lib_convhw.function("conv2d_hw_3x3_s1_f16");
+    m->_fn_conv_hw32 = m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_f16");
+    m->_fn_conv_hw64_acc =
+        m->_lib_convhw.function("conv2d_hw_3x3_s1_acc_f16");
+    m->_fn_conv_hw32_acc =
+        m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_acc_f16");
+    m->_fn_conv_small_cout =
+        m->_lib_elt.function("conv3x3_hwc_small_cout_f16");
+    m->_fn_conv_small_cout_acc =
+        m->_lib_elt.function("conv3x3_hwc_small_cout_acc_f16");
+    if (!m->_fn_bias_add.valid()) {
+      m->_fn_bias_add = m->_lib_elt.function("bias_add_rows_f16");
+    }
+    m->_use_hwconv = m->_fn_conv_hw64.valid() && m->_fn_conv_hw32.valid() &&
+                     m->_fn_conv_hw64_acc.valid() &&
+                     m->_fn_conv_hw32_acc.valid() &&
+                     m->_fn_conv_small_cout.valid() &&
+                     m->_fn_conv_small_cout_acc.valid() &&
+                     m->_fn_bias_add.valid();
+  }
 
   const int base = cfg.base_dim;                         // 96
   const int dims0 = base * cfg.dim_mult[3];              // 384
-
   m->_post_quant = m->load_conv1x1_(wts, "post_quant_conv");
   m->_conv_in    = m->load_conv3d_(wts, "decoder.conv_in");
+
   bool ok = !m->_post_quant.empty() && !m->_conv_in.empty();
   ok = ok && m->load_resblock_(wts, "decoder.mid_block.resnets.0.",
                                m->_mid_res0, dims0, dims0);
@@ -542,7 +710,9 @@ MetalWanVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   }
 
   m->_norm_out_g = m->load_vec_(wts, "decoder.norm_out.gamma");
+
   m->_conv_out = m->load_conv3d_(wts, "decoder.conv_out");
+
   ok = ok && !m->_norm_out_g.empty() && !m->_conv_out.empty();
 
   if (!ok) { return nullptr; }
@@ -837,6 +1007,7 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
 
   // Temporal-only (3,1,1): concat the three frames channel-wise.
   if (c.ks == 1) {
+    if (!cx.ensure_col(_mc, ohw * (std::size_t)3 * c.cin)) { return; }
     const std::size_t per_row = (std::size_t)3 * c.cin;
     std::size_t rows = (per_row > 0) ? (cx.col_cap / per_row) : ohw;
     if (_mma_max_m > 0 && rows > (std::size_t)_mma_max_m / 2) {
@@ -867,6 +1038,11 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
   }
 
   // Spatial 3x3, either the 27-tap causal conv3d or the plain 2D resample.
+  // The hardware conv first; the gather below is the fallback.
+  if (stride == 1 && conv3x3_hw_(cx, c, taps, tap_off, out, out_row0, H, W)) {
+    return;
+  }
+  if (!cx.ensure_col(_mc, ohw * (std::size_t)c.k)) { return; }
   const std::size_t per_row = (std::size_t)c.k;
   std::size_t rows = (per_row > 0) ? (cx.col_cap / per_row) : ohw;
   if (_mma_max_m > 0 && rows > (std::size_t)_mma_max_m / 2) {
@@ -906,6 +1082,90 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
     gemm_bias_(cx, cx.col, c.w, c.b, out, mc, c.cout, c.k,
                (int)(out_row0 + r0));
   }
+}
+
+// One output frame of a 3x3 or 3x3x3 conv on the gather-free hardware conv.
+// A causal conv runs as one 2D conv PER TEMPORAL TAP, against that tap's
+// [3,3,cin,cout] block of the HWIO twin: the first live tap writes the
+// output, every later one accumulates onto it, and a tap before the
+// sequence is skipped. No gather -- 27 taps of traffic, 11.5 GB per
+// full-resolution conv per frame at 1920x1152 -- and no three-frame concat
+// either, which cost 2.2 GB of peak at that size. The head's 3-channel
+// output fits neither tile and takes the per-pixel small-cout conv, the
+// same way. Verified against the gather per conv
+// (conv2d_mma.hw_op_wan_causal_conv3d, rel-L2 ~3e-4) and across the whole
+// decoder (flashvsr_vae.hwconv_decode_matches_gather, 6.5e-4).
+//
+// MEASURED per conv on the M5 Pro against the gather: 5.66x at 1920x1152
+// 3x96->96 (40 ms, 27.7 TF/s, against 225), 3.45x at 960x576 and 2.27x at
+// 480x288. The concat version it replaced was 3.54x / 2.84x / 2.02x: the
+// concat was traffic as well as peak. Decodes end to end: 960x576 859 ->
+// 277 ms/frame (3.10x), 1920x1152 ~3400 -> 1149 ms/frame (2.96x) at a
+// 13141 MB peak, where the concat version peaked at 15118.
+bool
+MetalWanVae::conv3x3_hw_(Ctx& cx, const Conv& c,
+                         const SharedBuffer* const taps[3],
+                         const std::size_t tap_off[3],
+                         const SharedBuffer& out, std::size_t out_row0,
+                         int H, int W)
+{
+  if (!_use_hwconv || c.whwio.empty() || c.ks != 9) { return false; }
+  const int tile = (c.cout % 64 == 0) ? 64 : (c.cout % 32 == 0) ? 32 : 0;
+  if (tile == 0 && c.cout > kSmallCoutMax) { return false; }
+  const std::size_t hw = (std::size_t)H * W;
+  if (tile != 0) {
+    // The op tiles its destination 8x8 and indexes through int32 extents.
+    constexpr std::size_t kIdxMax = 0x7fffffffull;
+    if ((W % 8) != 0 || (H % 8) != 0 || (std::size_t)c.cin * hw > kIdxMax ||
+        (std::size_t)c.cout * hw > kIdxMax) {
+      return false;
+    }
+  }
+  const int ntaps = (c.kt == 3) ? 3 : 1;
+  bool live = false;
+  for (int t = 0; t < ntaps; ++t) { live = live || taps[t] != nullptr; }
+  if (!live) { return false; }
+
+  ComputeEncoder& enc = *cx.enc;
+  const std::size_t blk = (std::size_t)9 * c.cin * c.cout;      // per tap
+  const std::size_t out_off = out_row0 * (std::size_t)c.cout;  // elements
+  bool first = true;
+  for (int t = 0; t < ntaps; ++t) {
+    if (taps[t] == nullptr) { continue; }
+    if (tile != 0) {
+      const metal_compute::ComputeFunction& fn =
+          tile == 64 ? (first ? _fn_conv_hw64 : _fn_conv_hw64_acc)
+                     : (first ? _fn_conv_hw32 : _fn_conv_hw32_acc);
+      enc.set_function(fn);
+      enc.set_buffer(0, *taps[t], tap_off[t] * 2);
+      enc.set_buffer(1, c.whwio, (std::size_t)t * blk * 2);
+      enc.set_buffer(2, out, out_off * 2);
+      enc.set_constant(3, W); enc.set_constant(4, H);
+      enc.set_constant(5, c.cin); enc.set_constant(6, c.cout);
+      enc.dispatch({(unsigned)((W / 8) * 128), (unsigned)(H / 8),
+                    (unsigned)(c.cout / tile)}, {128, 1, 1});
+    } else {
+      const int has_bias = (first && !c.b.empty()) ? 1 : 0;
+      enc.set_function(first ? _fn_conv_small_cout : _fn_conv_small_cout_acc);
+      enc.set_buffer(0, *taps[t], tap_off[t] * 2);
+      enc.set_buffer(1, c.whwio, (std::size_t)t * blk * 2);
+      enc.set_buffer(2, has_bias != 0 ? c.b : c.whwio);
+      enc.set_buffer(3, out, out_off * 2);
+      enc.set_constant(4, W); enc.set_constant(5, H);
+      enc.set_constant(6, c.cin); enc.set_constant(7, c.cout);
+      enc.set_constant(8, has_bias);
+      enc.dispatch({(unsigned)W, (unsigned)H, 1}, {256, 1, 1});
+    }
+    first = false;
+  }
+  if (tile != 0 && !c.b.empty()) {     // the op has no bias slot
+    enc.set_function(_fn_bias_add);
+    enc.set_buffer(0, out, out_off * 2); enc.set_buffer(1, c.b);
+    enc.set_constant(2, c.cout);
+    enc.set_constant(3, (unsigned)(hw * (std::size_t)c.cout));
+    enc.dispatch({(unsigned)c.cout, (unsigned)hw, 1}, {256, 1, 1});
+  }
+  return true;
 }
 
 // Whole-chunk convolution. Output frame o of a stride-1 causal conv reads
@@ -1216,14 +1476,83 @@ MetalWanVae::time_down_(Ctx& cx, const Resample& rs, const SharedBuffer& x,
 std::size_t
 MetalWanVae::decode_peak_bytes(int h8, int w8) const noexcept
 {
-  // One chunk is at most four frames at full resolution. The dominant
-  // terms are the top level's activations (4 frames x H x W x base) held
-  // alongside a resblock's two intermediates, plus the level below at
-  // twice the channels and a quarter the pixels.
-  const std::size_t hw = (std::size_t)h8 * w8;
-  const std::size_t base = (std::size_t)_cfg.base_dim;
-  const std::size_t top = 4 * 64 * hw * base * 2;         // 4 frames, 8x8 px
-  return top * 3 + top / 2;
+  return decode_peak_bytes(
+      _cfg, h8, w8, std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr);
+}
+
+// Walks decode()'s topology for a STEADY chunk -- four output frames; the
+// first chunk is one, and smaller everywhere. Three terms, in f16 bytes.
+//
+// CARRIES, exact: two input frames of every causal conv, allocated by the
+// first chunk and held to the end of the clip. The estimate this replaced
+// had no such term and called itself per-chunk, which is how a 1920x1152
+// decode that holds ~10 GB of carries was booked at under 6 GB in total.
+//
+// The chunk POOL is first-fit and hands nothing back inside a chunk, and
+// the decoder only ever widens, so a level keeps the slots it grew while
+// the next adds its own: kSlots of each level's largest buffer, where a
+// level opens at the nearest-2x buffer that feeds it. kSlots is
+// CALIBRATED, not derived (flashvsr_vae.frame_split_is_exact_and_bounded):
+// the measured pool is 1.84 slots a level over the whole chunk and 1.74
+// split, identically at 256x256 and 512x512 -- the peaks scale by exactly
+// 4.0x, so nothing in them is a fixed overhead -- which puts this figure
+// 4.3% and 3.3% above the measurement.
+//
+// The OUTPUT: the chunk's RGB twice, the pool's and the sink's.
+std::size_t
+MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
+                               bool frame_split) noexcept
+{
+  if (h8 <= 0 || w8 <= 0) { return 0; }
+  constexpr std::size_t kSlots = 2;
+  const std::size_t hw8 = (std::size_t)h8 * w8;
+  const std::size_t base = (std::size_t)cfg.base_dim;
+  const std::size_t d[5] = {base * cfg.dim_mult[3], base * cfg.dim_mult[3],
+                            base * cfg.dim_mult[2], base * cfg.dim_mult[1],
+                            base * cfg.dim_mult[0]};
+  const bool tup[3] = {cfg.temperal_downsample[2], cfg.temperal_downsample[1],
+                       cfg.temperal_downsample[0]};
+  int split_at = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (tup[i]) { split_at = i; }
+  }
+
+  std::size_t carries = 0, pool = 0;
+  auto keep = [&](std::size_t hw, std::size_t cin) {
+    carries += 2 * hw * cin * 2;
+  };
+  std::size_t level = hw8 * d[0];            // ELEMENTS, the level's largest
+  auto next_level = [&](std::size_t opens) {
+    pool += kSlots * level * 2;
+    level = opens;
+  };
+
+  keep(hw8, (std::size_t)cfg.z_dim);                     // conv_in
+  for (int r = 0; r < 4; ++r) { keep(hw8, d[0]); }       // mid, 2 x 2 convs
+  // `t` frames in the chunk; `nt` frames in each buffer, which drops to one
+  // past the split.
+  std::size_t hw = hw8, t = 1, nt = 1;
+  for (int i = 0; i < 4; ++i) {
+    const std::size_t in = (i > 0) ? d[i] / 2 : d[i];
+    const std::size_t out = d[i + 1];
+    for (int r = 0; r <= cfg.num_res_blocks; ++r) {
+      keep(hw, r == 0 ? in : out);
+      keep(hw, out);
+    }
+    level = std::max(level, nt * hw * std::max(in, out));
+    if (i == 3) { break; }                   // the last block has no resample
+    if (tup[i]) {
+      keep(hw, out);                         // its time_conv
+      level = std::max(level, nt * hw * 2 * out);
+      t *= 2;
+      nt = (frame_split && i >= split_at) ? 1 : t;
+    }
+    next_level(nt * 4 * hw * out);
+    hw *= 4;
+  }
+  keep(hw, d[4]);                            // conv_out
+  next_level(0);
+  return carries + pool + 2 * t * hw * 3 * 2;
 }
 
 bool
@@ -1247,23 +1576,52 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
 
   // Preflight: refuse a decode that clearly won't fit rather than
   // allocating into an out-of-memory mid-clip (which corrupts the output).
+  //
+  // On PHYSICAL memory only. The working set is advisory on UMA -- the
+  // same rule vae-decode applies around this call -- and with the carries
+  // counted, a 1920x1152 decode that runs needs more than a 24 GB box's
+  // working set reports free before anything is allocated.
+  //
+  // The band's share is bounded by both: whatever this decode leaves of
+  // the smaller of the two. Sized from the working set alone it took RAM
+  // the box did not have.
   std::size_t headroom = 0;
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
     headroom = (mb.recommended != 0) ? mb.headroom : 0;
-    const std::size_t need = decode_peak_bytes(h8, w8);
-    if (mb.recommended != 0 && !mb.fits(need)) {
-      return fail(fmt(
-          "insufficient GPU memory for a {}x{} video decode: need ~{} MB per "
-          "chunk, {} MB free of {} MB working set (lower the resolution or "
-          "free other resident models)", Wout, Hout, need >> 20,
-          mb.headroom >> 20, mb.recommended >> 20)());
+    if (headroom != 0 && mb.available_physical != 0) {
+      headroom = std::min(headroom, mb.available_physical);
     }
-    if (!mb.fits_physical(need)) {
+    const std::size_t need = decode_peak_bytes(h8, w8);
+    // NO MARGIN on top. fits_physical's default 10% is for a guess, and
+    // this is not one: the carries are exact and the pool term is
+    // calibrated 3-4% ABOVE a measured peak, so a margin counts the same
+    // caution twice. MEASURED at 1920x1152 on a 24 GB box: need 13417 MB
+    // against 14153 MB reclaimable -- a real peak of ~13.0 GB with a GB to
+    // spare -- refused by the margin alone.
+    // ...plus what this process still holds for GPU buffers that no longer
+    // exist. The driver returns a freed buffer's pages asynchronously,
+    // tens of milliseconds after the free, and a new allocation reuses
+    // them meanwhile -- room available_physical does not count yet (see
+    // MemoryBudget::self_graphics). A decode that starts right behind a
+    // large free is exactly that case: MEASURED on a 24 GB box, a second
+    // 1920x1152 decode in one process sampled an 11106 MB footprint over
+    // 278 MB of live buffers and was refused against 6945 MB
+    // "reclaimable" before this term existed.
+    const std::size_t live =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    const std::size_t reusable =
+        mb.self_graphics > live ? mb.self_graphics - live : 0;
+    if (mb.available_physical != 0 &&
+        need > mb.available_physical + reusable) {
+      // Who holds the rest, since "not enough" alone cannot say whether
+      // the box is full or this process is.
       return fail(fmt(
-          "insufficient free RAM for a {}x{} video decode: need ~{} MB per "
-          "chunk, ~{} MB reclaimable", Wout, Hout, need >> 20,
-          mb.available_physical >> 20)());
+          "insufficient free RAM for a {}x{} video decode: need ~{} MB, "
+          "~{} MB reclaimable and ~{} MB held for freed GPU buffers; this "
+          "process holds ~{} MB, ~{} MB of it in live GPU buffers", Wout,
+          Hout, need >> 20, mb.available_physical >> 20, reusable >> 20,
+          mb.self_footprint >> 20, live >> 20)());
     }
   }
 
@@ -1286,6 +1644,16 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     const long r = std::atol(e);
     if (r > 0) { col_cap = (std::size_t)r * widest; }
   }
+  // What the band came out as, for attributing a slow decode: the cap is a
+  // count of GEMM rows (PIXELS) at the widest conv, not of image rows.
+  if (std::getenv("VPIPE_WAN_VAE_LOG") != nullptr) {
+    std::fprintf(stderr,
+                 "[wan-vae] decode %dx%d, T=%d: need %zu MB, headroom %zu MB, "
+                 "band %zu MB = %zu px at the widest conv (%.1f image rows)\n",
+                 Wout, Hout, T, decode_peak_bytes(h8, w8) >> 20,
+                 headroom >> 20, (col_cap * 2) >> 20, col_cap / widest,
+                 (double)(col_cap / widest) / (double)Wout);
+  }
 
   // Per-conv carries, in traversal order. The count is fixed by the
   // topology, so index them by a counter reset at each chunk exactly as
@@ -1303,10 +1671,9 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     CommandStream stream = mc->make_command_stream();
     Ctx cx;
     cx.use_pool = std::getenv("VPIPE_WAN_NO_VAE_POOL") == nullptr;
-    cx.col = mc->make_shared_buffer(col_cap * 2);
-    if (cx.col.empty()) {
-      return fail("im2col band scratch allocation failed (out of GPU memory)");
-    }
+    // The band is allocated by the first conv that GATHERS (conv_frame_).
+    // On the hardware conv none does, and at 1920x1152 that is 2.6 GB this
+    // chunk never touches.
     cx.col_cap = col_cap;
     const SharedBuffer* rgb = nullptr;
     int t = 1;                       // frames in this chunk
@@ -1349,38 +1716,130 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
         step(resblock_(cx, _mid_res1, *x, t, H, W, a, b));
       }
 
-      for (const UpBlock& ub : _up_blocks) {
+      // The whole chunk runs up to and including the LAST temporal
+      // upsample. What follows it -- that block's spatial half, every
+      // later block, the head -- mixes frames only through a carry, so it
+      // runs one frame at a time: the same arithmetic in the same order,
+      // over a quarter of the working set. It is also where the
+      // resolution is, so it is where the working set is.
+      //
+      // MEASURED at 1920x1152 (FlashVSR's 4x output) before this: a 29.0 GB
+      // peak footprint on a 24 GB box, ~9.5 GB of swap, and a decode four
+      // times longer than the denoise in front of it.
+      // VPIPE_WAN_VAE_NO_FRAME_SPLIT runs the tail over the whole chunk.
+      std::size_t split_at = 0;
+      for (std::size_t i = 0; i < _up_blocks.size(); ++i) {
+        if (_up_blocks[i].up.present && _up_blocks[i].up.temporal) {
+          split_at = i;
+        }
+      }
+      for (std::size_t i = 0; i <= split_at; ++i) {
+        const UpBlock& ub = _up_blocks[i];
         for (const ResBlock& rb : ub.resnets) {
           Carry* a = next_carry(); Carry* b = next_carry();
           step(resblock_(cx, rb, *x, t, H, W, a, b));
         }
+        if (ub.up.present && ub.up.temporal) {
+          SharedBuffer& up = time_up_(cx, ub.up, *x, t, (std::size_t)H * W,
+                                      ub.up_dim, next_carry());
+          if (&up != x) { step(up); }
+        }
+        if (!cx.alloc_ok) { return fail("chunk allocation failed"); }
+        if (i == split_at) { break; }
         if (ub.up.present) {
-          if (ub.up.temporal) {
-            SharedBuffer& up = time_up_(cx, ub.up, *x, t, (std::size_t)H * W,
-                                        ub.up_dim, next_carry());
-            if (&up != x) { step(up); }
-          }
           step(upsample2x_(cx, *x, t, H, W, ub.up_dim));
           H *= 2; W *= 2;
           step(conv_chunk_(cx, ub.up.space, *x, t, H, W, 1, nullptr));
         }
-        if (!cx.alloc_ok) { return fail("chunk allocation failed"); }
       }
 
-      const std::size_t rows = (std::size_t)t * H * W;
-      SharedBuffer& xn = normc_(cx, *x, rows, base, _norm_out_g);
-      cx.release(*x);
-      silu_(cx, xn, rows * (std::size_t)base);
-      SharedBuffer& out = conv_chunk_(cx, _conv_out, xn, t, H, W, 1,
-                                      next_carry());
-      cx.release(xn);
-      const std::size_t n = rows * 3;
-      enc.set_function(_fn_clamp);
-      enc.set_buffer(0, out); enc.set_buffer(1, out);
-      enc.set_constant(2, (int)n);
-      enc.set_constant(3, -1.0f); enc.set_constant(4, 1.0f);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-      rgb = &out;
+      // Block `split_at`'s spatial half onward, over `nt` frames of `in`
+      // at th x tw, which it advances to the output size. Returns the
+      // clamped RGB, [nt*th*tw, 3]. Never releases `in`: the split path
+      // refills it for every frame.
+      auto tail = [&](const SharedBuffer& in, int nt, int& th,
+                      int& tw) -> SharedBuffer* {
+        const SharedBuffer* y = &in;
+        auto adv = [&](SharedBuffer& ny) {
+          if (y != &in) { cx.release(*y); }
+          y = &ny;
+        };
+        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
+          const UpBlock& ub = _up_blocks[i];
+          if (i != split_at) {
+            for (const ResBlock& rb : ub.resnets) {
+              Carry* a = next_carry(); Carry* b = next_carry();
+              adv(resblock_(cx, rb, *y, nt, th, tw, a, b));
+            }
+          }
+          if (ub.up.present) {
+            adv(upsample2x_(cx, *y, nt, th, tw, ub.up_dim));
+            th *= 2; tw *= 2;
+            adv(conv_chunk_(cx, ub.up.space, *y, nt, th, tw, 1, nullptr));
+          }
+          if (!cx.alloc_ok) { return nullptr; }
+        }
+        const std::size_t rows = (std::size_t)nt * th * tw;
+        SharedBuffer& yn = normc_(cx, *y, rows, base, _norm_out_g);
+        if (y != &in) { cx.release(*y); }
+        silu_(cx, yn, rows * (std::size_t)base);
+        SharedBuffer& out = conv_chunk_(cx, _conv_out, yn, nt, th, tw, 1,
+                                        next_carry());
+        cx.release(yn);
+        if (!cx.alloc_ok) { return nullptr; }
+        const std::size_t n = rows * 3;
+        enc.set_function(_fn_clamp);
+        enc.set_buffer(0, out); enc.set_buffer(1, out);
+        enc.set_constant(2, (int)n);
+        enc.set_constant(3, -1.0f); enc.set_constant(4, 1.0f);
+        enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+        return &out;
+      };
+
+      const bool split =
+          t > 1 && std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr;
+      if (!split) {
+        rgb = tail(*x, t, H, W);
+        cx.release(*x);
+      } else {
+        // The chunk's frames at the split, and where each one's RGB lands.
+        const std::size_t fel =
+            (std::size_t)H * W * (std::size_t)_up_blocks[split_at].up_dim;
+        int oh = H, ow = W;
+        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
+          if (_up_blocks[i].up.present) { oh *= 2; ow *= 2; }
+        }
+        const std::size_t ofel = (std::size_t)oh * ow * 3;
+        SharedBuffer& all = cx.alloc(mc, (std::size_t)t * ofel);
+        SharedBuffer& one = cx.alloc(mc, fel);
+        const std::size_t ci0 = ci;
+        const int H0 = H, W0 = W;
+        bool ok = cx.alloc_ok;
+        for (int k = 0; k < t && ok; ++k) {
+          ci = ci0;                    // every frame walks the same carries
+          enc.set_function(_fn_copy);
+          enc.set_buffer(0, *x, (std::size_t)k * fel * 2);
+          enc.set_buffer(1, one);
+          enc.set_constant(2, 0);
+          enc.set_constant(3, (int)fel);
+          enc.dispatch({(unsigned)fel, 1, 1}, {256, 1, 1});
+          H = H0; W = W0;
+          SharedBuffer* o = tail(one, 1, H, W);
+          ok = o != nullptr;
+          if (!ok) { break; }
+          enc.set_function(_fn_copy);
+          enc.set_buffer(0, *o);
+          enc.set_buffer(1, all);
+          enc.set_constant(2, (int)((std::size_t)k * ofel));
+          enc.set_constant(3, (int)ofel);
+          enc.dispatch({(unsigned)ofel, 1, 1}, {256, 1, 1});
+          cx.release(*o);
+        }
+        cx.release(one);
+        cx.release(*x);
+        rgb = ok ? &all : nullptr;
+      }
+      if (rgb == nullptr) { return fail("chunk allocation failed"); }
     }
     if (!cx.alloc_ok) {
       return fail("a decode intermediate allocation failed (out of GPU "

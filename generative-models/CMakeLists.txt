@@ -36,6 +36,7 @@ set(LOCAL_SOURCES
   shared/i8-gemm.cc
   shared/lora-names.cc
   shared/runtime-lora.cc
+  shared/torch-zip.cc
   shared/sol-attention.cc
   shared/metal-sol-attention.cc
   shared/metal-sage-attention.cc
@@ -87,6 +88,9 @@ set(LOCAL_SOURCES
   flux2/metal-flux2-calibration.cc
   boogu/metal-boogu-transformer.cc
   boogu/metal-boogu-calibration.cc
+  flashvsr/flashvsr-lq-proj.cc
+  flashvsr/metal-flashvsr-transformer.cc
+  flashvsr/flashvsr-family.cc
   vosr/metal-dinov2-encoder.cc
   vosr/metal-vosr-transformer.cc
   wan/metal-wan-vae.cc
@@ -139,6 +143,7 @@ set(LOCAL_HEADERS
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/grounded-encode-params.h
+  shared/torch-zip.h
   shared/wired-pool.h
   shared/mcp/file-sandbox.h
   shared/mcp/mcp-tools.h
@@ -170,6 +175,9 @@ set(LOCAL_HEADERS
   moss/metal-moss-rt-model.h
   boogu/metal-boogu-transformer.h
   boogu/metal-boogu-calibration.h
+  flashvsr/flashvsr-lq-proj.h
+  flashvsr/metal-flashvsr-transformer.h
+  flashvsr/flashvsr-family.h
   vosr/metal-dinov2-encoder.h
   vosr/metal-vosr-transformer.h
   wan/metal-wan-vae.h

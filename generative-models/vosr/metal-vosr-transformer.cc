@@ -498,6 +498,21 @@ MetalVosrTransformer::load_weights_(WeightSet& ws, std::string* err)
   return true;
 }
 
+int
+MetalVosrTransformer::default_tile(int lh, int lw, const Config& cfg)
+{
+  // The grid the weights were distilled at, expressed back in latent
+  // cells: train_grid tokens of `patch` cells each. For the shipped
+  // checkpoint that is 32 * 2 = 64, i.e. 512 output pixels.
+  const int p = cfg.patch > 0 ? cfg.patch : 1;
+  const int trained = cfg.train_grid > 0 ? cfg.train_grid * p : 0;
+  if (trained <= 0) { return 0; }
+  // Already inside it: one pass IS the reference's path here, and
+  // tiling a picture that does not need it would only add seams.
+  if (lh <= trained && lw <= trained) { return 0; }
+  return trained;
+}
+
 void
 MetalVosrTransformer::build_rope_(int gh, int gw, SharedBuffer& cos_out,
                                  SharedBuffer& sin_out) const

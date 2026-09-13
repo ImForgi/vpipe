@@ -40,6 +40,7 @@
 // The executable dynamically links libvpipe; pipeline output and
 // diagnostics flow through the session's default stdout delegates.
 
+#include "common/diagnostic-capture.h"
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "plugin/plugin-manager.h"
@@ -263,6 +264,35 @@ apply_override(FlexData& spec, const std::string& stage_id,
   return true;
 }
 
+// Print a refusal the way someone at a shell needs it: one `vpipe:`
+// line naming what was asked, then the reasons the operation gave,
+// indented under it.
+//
+// Those reasons also went past as [WARN] when they happened -- that is
+// the session's running log, and with several --launch arguments in
+// flight it interleaves. This block is the tool's ANSWER to one
+// argument and has to be readable on its own, so it repeats the reason
+// rather than pointing at a line somewhere above. A refusal that
+// reported no reason at all says that instead: it means the site that
+// refused never said why, which is a defect worth seeing named.
+void
+report_refusal(const char* what, const std::string& subject,
+               const vpipe::DiagnosticCapture& why)
+{
+  if (why.empty()) {
+    std::fprintf(stderr, "vpipe: %s '%s': rejected, no reason reported\n",
+                 what, subject.c_str());
+    return;
+  }
+  std::fprintf(stderr, "vpipe: %s '%s': rejected\n", what, subject.c_str());
+  for (const std::string& line : why.lines()) {
+    std::fprintf(stderr, "  %s\n", line.c_str());
+  }
+  if (why.truncated()) {
+    std::fprintf(stderr, "  (further messages omitted)\n");
+  }
+}
+
 struct Launch {
   enum Kind { Full, Single };
   Kind                     kind;
@@ -295,12 +325,10 @@ build_single(SessionIntf* s, const Launch& L, int idx)
                  L.source.c_str());
     return std::nullopt;
   }
+  vpipe::DiagnosticCapture why;
   StageHandle st = pl.insert_stage(L.source, L.source, {}, cfg.to_json());
   if (!st) {
-    std::fprintf(stderr,
-                 "vpipe: failed to create stage '%s' (unknown type or bad "
-                 "config)\n",
-                 L.source.c_str());
+    report_refusal("--launch-stage", L.source, why);
     s->unload_pipeline(pl);
     return std::nullopt;
   }
@@ -316,8 +344,12 @@ build_full(SessionIntf* s, const Launch& L)
 {
   // No edits: load_pipeline takes a path or an inline JSON spec directly.
   if (L.cfgs.empty()) {
+    vpipe::DiagnosticCapture why;
     PipelineHandle h = s->load_pipeline(L.source);
-    if (!h) { return std::nullopt; }   // loader already logged the cause
+    if (!h) {
+      report_refusal("--launch", L.source, why);
+      return std::nullopt;
+    }
     return h;
   }
 
@@ -367,8 +399,12 @@ build_full(SessionIntf* s, const Launch& L)
   }
 
   // Hand the edited spec back to the loader as an inline JSON document.
+  vpipe::DiagnosticCapture why;
   PipelineHandle h = s->load_pipeline(spec.to_json());
-  if (!h) { return std::nullopt; }   // loader already logged the cause
+  if (!h) {
+    report_refusal("--launch", L.source, why);
+    return std::nullopt;
+  }
   return h;
 }
 
@@ -551,7 +587,16 @@ run(int argc, char** argv)
             pre.push_back(argv[j + 1]);
           }
         }
-        if (!pre.empty()) { PluginManager::get().load_all(nullptr, pre); }
+        // With no session the loader's reason has nowhere to go, so at
+        // least NAME the plugin that was skipped: a listing that silently
+        // omits its entries is the failure described above.
+        for (const std::string& p : pre) {
+          if (!PluginManager::get().load(nullptr, p)) {
+            std::fprintf(stderr,
+                         "vpipe: plugin '%s' was not loaded (rerun with a "
+                         "pipeline to see why)\n", p.c_str());
+          }
+        }
       }
       FlexData arr = FlexData::make_array();
       auto     out = arr.as_array();
@@ -652,10 +697,17 @@ run(int argc, char** argv)
       ++failed;
       continue;
     }
+    vpipe::DiagnosticCapture why;
     const Status st = s->launch_pipeline(*h);
     if (st.code != 0) {
       std::fprintf(stderr, "vpipe: launch failed for '%s' (status %u)\n",
                    L.source.c_str(), st.code);
+      for (const std::string& line : why.lines()) {
+        std::fprintf(stderr, "  %s\n", line.c_str());
+      }
+      if (why.empty()) {
+        std::fprintf(stderr, "  (no reason reported)\n");
+      }
       s->unload_pipeline(*h);
       ++failed;
       continue;

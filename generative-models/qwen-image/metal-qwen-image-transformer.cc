@@ -1552,7 +1552,16 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       };
       fn_attn = build(false);
       use_steel = fn_attn.valid();
-      if (use_steel && nax && _cfg.sage.dense_layers < _cfg.n_layers) {
+      // The int8 twin, on the matrix-core entry only, and only when
+      // there is a driver to fill its operands. A function built with
+      // constant 306 true reads buffers 15..18, so it is not a twin of
+      // anything without the prologue that writes them -- and asking
+      // for it while `_sage` is null is how this built a dispatch whose
+      // prepare() had no object to run on. `dense_layers` alone does
+      // not say Sage was asked for: it defaults to zero, which is below
+      // every block count here.
+      if (use_steel && nax && (bool)_sage && _cfg.sage.enabled &&
+          _cfg.sage.dense_layers < _cfg.n_layers) {
         fn_attn_i8 = build(true);
       }
     }
@@ -1760,7 +1769,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
         // the attention params describe. gqa_factor is 1 here, so the
         // KV head count is NH.
         bool i8_ok = false;
-        if (fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
+        if (_sage && fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
           const MetalSageAttention::Operand qo{&qt, 0, Hd, JT * Hd};
           const MetalSageAttention::Operand ko{&kt, 0, Hd, JT * Hd};
           std::string gerr;

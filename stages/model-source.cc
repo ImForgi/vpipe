@@ -199,6 +199,10 @@ const MirrorEntry kMirrors[] = {
      .hf_path = "RudySen/Krea2-realism-V2", .path = ""},
     {.source = "modelscope",
      .hf_path = "conradlocke/krea2-identity-edit", .path = ""},
+    // FlashVSR-v1.1 has no ModelScope counterpart under its own name (the
+    // repo lookup returns "record not found", 2026-09-12).
+    {.source = "modelscope", .hf_path = "JunhaoZhuang/FlashVSR-v1.1",
+     .path = ""},
 };
 
 // Plugin-contributed rows, published as immutable snapshots for the same
