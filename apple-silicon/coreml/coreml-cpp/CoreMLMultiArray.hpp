@@ -32,6 +32,12 @@ public:
       const NS::Object*     deallocatorBlock,
       NS::Error**           error);
 
+  // Wraps a CVPixelBufferRef (opaque void*) of
+  // kCVPixelFormatType_OneComponent16Half as a Float16 array of `shape`
+  // [height, width]. The buffer is retained; when it is IOSurface-backed
+  // CoreML can pass it to the Neural Engine as the memory it already is.
+  MultiArray* initWithPixelBuffer(void* pixelBuffer, const NS::Array* shape);
+
   MultiArrayDataType dataType()    const;
   NS::Array*         shape()       const;
   NS::Array*         strides()     const;
@@ -86,6 +92,13 @@ CML::MultiArray::initWithDataPointer(void*               dataPointer,
       _CML_PRIVATE_SEL(
           initWithDataPointer_shape_dataType_strides_deallocator_error_),
       dataPointer, shape, dataType, strides, deall, error);
+}
+
+_CML_INLINE CML::MultiArray*
+CML::MultiArray::initWithPixelBuffer(void* pixelBuffer, const NS::Array* shape)
+{
+  return NS::Object::sendMessage<MultiArray*>(
+      this, _CML_PRIVATE_SEL(initWithPixelBuffer_shape_), pixelBuffer, shape);
 }
 
 _CML_INLINE CML::MultiArrayDataType CML::MultiArray::dataType() const

@@ -105,6 +105,42 @@ const ConfigKey kAttrs[] = {
           "Default false; env VPIPE_I8_GEMM overrides",
    .def_bool = false},
   // ---- SageAttention (thu-ml, arXiv:2410.02367) ---------------------
+  {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated FFN (LOSSY, fp16): run the block feed-forward on "
+          "the Apple Neural Engine, which on an M4 is the only unused "
+          "compute on the die -- the GPU's f16 GEMM already sits at "
+          "84-92% of roofline and its integer MAD is a QUARTER of the "
+          "f16 rate, so there is no int8 lever there. The rows are split "
+          "between the two engines and run concurrently. The ANE runs "
+          "ONE shared module whose weights are runtime inputs, staged "
+          "per block into IOSurface buffers: its memory is fixed "
+          "(~1.2-1.5 GB for MiniMax-H3 depending on clip length, however "
+          "many blocks use it), it compiles once per shape and is cached "
+          "after. The resource plan decides whether the module fits. A "
+          "4/8-bit affine checkpoint is dequantized into those buffers "
+          "per block, and a runtime LoRA on the feed-forward is merged "
+          "into them. Implemented by MiniMax-H3; other families ignore "
+          "it"},
+  {.key = "ane_rows", .type = ConfigType::Real, .required = false,
+   .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
+          "rest CONCURRENTLY (rows are independent in a feed-forward, so "
+          "the split is exact -- no partial sums, no seam). 0 (default) "
+          "lets the family balance from the two engines' measured rates; "
+          "~12.6 TOPS ANE against ~7 TFLOP/s GPU puts it near 0.64. 1 "
+          "gives the whole FFN to the ANE and idles the GPU for its "
+          "duration. The crossing itself is free: measured at -0.3 to "
+          "-1.0 ms against a GPU-only control with the same commit "
+          "count, i.e. the ANE phase overlaps the GPU's commit/wait "
+          "rather than serialising behind it"},
+  {.key = "ane_templates", .type = ConfigType::String, .required = false,
+   .doc = "directory of precompiled ANE module templates. Unused by the "
+          "runtime-weight feed-forward, which emits its own graph; "
+          "accepted so existing graphs keep loading"},
+  {.key = "ane_layers", .type = ConfigType::Int, .required = false,
+   .doc = "cap on how many blocks use the ANE feed-forward; 0 (default) "
+          "means every dense block. Not a memory setting -- the blocks "
+          "share one module whose cost is fixed -- so set it only to "
+          "cover fewer blocks on purpose, e.g. for a benchmark"},
   {.key = "sage_attn", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated attention (LOSSY): SageAttention runs the QK^T "
           "product of the flash kernel in INT8, with one scale per "
@@ -415,6 +451,23 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                             _sol.dense_layers);
   genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
                             _sol.local_radius);
+  // The ANE tier. An empty `ane_templates` does NOT disable it: a family
+  // that can emit its own graph needs no template, and only the family
+  // knows whether it can. `ane_layers` caps the blocks that use it; no
+  // video family implements the tier yet, so here the keys
+  // are carried to a plugin family and no further.
+  {
+    const std::string tdir = attr_str("ane_templates");
+    const bool on = attr_bool("ane_ffn");
+    double rows = attr_real("ane_rows");
+    if (!(rows >= 0.0) || rows > 1.0) { rows = 0.0; }
+    long long layers = attr_int("ane_layers");
+    if (layers < 0) { layers = 0; }
+    genai::accel::set_flag(&_accel, genai::accel::kAneFfn, on);
+    genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
+    genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
+    genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
+  }
   // ...and back out, which is the half that makes it one decision. If a
   // key is ever written under one name and read under another, this is
   // where it stops being true rather than three plugins away.
@@ -692,6 +745,70 @@ GenerateVideoStage::vdn_dir_() const
   return std::string(o.at("linear_branch").as_string(""));
 }
 
+std::string
+GenerateVideoStage::ane_claim_label_() const
+{
+  return "ane-ffn/" + std::string(this->id());
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// What the MiniMax-H3 ANE tier books: its fixed module plus host buffers
+// for the ANE's rows of the PLANNED clip -- the packed sequence of the
+// planned geometry, with room for two conditioning latent frames and the
+// longest text. The same geometry answers the claim and the grant, so the
+// two cannot book different numbers.
+std::size_t
+GenerateVideoStage::h3_ane_bytes_() const
+{
+  int w = _width, h = _height, f = _frames;
+  (void)planned_geometry_(resolve_model_dir(session(), _hf_dir), &w, &h, &f);
+  const genai::MetalMiniMaxH3VideoVae::Config vc;
+  const genai::MetalMiniMaxH3Transformer::Config tc;
+  constexpr int kCondFrames = 2, kTextRows = 512;
+  const int lf = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
+      vc, std::max(1, f));
+  const int gh = std::max(1, (h + vc.patch - 1) / vc.patch / tc.patch_h);
+  const int gw = std::max(1, (w + vc.patch - 1) / vc.patch / tc.patch_w);
+  const int audio =
+      _fps > 0.0
+          ? genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
+                (double)std::max(1, f) / _fps)
+          : 0;
+  const int seq = (std::max(0, lf) + kCondFrames) * gh * gw + audio +
+                  kTextRows;
+  return genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(tc, seq);
+}
+
+// Carry the settled ANE tier out of the accel bag and onto _h3_cfg.
+// WHETHER it runs is the plan's call: the module is one fixed unit, and
+// without the grant the config stays off, which is how the DiT is told to
+// keep its GPU feed-forward. Read here rather than at claim time because
+// the grant is not computed until every stage has claimed.
+void
+GenerateVideoStage::apply_h3_ane_()
+{
+  namespace a = genai::accel;
+  _h3_cfg.ane_ffn = false;
+  if (!a::flag(&_accel, a::kAneFfn)) { return; }
+  const std::size_t bytes = h3_ane_bytes_();
+  if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
+      0) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): the ANE feed-forward was requested but "
+        "the plan left no room for its module ({} MB); keeping the GPU "
+        "feed-forward", this->id(), bytes >> 20));
+    return;
+  }
+  _h3_cfg.ane_ffn    = true;
+  _h3_cfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
+  _h3_cfg.ane_layers =
+      (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));
+}
+#else
+std::size_t GenerateVideoStage::h3_ane_bytes_() const { return 0; }
+void GenerateVideoStage::apply_h3_ane_() {}
+#endif
+
 std::vector<ResourceClaim>
 GenerateVideoStage::declare_resources() const
 {
@@ -824,7 +941,26 @@ GenerateVideoStage::declare_resources() const
   }
 
   if (fam != nullptr) {
-    std::vector<ResourceClaim> out = fam->declare_resources(root);
+    // A family's CoreML claim -- the ANE module a family that implements
+    // `ane_ffn` holds -- is booked only when the graph asked for the tier,
+    // and under THIS stage's label: the family cannot know the stage's id,
+    // and two stages sharing a label would share one grant. The grant is
+    // read back at load; see the plugin branch of load.
+    const bool ane = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+    std::vector<ResourceClaim> out;
+    for (auto& c : fam->declare_resources(root)) {
+      std::size_t ub = 0;
+      int un = 0;
+      if (model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+        if (!ane) { continue; }
+        for (auto& r : model_memory::coreml_claims(ane_claim_label_(), ub,
+                                                   un, c.phase)) {
+          out.push_back(std::move(r));
+        }
+        continue;
+      }
+      out.push_back(std::move(c));
+    }
     for (auto& c : arena) { out.push_back(std::move(c)); }
     return out;
   }
@@ -853,6 +989,17 @@ GenerateVideoStage::declare_resources() const
   // does fit the second is not one to refuse -- it is one to stream.
   std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
       dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit))};
+  // ANE RESIDENCY: one unit, in the denoise phase. CoreML holds the
+  // module's bytes where no other ledger can see them, and the feed-forward
+  // runs on ONE shared runtime-weight module, so the cost is fixed --
+  // granted whole or not at all. See apply_h3_ane_().
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+    for (auto& c : model_memory::coreml_claims(ane_claim_label_(),
+                                               h3_ane_bytes_(), 1,
+                                               model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   // VDN's branch is a SECOND checkpoint -- 4.28 GB over 50 blocks -- and
   // it is declared here or it is invisible: every driver runs
   // initialize() concurrently, so a peer that sizes itself against this
@@ -1542,6 +1689,32 @@ GenerateVideoStage::ensure_expert_(int which)
     // kernel variants the in-tree ones do. Nothing here is applied on
     // the family's behalf: these are what it was ASKED, not what it got.
     args.accel = &_accel;
+    // THE ANE TIER'S GRANT, for a family that booked a module. Its claim
+    // went into the plan under this stage's label (declare_resources);
+    // the answer is read here, where the built-ins read theirs. A refusal
+    // turns the key OFF in the bag, which every later request carries --
+    // so the family is told no, rather than holding a module the plan
+    // left no room for. A family that implements the tier and booked
+    // nothing is taken at its word.
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      for (const ResourceClaim& c :
+           _plugin_family->declare_resources(_root)) {
+        std::size_t ub = 0;
+        int un = 0;
+        if (!model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+          continue;
+        }
+        if (model_memory::coreml_grant(session(), ane_claim_label_(), ub,
+                                       un) <= 0) {
+          genai::accel::set_flag(&_accel, genai::accel::kAneFfn, false);
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): the ANE feed-forward was requested "
+              "but the plan left no room for {}'s module ({} MB); the family "
+              "keeps its GPU feed-forward", this->id(), _family, ub >> 20));
+        }
+        break;
+      }
+    }
     // The clip this graph intends to make, through the family's own
     // rounding, so a load-time decision that scales with the beat has the
     // right order of magnitude instead of a constant. Left at 0 when the
@@ -1692,6 +1865,7 @@ GenerateVideoStage::ensure_expert_(int which)
     _h3_cfg.i8_gemm = _i8_gemm;
     _h3_cfg.sol     = _sol;
     _h3_cfg.sage    = _sage;
+    apply_h3_ane_();
     // The runtime LoRA, when the model_config beat named one. It is a
     // LOAD-time argument and not a per-step knob: an adapted mlp.fc1
     // rules out the fused-SwiGLU kernel, which is decided before the
@@ -2054,7 +2228,29 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // when the setting is off, and reduced by whatever the forward arena
   // could lend -- see MetalMiniMaxH3Transformer::sage_lend_bytes_.
   const std::size_t sage = _h3_dit ? _h3_dit->sage_scratch_bytes(seq) : 0;
-  const std::size_t need = dit + vdn + sol + sage;
+  // AND THE ANE MODULE'S, when the plan granted it: CoreML holds its staged
+  // weights and the host rows beside this forward, at THIS sequence rather
+  // than the planned one. Counted in `need`, so the refusal is judged with
+  // it and the residency reserve below leaves it clear -- a streamed DiT
+  // growing blocks into memory the ANE already holds is the same failure
+  // as growing into the scratch.
+  std::size_t ane =
+      _h3_cfg.ane_ffn
+          ? genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(_h3_cfg, seq)
+          : 0;
+  // The qkv matmul tier (prototype), which carries no claim of its own yet.
+  if (_h3_cfg.ane_qkv || std::getenv("VPIPE_H3_ANE_QKV") != nullptr) {
+    ane += genai::AneFeedForward::matmul_runtime_bytes(
+        _h3_cfg.hidden, 3 * _h3_cfg.inner(), seq,
+        genai::MetalMiniMaxH3Transformer::ane_chunk_rows());
+  }
+  // TWO BUDGETS. The forward's Metal scratch is what the GPU working set
+  // must hold; the ANE modules are IOSurfaces and CoreML's own copies, so
+  // they count against physical RAM only. MEASURED on an M5 Pro 24 GB at
+  // 1344x768x328 (98887 rows): charging the ANE's 3.1 GB to the working set
+  // refused a clip that runs GPU-only.
+  const std::size_t gpu_need = dit + vdn + sol + sage;
+  const std::size_t need = gpu_need + ane;
 
   // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
   // inside the predicates.
@@ -2077,8 +2273,16 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   auto grossed_up = [](std::size_t n, double margin) -> std::size_t {
     return (std::size_t)((double)n / (1.0 - margin));
   };
-  const std::size_t need_ws   = grossed_up(need, kWorkingSetMargin);
-  const std::size_t need_phys = grossed_up(need, kPhysicalMargin);
+  const std::size_t need_ws   = grossed_up(gpu_need, kWorkingSetMargin);
+  // The physical margin is slack for the SCRATCH ESTIMATE; the ANE modules
+  // are fixed-size slots and one-chunk host buffers, so they are added at
+  // face value. Grossing them up too charged a 24 GB M5 Pro ~1.6 GB of
+  // margin for a ~1.1 GB module and ran a clip without it.
+  const std::size_t need_phys = grossed_up(gpu_need, kPhysicalMargin) + ane;
+  auto fits_phys = [&](const auto& b, std::size_t extra) {
+    return b.available_physical >= grossed_up(gpu_need, kPhysicalMargin) +
+                                       extra;
+  };
 
   // Tell the DiT how much room to leave clear when it decides whether to
   // keep a streamed block resident. Its growth must not eat the scratch
@@ -2092,8 +2296,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // Both budgets, for the reason generate-image gives: fits() is our Metal
   // working set and misses other processes' resident memory; fits_physical
   // is host-wide reclaimable RAM and catches it.
-  if (mb.fits(need, kWorkingSetMargin) &&
-      mb.fits_physical(need, kPhysicalMargin)) {
+  if (mb.fits(gpu_need, kWorkingSetMargin) && fits_phys(mb, ane)) {
     return true;
   }
 
@@ -2104,8 +2307,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     parked = gm->reclaim_at_least(need);
   }
   mb = mc->memory_budget();
-  if (mb.fits(need, kWorkingSetMargin) &&
-      mb.fits_physical(need, kPhysicalMargin)) {
+  if (mb.fits(gpu_need, kWorkingSetMargin) && fits_phys(mb, ane)) {
     session()->info(fmt(
         "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
         "~{} MB of scratch{}", this->id(), parked >> 20, seq, need >> 20,
@@ -2125,8 +2327,30 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     return true;
   }
   // WHICH GATE FAILED, and by how much, in the units the gate uses.
-  const bool ws_ok = mb.fits(need, kWorkingSetMargin);
-  const bool ph_ok = mb.fits_physical(need, kPhysicalMargin);
+  // THE ANE IS THE OPTIONAL PART. When the clip fits without its modules,
+  // run the GPU alone -- a slower clip -- instead of refusing the clip.
+  if (ane > 0 && mb.fits(gpu_need, kWorkingSetMargin) &&
+      mb.fits_physical(gpu_need, kPhysicalMargin)) {
+    if (_h3_dit) {
+      _h3_dit->disable_ane();
+      _h3_dit->set_residency_reserve(gpu_need + (1ull << 30));
+    }
+    _h3_cfg.ane_ffn = false;
+    _h3_cfg.ane_qkv = false;
+    if (auto* gm = session()->services()->generative_model_manager()) {
+      gm->revise_scratch("coreml:" + ane_claim_label_(), 0);
+    }
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): the {}-row forward fits only without the "
+        "ANE modules' ~{} MB (reclaimable RAM ~{} MB against ~{} MB wanted "
+        "with them; GPU working set ~{} MB against ~{} MB) -- running the "
+        "GPU alone for this clip", this->id(), seq, ane >> 20,
+        mb.available_physical >> 20, need_phys >> 20, mb.headroom >> 20,
+        need_ws >> 20));
+    return true;
+  }
+  const bool ws_ok = mb.fits(gpu_need, kWorkingSetMargin);
+  const bool ph_ok = fits_phys(mb, ane);
   auto gate = [](const char* what, bool ok, std::size_t want,
                  std::size_t have) {
     return ok ? fmt("{} needs ~{} MB, has ~{} MB -- ok", what, want >> 20,
@@ -2558,6 +2782,23 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   std::string derr;
   const bool ok = genai::denoise(req, &derr);
   bar.finish();
+  // After a denoise, whose first forward is where the ANE tier arms or
+  // declines: set the module booking to what is HELD -- the bytes at this
+  // clip's sequence when the tier armed, 0 when it did not (the emitter did
+  // not verify, too few rows for a chunk). Both ways, every clip: a short
+  // clip that declined and a long one after it that armed must not leave
+  // the ledger at zero while the module is live. revise_scratch() refuses
+  // to create, so this is a no-op when the plan booked nothing.
+  if (_h3_dit && _h3_dit->ane_attempted()) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->revise_scratch(
+          "coreml:" + ane_claim_label_(),
+          _h3_dit->ane_armed()
+              ? genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(
+                    _h3_cfg, L.seq_len)
+              : 0);
+    }
+  }
   if (!ok) {
     session()->warn(fmt("GenerateVideoStage('{}'): {}", this->id(), derr));
     return false;

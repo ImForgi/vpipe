@@ -179,6 +179,19 @@ public:
   }
 
 private:
+  // Copies the settled ANE tier from the accel bag onto a family config
+  // that has the fields. See the definition -- the bag is filled whether
+  // or not anything reads it, so this is the step that makes the tier
+  // reachable from a graph.
+  template <typename Cfg>
+  void apply_ane_(Cfg& cfg) const;
+
+  // The label both halves of the ANE grant use: declare_resources()
+  // claims CoreML residency under it and apply_ane_() reads the grant
+  // back. Per STAGE, so two generate-image stages in one graph are
+  // granted separately rather than sharing one allowance.
+  std::string ane_claim_label_() const;
+
   // Stamp the generating model onto a latent beat's sideband. The chain
   // generate-image -> vae-decode -> save-image carries it through so a saved
   // file can record WHAT produced it (save-image writes it into EXIF

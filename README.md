@@ -18,7 +18,7 @@
 
 **[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
 · **[Run the first example](#first-example)**
-· **[Try image editing](docs/KLEIN-KV.md)**
+· **[Try image editing](docs/KLEIN.md)** ([简体中文](docs/KLEIN-zh-cn.md))
 · **[Try MiniMax H3 video](docs/MINIMAX-H3.md)**
 · **[Try Krea-2 images](docs/KREA-2.md)**
 
@@ -57,8 +57,9 @@ preview panels, profiler, and reproducible model configuration.*
     (10 GPU cores, 16 GB), no cooling aid — it scales with GPU cores [^4]
 
 - **Image and video generation on base-model Macs** with weight streaming —
-  walk through a reference image edit in
-  **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
+  walk through a reference image edit, or combine two references, in
+  **[docs/KLEIN.md](docs/KLEIN.md)**
+  ([简体中文](docs/KLEIN-zh-cn.md))
 
 - **Realtime multimodal pipelines** for VQA, ASR, chat, TTS, image editing,
   video generation, and tool use.
@@ -109,13 +110,13 @@ speed claim. [^3]
 | Workload family | Verified status |
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
-| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9b-kv:** 4-bit reference image editing with 4-step default pipeline and compare-image UI on Apple Silicon. |
+| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. |
 | Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
 settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
 for text-to-image, the tuned 8-step schedule and the live denoising preview;
-and **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)** and
+and **[docs/KLEIN.md](docs/KLEIN.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
 workflows.
 
@@ -372,7 +373,7 @@ worth knowing.
 
 **Then:** **[EXAMPLES.md](EXAMPLES.md)** builds the same chat by hand in the
 web UI, and adds speech transcription. For image editing from a reference
-photo, **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**; for text-to-image,
+photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
 **[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
 **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the pipelines it
 describes.

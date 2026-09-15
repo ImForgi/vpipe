@@ -1062,48 +1062,101 @@ MetalKrea2Vae::autotune_conv3x3_(MetalCompute* mc,
   }
 }
 
+// Does a decode at this latent size GATHER? The hardware conv takes every
+// 3x3 in this decoder -- the 32-channel destination tile took the
+// full-resolution base-96 ones and the small-cout conv took conv_out -- so
+// on a GPU that has it, at a grid it accepts, no im2col band is allocated
+// at all. Off it, or at a grid it declines, every 3x3 falls back and the
+// band is the largest single buffer in the decode.
+bool
+MetalKrea2Vae::decode_gathers_(int h8, int w8) const noexcept
+{
+  const std::size_t Hout = (std::size_t)h8 * 8;
+  const std::size_t Wout = (std::size_t)w8 * 8;
+  const std::size_t base = (std::size_t)_cfg.base_dim;
+  return !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (h8 % 8) != 0 ||
+         (w8 % 8) != 0 ||
+         base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout > 0x7fffffffull;
+}
+
+// The im2col band: the scratch a gathering 3x3 streams its [H*W, 9*cin]
+// through, sized for the widest cin the decoder has (base*dim_mult[1]).
+//
+// THE CAP IS THE POINT. The band used to be sized from whatever headroom
+// was left after the preflight's reserve, which made the two numbers
+// unable to agree by construction: the preflight books a figure, the band
+// then grows to fill everything the box has BESIDE that figure, and the
+// peak is the sum. MEASURED at 512x512 on a 64 GB M4 (no hardware conv, so
+// every conv gathers): a 906 MB band against a 648 MB book, for a 1104 MB
+// peak -- the preflight under-booking by 456 MB, which is exactly the
+// mid-decode OOM it exists to prevent.
+//
+// A band is a GEMM M-dimension and nothing else, so paying for a bigger
+// one buys nothing. MEASURED, same box, best-of-3: 512x512 890.5 ms and
+// 1024x1024 3597.7 ms with an 8192-row band (28 / 56 MB) against 903.2 and
+// 3603.9 ms with the full image in one band (906 MB / 3.6 GB). So cap it,
+// book the cap, and let the headroom only ever shrink it from there.
+std::size_t
+MetalKrea2Vae::decode_band_bytes_(int h8, int w8) const noexcept
+{
+  const std::size_t Hout = (std::size_t)h8 * 8;
+  const std::size_t Wout = (std::size_t)w8 * 8;
+  const std::size_t wide =
+      (std::size_t)_cfg.base_dim * (std::size_t)_cfg.dim_mult[1];
+  const std::size_t full = Hout * Wout * 9 * wide * 2;      // whole image
+  const std::size_t floor_ = Wout * 9 * wide * 8 * 2;       // 8 output rows
+  if (full <= kDecodeBandMax) { return full; }
+  return std::max(floor_, kDecodeBandMax);
+}
+
 std::size_t
 MetalKrea2Vae::decode_peak_bytes(int h8, int w8) const noexcept
 {
   // Preflight estimate (f16 = 2 bytes/elt). The per-up-block command-buffer
   // split (default on; VPIPE_KREA2_NO_VAE_SPLIT opts out) commits + frees each
   // up-level before the next, so the resident peak is ONE level's working set,
-  // not the summed up-path. That peak is the top-res im2col scratch
-  // [Hout*Wout, 9*base]: conv_out (3 ch) and the top-level resblock convs
-  // (base ch) can't use the hw conv (cout % 64 != 0), so they fall back to
-  // im2col even in hwconv mode -- it is the single largest buffer. Budget it +
-  // ~50% for the level's input/output/carry activations. A miss here is caught
-  // cleanly by the per-level wait_ok() backstop (never a corrupt image), so
-  // this need not be wildly conservative -- an over-estimate just rejects
-  // feasible decodes on a memory-bounded box, which is what regressed 1024px.
+  // not the summed up-path -- and the top level's is the largest, since
+  // channels grow only as fast as the spatial size shrinks. Two terms:
+  //
+  //   activations  the level's input / output / carry, all
+  //                full-resolution base-channel f16 tensors. MEASURED at
+  //                a small band, so the band does not hide inside the
+  //                figure: 239 MB at 512x512 and 931 MB at 1024x1024,
+  //                i.e. five such tensors at both sizes. Booked at six --
+  //                or at seventeen with the buffer pool off, see below.
+  //   band         the im2col scratch, when anything gathers. Capped, so
+  //                this is a number the decode can be held to rather than
+  //                one it grows past -- see decode_band_bytes_().
+  //
+  // A miss here is caught cleanly by the per-level wait_ok() backstop (never
+  // a corrupt image), so this need not be wildly conservative -- an
+  // over-estimate just rejects feasible decodes on a memory-bounded box,
+  // which is what regressed 1024px.
   if (h8 <= 0 || w8 <= 0) { return 0; }
   const std::size_t Hout = (std::size_t)h8 * 8;
   const std::size_t Wout = (std::size_t)w8 * 8;
   const std::size_t base = (std::size_t)_cfg.base_dim;
-  const std::size_t im2col = Hout * Wout * 9 * base * 2;
-  if (std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") == nullptr) {
-    // ON THE HARDWARE CONV nothing gathers: every level's grid is a multiple
-    // of 8 when the latent's is, the 32-channel tile takes the base-96
-    // full-resolution convs, and conv_out takes the small-cout conv -- so
-    // the im2col band is never allocated and the peak is the top level's
-    // activations. MEASURED (M5, krea2_vae.decode_bench): 240 MB at 512x512
-    // and 960 MB at 1024x1024, five full-resolution base-channel f16
-    // tensors at both sizes; booked at five and a half.
-    const bool gathers =
-        !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (h8 % 8) != 0 ||
-        (w8 % 8) != 0 ||
-        base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout > 0x7fffffffull;
-    if (!gathers) {
-      const std::size_t top = Hout * Wout * base * 2;
-      return top * 5 + top / 2;
-    }
-    return im2col + im2col / 2;                        // split on: one level
+  if (std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") != nullptr) {
+    // Split off: the whole up-path is one command buffer -- keep the summed,
+    // conservative figure (~16 GB at 1024px; the split is why it fits at
+    // all). The band is on top of it here too: with the pool ALSO off the
+    // summed figure is not conservative at all, and MEASURED at 512x512 it
+    // was 1778 MB against 1728 booked.
+    const std::size_t top =
+        Hout * Wout * (base * (std::size_t)_cfg.dim_mult[1]) * 2;
+    return (_use_hwconv ? top * 10 : top * 9 * 2) +
+           (decode_gathers_(h8, w8) ? decode_band_bytes_(h8, w8) : 0);
   }
-  // Split off: the whole up-path is one command buffer -- keep the summed,
-  // conservative figure (~16 GB at 1024px; the split is why it fits at all).
-  const std::size_t top =
-      Hout * Wout * (base * (std::size_t)_cfg.dim_mult[1]) * 2;
-  return _use_hwconv ? top * 10 : top * 9 * 2;
+  const std::size_t top = Hout * Wout * base * 2;
+  // Without the buffer pool (VPIPE_KREA2_NO_VAE_POOL) nothing is reused, so
+  // a level holds its whole op chain rather than its concurrent working
+  // set. MEASURED the same way: 768 MB at 512x512 and 3072 MB at 1024x1024,
+  // i.e. SIXTEEN of those tensors at both sizes against five with the pool.
+  // Booked at seventeen.
+  const std::size_t acts =
+      std::getenv("VPIPE_KREA2_NO_VAE_POOL") != nullptr ? 17 : 6;
+  return top * acts +
+         (decode_gathers_(h8, w8) ? decode_band_bytes_(h8, w8) : 0);
 }
 
 int
@@ -1342,21 +1395,25 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   // scratch is bounded to ONE band (a full-res conv is otherwise multi-GB), on
   // BOTH the hw-conv path (conv_out + top resblocks fall back to im2col) and the
   // non-matrix-core M4 path (all convs). `im2col_cap` (ELEMS) caps a band by
-  // memory (reserve the level activation pool = decode_peak_bytes, band gets the
-  // rest of the headroom) AND correctness (k_safe_band rows, matmul2d
-  // M-corruption). Each conv derives band rows = im2col_cap / (9*cin), re-capped
-  // at k_safe_band. VPIPE_KREA2_VAE_BAND_ROWS overrides the band.
+  // memory AND correctness (k_safe_band rows, matmul2d M-corruption). Each
+  // conv derives band rows = im2col_cap / (9*cin), re-capped at k_safe_band.
+  // VPIPE_KREA2_VAE_BAND_ROWS overrides the band.
+  //
+  // The memory cap is decode_band_bytes_() -- THE SAME FIGURE THE PREFLIGHT
+  // BOOKED, which is what makes the preflight an upper bound rather than a
+  // guess. The headroom can only take it DOWN from there: the band used to
+  // be handed the headroom left over BESIDE the reserve, so the decode's
+  // peak grew with the size of the box while the book stayed put.
   const std::size_t wide = (std::size_t)base * _cfg.dim_mult[1];   // widest cin
   const std::size_t k_safe_band =
       _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)Hout * Wout;
-  const std::size_t full_band = (std::size_t)Hout * Wout * 9 * wide;
   const std::size_t floor_band = (std::size_t)Wout * 9 * wide * 8;   // 8 rows
-  std::size_t im2col_cap = full_band;
+  std::size_t im2col_cap = decode_band_bytes_(h8, w8) / 2;
   if (decode_headroom > 0) {
-    const std::size_t reserve = decode_peak_bytes(h8, w8);   // pool reserve bytes
+    const std::size_t reserve = decode_peak_bytes(h8, w8);
     const std::size_t avail_el = decode_headroom > reserve
         ? (decode_headroom - reserve) / 2 : 0;
-    im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+    im2col_cap = std::min(im2col_cap, std::max(floor_band, avail_el));
   }
   im2col_cap = std::min(im2col_cap, k_safe_band * 9 * wide);
   if (const char* e = std::getenv("VPIPE_KREA2_VAE_BAND_ROWS")) {
@@ -1364,11 +1421,10 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     if (r > 0) { im2col_cap = (std::size_t)r * 9 * wide; }
   }
   // Allocated by the first conv that GATHERS, or by the tune when it has a
-  // shape to probe. On a GPU with the hardware conv no decoder conv gathers
-  // at an ordinary size -- the 32-channel tile took the full-resolution
-  // 96-channel ones -- and the eager scratch was a band of up to ~906 MB
-  // that nothing read: MEASURED at 512x512, a 1104 MB peak against the 648
-  // MB the preflight booked.
+  // shape to probe -- never eagerly. On a GPU with the hardware conv no
+  // decoder conv gathers at an ordinary size (the 32-channel tile took the
+  // full-resolution 96-channel ones), and an eager scratch was then a band
+  // nothing ever read.
   SharedBuffer im2col_scratch;
   // First decode: measure the 3x3 fallback. Over THIS scratch and cap, so the
   // probe bands exactly as the convs below it will.
@@ -1721,20 +1777,24 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
   // conv's [OH*OW, 9*cin] in output-row bands so the shared col scratch is one
   // band, not the full-res base-channel [hw, 9*base] (multi-GB at high res).
   // Peak full-res im2col is the base-ch s1 convs; deeper levels shrink. Cap the
-  // band by memory (headroom -- no encode preflight, query it here) AND
-  // correctness (k_safe_band rows, matmul2d M-corruption).
+  // band by kDecodeBandMax -- a band is a GEMM M-dimension and a bigger one
+  // measured no faster, so it is capped outright rather than handed the
+  // headroom (which made a decode's peak a function of the size of the box;
+  // see decode_band_bytes_) -- AND by correctness (k_safe_band rows,
+  // matmul2d M-corruption). Headroom only ever shrinks it further.
   const std::size_t k_safe_band =
       _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : hw;
   const std::size_t full_band = hw * 9 * (std::size_t)base;
   const std::size_t floor_band = (std::size_t)W * 9 * base * 8;
   const std::size_t act_reserve = hw * (std::size_t)base * 7;
-  std::size_t im2col_cap = full_band;
+  std::size_t im2col_cap =
+      std::min(full_band, std::max(floor_band, kDecodeBandMax / 2));
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
     if (mb.recommended != 0) {
       const std::size_t avail_el = mb.headroom > act_reserve * 2
           ? (mb.headroom - act_reserve * 2) / 2 : 0;
-      im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+      im2col_cap = std::min(im2col_cap, std::max(floor_band, avail_el));
     }
   }
   im2col_cap = std::min(im2col_cap, k_safe_band * 9 * (std::size_t)base);

@@ -5,6 +5,8 @@
 set(LOCAL_SOURCES
   coreml-cpp/coreml-private.cc
   coreml-model-manager.cc
+  ane-worker.cc
+  ane-emitter.cc
 )
 set(LOCAL_HEADERS
   coreml-cpp/CoreML.hpp
@@ -35,6 +37,8 @@ set(LOCAL_HEADERS
   coreml-cpp/CoreMLUpdateProgressHandlers.hpp
   coreml-cpp/CoreMLUpdateTask.hpp
   coreml-model-manager.h
+  ane-worker.h
+  ane-emitter.h
 )
 
 list(TRANSFORM LOCAL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")

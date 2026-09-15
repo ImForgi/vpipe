@@ -54,12 +54,31 @@ WiredPool::wire_one(metal_compute::MetalCompute* mc,
   return mgr->wire_into_pool(b);
 }
 
+bool
+WiredPool::refused(metal_compute::MetalCompute* mc,
+                   const metal_compute::SharedBuffer& b) const
+{
+  if (!GenerativeModelManager::pool_wirable(b)) { return false; }
+  auto* mgr = manager_(mc);
+  return mgr != nullptr && !mgr->wired_pool_can_take(b.byte_size());
+}
+
 void
 WiredPool::note_wired(metal_compute::MetalCompute* mc, std::size_t got,
                       std::size_t want)
 {
   _wired += got;
   if (got >= want || !_on) { return; }
+  // A SHORTFALL IS NOT ALWAYS A REFUSAL. The pool never wires buffers
+  // below GenerativeModelManager::kMinWiredBytes (heap slices, a few
+  // scalars), and every block carries some, so `want` -- the block's whole
+  // resident size -- always exceeds what a fully wired block reports. Only
+  // a pool that can no longer take the missing bytes (full, or capped by a
+  // real shortage) has said no; otherwise this block is as wired as the
+  // pool will make it, and growth goes on.
+  if (auto* mgr = manager_(mc)) {
+    if (mgr->wired_pool_can_take(want - got)) { return; }
+  }
   _budget   = _wired;
   _retry    = true;
   _retry_at = mc != nullptr ? mc->memory_budget().available_physical : 0;

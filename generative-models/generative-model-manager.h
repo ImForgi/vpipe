@@ -555,11 +555,36 @@ public:
   bool        wired_pool_can_take(std::size_t bytes) const;
 
   // Wire `b` and charge it to the pool, returning the bytes actually
-  // wired (0 when wiring is off, the pool is full, or mlock refused).
-  // A refusal COLLAPSES the pool to what is held, because a box that
-  // said no once will say no again and the alternative is a caller
-  // spinning against a ceiling it can never reach.
+  // wired (0 when wiring is off, the pool is full, `b` is not a buffer the
+  // pool wires -- see pool_wirable() -- or mlock refused).
+  //
+  // Only a SHORTAGE collapses the pool to what is held: ENOMEM / EAGAIN on
+  // anonymous memory, because a box that said no once will say no again
+  // and the alternative is a caller spinning against a ceiling it can
+  // never reach. A refusal that is the BUFFER's own property -- a
+  // file-backed page, a heap slice's EPERM -- skips that buffer and leaves
+  // the ceiling alone. A caller tells the two apart afterwards with
+  // wired_pool_can_take(): still true means "skipped, go on".
   std::size_t wire_into_pool(metal_compute::SharedBuffer& b);
+
+  // Buffers below this are not a pool question and are never wired. They
+  // come from MetalCompute's shared small-buffer heap -- a slice of pages
+  // the heap owns -- or are a few scalars, and mlock on them fails for
+  // reasons that say nothing about the box. MEASURED on an M4 Pro:
+  // identical LTX-2.5 runs froze the pool at 5.7, 7.6 and 15.6 GB because
+  // the first refusal was a 64-byte buffer (ENOMEM) or an 8 KB heap slice
+  // (EPERM), and the collapse left every later block unwired.
+  static constexpr std::size_t kMinWiredBytes = 64 * 1024;
+  static bool pool_wirable(const metal_compute::SharedBuffer& b) noexcept;
+
+  // Memory WIRED ON THIS PROCESS'S BEHALF by someone else -- CoreML pins
+  // an ANE module's program and IOSurface weight slots itself (MEASURED
+  // ~500 MB at LTX-2.5's 4096x16384 feed-forward) -- charged against the
+  // pool so every model sizing its resident set plans around it. Not
+  // capped: the pages are wired whether or not the pool agrees, and an
+  // honest overdraft beats a pool that believes it has room.
+  void        charge_external_wired(std::size_t bytes);
+  void        release_external_wired(std::size_t bytes);
 
   // Give `b`'s pages back: munlock, and drop the pool's charge for them.
   //

@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
 
 #include "generative-models/shared/i8-gemm.h"
@@ -229,7 +230,8 @@ MetalBooguTransformer::wire_block_(DoubleBlock& b, bool on)
   auto one = [&](metal_compute::SharedBuffer& p) {
     if (stop) { return; }
     const std::size_t n = _wire.wire_one(_mc, p, on);
-    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
       stop = true;
       return;
     }
@@ -256,7 +258,8 @@ MetalBooguTransformer::wire_block_(Block& b, bool on)
   auto one = [&](metal_compute::SharedBuffer& p) {
     if (stop) { return; }
     const std::size_t n = _wire.wire_one(_mc, p, on);
-    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
       stop = true;
       return;
     }
@@ -345,6 +348,10 @@ MetalBooguTransformer::resident_pages_(std::size_t* examined,
     // 0, which the caller reads as "no evidence" rather than as a
     // shortfall, and that is the correct answer.
     if (p.is_wired()) { return; }
+    // Nor one below the pool's minimum: never wired, heap-owned pages that
+    // read partly out of RAM for reasons unrelated to this block. See
+    // GenerativeModelManager::pool_wirable.
+    if (!GenerativeModelManager::pool_wirable(p)) { return; }
     const auto r = p.page_residency(64);
     if (!r.valid) { return; }
     *examined += r.examined;

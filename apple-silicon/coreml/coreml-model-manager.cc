@@ -621,10 +621,16 @@ CoreMLLoadedModel::predict(span<const CoreMLPredictInput> inputs,
       NS::Array* shp = ns_num_array_(in.shape);
       NS::Array* str = ns_num_array_(strides);
       err = nullptr;
-      auto* ma = CML::MultiArray::alloc()->initWithDataPointer(
-          const_cast<void*>(in.data), shp, to_marray_dtype_(in.dtype),
-          str, /*deallocator=*/nullptr, &err);
-      if ((err || !ma) && in.strides.empty()) {
+      CML::MultiArray* ma = nullptr;
+      if (in.pixel_buffer != nullptr) {
+        ma = CML::MultiArray::alloc()->initWithPixelBuffer(in.pixel_buffer,
+                                                           shp);
+      } else {
+        ma = CML::MultiArray::alloc()->initWithDataPointer(
+            const_cast<void*>(in.data), shp, to_marray_dtype_(in.dtype),
+            str, /*deallocator=*/nullptr, &err);
+      }
+      if ((err || !ma) && in.strides.empty() && in.pixel_buffer == nullptr) {
         // Fallback (contiguous inputs only): alloc + memcpy.
         err = nullptr;
         ma = CML::MultiArray::alloc()->initWithShape(
@@ -811,7 +817,10 @@ CoreMLModelManager::KeyHash::operator()(const Key& k) const noexcept
 CoreMLModelManager::CoreMLModelManager(const LogSinkIntf* session)
   : _log(session)
 {
+  _ane.reset(new AneWorker());
 }
+
+CoreMLModelManager::~CoreMLModelManager() = default;
 
 shared_ptr<CoreMLLoadedModel>
 CoreMLModelManager::load(string_view path, int compute_units)

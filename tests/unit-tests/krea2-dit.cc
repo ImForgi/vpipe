@@ -432,6 +432,221 @@ TEST(krea2_dit, forward_dit_i8_matches_f16)
 // on the RoPE and folded into the joint attention. A dead ref path would give a
 // byte-identical result. Note: this checks the MECHANISM is wired, not that a
 // text-to-image checkpoint semantically uses references. Same random inputs.
+// The ANE feed-forward, against the same forward with the tier off.
+//
+// Rows are independent in a feed-forward, so giving the ANE a band of
+// them is EXACT arithmetic -- the only difference is fp16 on the ANE
+// against bf16 on the GPU, and that is safe here because the FFN is
+// self-contained: only its output re-enters the residual stream, and
+// that addition stays on the GPU. So this is a PRECISION comparison,
+// not a correctness one, and a broken split (wrong rows, wrong offset,
+// stale `o`) lands nowhere near the bar.
+//
+// Runs on the shared runtime-weight module the tier uses -- compiled once
+// per shape (cached after the first), weights staged per block into
+// IOSurface slots -- so it needs no templates and bakes nothing. Capped at
+// the two blocks `stop` runs.
+TEST(krea2_dit, forward_dit_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // Default grid 64 == 1024x1024, seq 4160: the ANE path is CHUNKED at
+  // 2048 rows, so a smaller grid gives it fewer than one whole chunk
+  // and the tier correctly switches itself off -- which this test then
+  // reads as "the tier did nothing", because it asserts the two runs
+  // DIFFER.
+  const char* gs = std::getenv("VPIPE_KREA2_ANE_GRID");
+  const int text_seq = 64;
+  const int grid = (gs != nullptr) ? std::atoi(gs) : 64;
+  const int img_seq = grid * grid;
+  const int stop = 1;                        // blocks 0..1
+  const int seq = text_seq + img_seq;
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t sd = 0x51ced00du;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      sd = sd * 1664525u + 1013904223u;
+      e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)seq * HID;
+
+  const char* lora_path = std::getenv("VPIPE_KREA2_ANE_LORA");
+  auto run = [&](bool ane, bool with_lora) {
+    MetalKrea2Transformer::Config cfg = base;
+    if (ane) {
+      cfg.session       = &sess;
+      cfg.ane_rows      = 0.5f;     // 544 of 1088
+      cfg.ane_layers    = stop + 1;
+      cfg.ane_qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+    }
+    std::vector<float> out;
+    // VPIPE_KREA2_ANE_LORA: a runtime adapter on BOTH arms. The GPU applies
+    // it as side GEMMs; the ANE's rows must get it merged into their staged
+    // weights, or this comparison measures the adapter rather than fp16.
+    std::vector<MetalKrea2Transformer::LoraSpec> loras;
+    if (with_lora && lora_path != nullptr) {
+      MetalKrea2Transformer::LoraSpec sp;
+      sp.path = lora_path;
+      loras.push_back(sp);
+    }
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg,
+                                         /*stream_blocks=*/true, loras);
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_gpu = run(false, true);
+  const std::vector<float> v_ane = run(true, true);
+  ASSERT_TRUE(!v_gpu.empty());
+  ASSERT_TRUE(v_ane.size() == v_gpu.size());
+  if (v_ane.size() != v_gpu.size()) { return; }
+  const double r = rel_l2_(v_ane.data(), v_gpu.data(), v_ane.size());
+  std::printf("[krea2_dit] forward_dit ANE-vs-GPU rel-L2 = %.6g "
+              "(%dx%d, seq=%d)\n", r, grid * 16, grid * 16, seq);
+  // The two runs must DIFFER -- an identical result means the tier
+  // silently did nothing, which is the failure mode a tolerance alone
+  // would pass.
+  EXPECT_TRUE(r > 0.0);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  // With an adapter, the CONTROLS: how far the adapter itself moves the
+  // GPU's output, and the ANE's fp16 floor on the same run WITHOUT it. An
+  // ANE whose rows dropped the adapter adds roughly that effect (over its
+  // share of the rows) on top of the floor; one that merged it sits AT the
+  // floor. The floor is measured, not assumed: with q/k/v/gate on the ANE
+  // too, a 4-bit checkpoint's rises to ~0.011 (the q/k fp16 error goes
+  // through the q/k norms and the attention), above half the ~0.016 effect
+  // a fixed fraction would have demanded.
+  if (lora_path != nullptr) {
+    const std::vector<float> v_base = run(false, false);
+    const std::vector<float> v_ane_base = run(true, false);
+    ASSERT_TRUE(v_base.size() == v_gpu.size() &&
+                v_ane_base.size() == v_gpu.size());
+    if (v_base.size() != v_gpu.size() ||
+        v_ane_base.size() != v_gpu.size()) {
+      return;
+    }
+    const double eff = rel_l2_(v_base.data(), v_gpu.data(), v_gpu.size());
+    const double floor = rel_l2_(v_ane_base.data(), v_base.data(),
+                                 v_base.size());
+    std::printf("[krea2_dit] adapter effect on the GPU output rel-L2 = %.6g, "
+                "ANE fp16 floor without it %.6g (ANE-vs-GPU with it %.6g)\n",
+                eff, floor, r);
+    EXPECT_TRUE(eff > 0.0);
+    EXPECT_TRUE(r < 1.25 * floor + 1e-4);
+  }
+}
+
+// Does the ANE split actually make the block faster?
+//
+// Times the SECOND forward of each arm, so the one-time module compile
+// and first staging are excluded and what is left is the steady
+// state a real run would see. Opt-in, since
+// each arm loads the DiT again.
+TEST(krea2_dit, ane_split_is_faster)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || std::getenv("VPIPE_KREA2_ANE_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // Krea-2 patches 2x2 over an 8x VAE downsample, so one token is 16
+  // pixels: grid 32 == 512x512, 64 == 1024x1024, 128 == 2048x2048.
+  // The default is the SMALL one because it is quick; 1024x1024 is the
+  // case that matters and is where the GPU's feed-forward should stop
+  // being insensitive to row count.
+  const char* gs = std::getenv("VPIPE_KREA2_ANE_GRID");
+  const int text_seq = 64;
+  const int grid = (gs != nullptr) ? std::atoi(gs) : 32;
+  const int img_seq = grid * grid, stop = 1;
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t sd = 0x1a2b3c4du;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      sd = sd * 1664525u + 1013904223u;
+      e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+
+  auto timed = [&](bool ane) {
+    MetalKrea2Transformer::Config cfg = base;
+    if (ane) {
+      cfg.session = &sess;
+      // Sweepable. The CHUNKED path rounds this down to whole 2048-row
+      // chunks, so one template serves every ratio.
+      // UNSET means 0, which the family reads as "auto-balance".
+      const char* rr = std::getenv("VPIPE_KREA2_ANE_ROWS");
+      cfg.ane_rows = (rr != nullptr) ? (float)std::atof(rr) : 0.0f;
+      cfg.ane_layers = stop + 1;
+      cfg.ane_qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+    }
+    // PRELOADED, not streamed: a streamed run re-reads ~850 MB per
+    // block per forward, which dwarfs the ~100 ms of feed-forward and
+    // hides the thing being measured. The first attempt timed 1868 ms
+    // per block that way and read 0.93x -- disk, not compute.
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, false);
+    if (m == nullptr) { return 0.0; }
+    m->forward_dit(buf(txt), text_seq, buf(lat), img_seq, grid, grid, 0.5f,
+                   stop);                      // warm + bake
+    const auto t0 = std::chrono::steady_clock::now();
+    m->forward_dit(buf(txt), text_seq, buf(lat), img_seq, grid, grid, 0.5f,
+                   stop);
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+  };
+
+  const double gpu = timed(false);
+  const double ane = timed(true);
+  const char* rs = std::getenv("VPIPE_KREA2_ANE_ROWS");
+  const double share = (rs != nullptr) ? std::atof(rs) : 0.5;
+  std::printf("[krea2_dit] %dx%d, %d blocks, seq %d: GPU-only %.1f ms | "
+              "ANE split (%d/%d) %.1f ms | %.3fx\n", grid * 16, grid * 16,
+              stop + 1, text_seq + img_seq, gpu,
+              (int)((text_seq + img_seq) * share), text_seq + img_seq, ane,
+              gpu > 0 ? gpu / ane : 0.0);
+  EXPECT_TRUE(gpu > 0.0 && ane > 0.0);
+}
+
 TEST(krea2_dit, forward_dit_reference_images_change_output)
 {
   const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");

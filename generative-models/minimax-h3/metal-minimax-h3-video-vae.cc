@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -948,6 +949,94 @@ MetalMiniMaxH3VideoVae::ensure_scratch_(int rows, int voxels)
   return true;
 }
 
+// ---- the ANE tier ---------------------------------------------------
+
+std::size_t
+MetalMiniMaxH3VideoVae::ane_runtime_bytes(const Config& c) noexcept
+{
+  // One decode() tile: a chunk's latent frames over one spatial tile, plus
+  // the register and zero rows.
+  const int t = c.tokens_per_chunk() + c.token_overlap();
+  const int e = std::max(1, c.tile_size / std::max(1, c.patch));
+  const int rows = t * e * e + c.n_register + 1;
+  const std::size_t biases =
+      (std::size_t)(2 * c.ffn_inner + c.dim) * 2 * 2;   // slots + staging
+  return AneFeedForward::runtime_bytes(c.dim, c.ffn_inner, rows,
+                                       ane_chunk_rows()) + biases;
+}
+
+int
+MetalMiniMaxH3VideoVae::ane_chunk_rows() noexcept
+{
+  constexpr const char* kEnv = "VPIPE_H3_VVAE_ANE_CHUNK";
+  return std::getenv(kEnv) != nullptr ? AneFeedForward::chunk_rows(kEnv)
+                                      : 1024;
+}
+
+bool
+MetalMiniMaxH3VideoVae::ane_setup_(int rows)
+{
+  if (_ane_tried) { return _ane != nullptr; }
+  _ane_tried = true;
+  if (_mc->session() == nullptr || rows <= 0) { return false; }
+  AneFeedForward::Options o;
+  o.session = _mc->session();
+  o.mc      = _mc;
+  o.tag     = "minimax-h3-vae";
+  o.hidden  = _cfg.dim;
+  o.ffn     = _cfg.ffn_inner;
+  o.seq     = rows;
+  o.rows    = _cfg.ane_rows;
+  o.chunk   = ane_chunk_rows();
+  o.biases  = true;
+  o.profile = std::getenv("VPIPE_H3_VVAE_ANE_PROFILE") != nullptr;
+  _ane = AneFeedForward::create(o);
+  return _ane != nullptr;
+}
+
+bool
+MetalMiniMaxH3VideoVae::ane_eligible_(int L, const Block& b)
+{
+  if (_ane == nullptr) { return false; }
+  const int cap = (_cfg.ane_layers > 0)
+                      ? std::min(_cfg.ane_layers, _cfg.n_layers)
+                      : _cfg.n_layers;
+  if (L >= cap) { return false; }
+  auto stageable = [](const Linear& l) {
+    if (l.empty()) { return false; }
+    if (!l.quantized) { return true; }
+    return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
+           !l.qbias.empty();
+  };
+  const bool ok = stageable(b.w1) && stageable(b.w2);
+  if (!ok && !_ane_skip_warned && _mc->session() != nullptr) {
+    _ane_skip_warned = true;
+    _mc->session()->warn(fmt(
+        "minimax-h3-vae: block {} has no fp16 or 4/8-bit affine feed-forward "
+        "to stage, so it (and any like it) keeps the GPU feed-forward", L));
+  }
+  return ok;
+}
+
+void
+MetalMiniMaxH3VideoVae::ane_stage_(int L, const Block& b)
+{
+  auto view = [](const Linear& l, std::size_t offset) {
+    AneFfnSource s;
+    s.w         = &l.w;
+    s.codes     = &l.codes;
+    s.scales    = &l.scales;
+    s.qbias     = &l.qbias;
+    s.quantized = l.quantized;
+    s.bits      = l.bits;
+    s.offset    = offset;
+    s.bias      = l.b.empty() ? nullptr : &l.b;
+    return s;
+  };
+  _ane->stage(L, view(b.w1, 0), view(b.w1, (std::size_t)_cfg.ffn_inner),
+              view(b.w2, 0), _quant_group);
+}
+
 SharedBuffer
 MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
                                std::string* err)
@@ -1036,6 +1125,9 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
   }
   if (use_steel) { use_steel = _fn_attn.valid(); }
 
+  // The ANE feed-forward tier, armed once from the first tile's rows.
+  const bool ane_on = _cfg.ane_ffn && ane_setup_(rows);
+  using Clk = std::chrono::steady_clock;
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -1061,6 +1153,22 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
 
     for (int L = 0; L < c.n_layers; ++L) {
       const Block& b = _blocks[(std::size_t)L];
+      // Stage this block's feed-forward for the ANE now, on its worker, so
+      // the conversion runs under the attention encoded below.
+      const AneFeedForward::Plan ane_plan =
+          ane_on && ane_eligible_(L, b) ? _ane->plan_block()
+                                        : AneFeedForward::Plan::kGpu;
+      const bool ane_block = ane_plan == AneFeedForward::Plan::kSplit;
+      const bool ane_probe = ane_plan == AneFeedForward::Plan::kProbe;
+      if ((ane_block || ane_probe) && (L == 0 || _ane->needs_barrier())) {
+        // A measured layer after unsplit work -- GPU-mode layers, or the
+        // embedding ahead of layer 0: drain it first. See
+        // AneFeedForward::needs_barrier.
+        enc.end();
+        stream.commit().wait();
+        enc = stream.begin_compute();
+      }
+      if (ane_block) { ane_stage_(L, b); }
       enc.set_function(_fn_rms);
       enc.set_buffer(0, s.x); enc.set_buffer(1, b.n1); enc.set_buffer(2, s.nm);
       enc.set_constant(3, D); enc.set_constant(4, c.norm_eps);
@@ -1133,12 +1241,59 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
       enc.set_buffer(0, s.x); enc.set_buffer(1, b.n2); enc.set_buffer(2, s.nm);
       enc.set_constant(3, D); enc.set_constant(4, c.norm_eps);
       enc.dispatch({256, (unsigned)rows, 1}, {256, 1, 1});
-      gemm_(enc, s.nm, 0, b.w1, s.ff, 0, rows, 2 * FF, D);
+      // ---- the ANE split -------------------------------------------
+      // The ANE takes the TAIL rows of s.nm and the GPU the head: every
+      // kernel below reads from row 0 and the feed-forward is
+      // row-independent, so the split is exact. s.nm is input and output of
+      // both halves, on disjoint rows. The attention above is committed
+      // WITHOUT waiting before the staging job is joined, so the two
+      // overlap; the ANE starts before the GPU's half is encoded, so it
+      // hides behind that whole half.
+      int a_rows = 0;
+      double ane_drain_ms = 0.0;
+      if (ane_block || ane_probe) {
+        const auto t_d0 = Clk::now();
+        enc.end();
+        CommandStream::Fence afence = stream.commit();
+        const bool staged = ane_block && _ane->join_stage(L);
+        afence.wait();
+        ane_drain_ms = std::chrono::duration<double, std::milli>(
+            Clk::now() - t_d0).count();
+        if (staged) {
+          a_rows = _ane->begin(s.nm, s.nm, rows);
+        } else if (ane_block && _mc->session() != nullptr) {
+          _mc->session()->warn(fmt(
+              "minimax-h3-vae: staging block {}'s feed-forward for the ANE "
+              "failed; it keeps the GPU", L));
+        }
+        enc = stream.begin_compute();
+      }
+      const int g_rows = rows - a_rows;      // the ANE leaves the GPU >= 1
+      const auto t_g0 = Clk::now();
+      gemm_(enc, s.nm, 0, b.w1, s.ff, 0, g_rows, 2 * FF, D);
       enc.set_function(_fn_swiglu);
       enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
-      enc.set_constant(2, rows); enc.set_constant(3, FF);
-      enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
-      gemm_(enc, s.qkv, 0, b.w2, s.nm, 0, rows, D, FF);
+      enc.set_constant(2, g_rows); enc.set_constant(3, FF);
+      enc.dispatch({(unsigned)(g_rows * FF), 1, 1}, {256, 1, 1});
+      gemm_(enc, s.qkv, 0, b.w2, s.nm, 0, g_rows, D, FF);
+      if (a_rows > 0) {
+        enc.end();
+        stream.commit().wait();
+        const double gpu_ms =
+            _ane->timing() ? std::chrono::duration<double, std::milli>(
+                                 Clk::now() - t_g0).count()
+                           : 0.0;
+        (void)_ane->finish(L, rows, gpu_ms, ane_drain_ms);
+        enc = stream.begin_compute();
+      } else if (ane_probe) {
+        // The GPU over every row, drained, for the on/off measurement.
+        enc.end();
+        stream.commit().wait();
+        _ane->note_probe(ane_drain_ms,
+                         std::chrono::duration<double, std::milli>(
+                             Clk::now() - t_g0).count());
+        enc = stream.begin_compute();
+      }
       enc.set_function(_fn_gated);
       enc.set_buffer(0, s.x); enc.set_buffer(1, b.s2); enc.set_buffer(2, s.nm);
       enc.set_constant(3, D); enc.set_constant(4, rows * D);

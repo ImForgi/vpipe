@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_MINIMAX_H3_METAL_MINIMAX_H3_VIDEO_VAE_H
 #define GENERATIVE_MODELS_MINIMAX_H3_METAL_MINIMAX_H3_VIDEO_VAE_H
 
+#include "generative-models/shared/ane-ffn.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
@@ -92,6 +93,18 @@ class MetalMiniMaxH3VideoVae {
     // merely seaming differently.
     int tile_size        = 256;
     int tile_overlap_min = 64;
+
+    // ---- the ANE tier (LOSSY, opt-in) -------------------------------
+    // The decoder blocks' feed-forward split between the GPU and the Neural
+    // Engine by ROWS, per tile, per block (see shared/ane-ffn.h). About 70%
+    // of the decode's arithmetic is that feed-forward; attention stays on the
+    // GPU, where the ANE measured 1.8 TOPS for a whole block. `ane_rows` is
+    // the ANE's share, 0 auto-balancing; `ane_layers` caps the blocks, 0 all.
+    // Set from vae-decode's `ane_*` keys once the plan has granted the
+    // module; VPIPE_H3_VVAE_ANE_CHUNK / VPIPE_H3_VVAE_ANE_PROFILE for tuning.
+    bool  ane_ffn    = false;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
     // Per-channel latent whitening. The DiT works in NORMALIZED latent
     // space -- `(z - mean) / std` -- so a decode has to undo it first.
     // Empty when the checkpoint states neither, which means identity.
@@ -243,6 +256,16 @@ class MetalMiniMaxH3VideoVae {
   //
   // Fires on the encode thread between tiles; must be cheap and must not
   // re-enter the decoder. See VaeTileProgressFn for the counting rule.
+  // Bytes the ANE feed-forward tier holds for this config's tile shape;
+  // see AneFeedForward::runtime_bytes. Static: the plan asks before load.
+  static std::size_t ane_runtime_bytes(const Config& c) noexcept;
+  // Rows per ANE predict: VPIPE_H3_VVAE_ANE_CHUNK, or 1024 -- a tile is
+  // 1797 rows, so one 1024-row chunk is a 57% share, near the balance.
+  static int ane_chunk_rows() noexcept;
+  // Whether the tier tried to arm, and whether it did.
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept { return _ane != nullptr; }
+
   void set_tile_progress(genai::VaeTileProgressFn fn)
   {
     _tile_progress = std::move(fn);
@@ -336,6 +359,17 @@ class MetalMiniMaxH3VideoVae {
   };
   bool ensure_scratch_(int rows, int voxels);
   Scratch _s;
+
+  // ---- the ANE tier ------------------------------------------------
+  // Built at the first decode, from its tile's row count. Null == every
+  // block keeps the GPU feed-forward.
+  std::unique_ptr<AneFeedForward> _ane;
+  bool _ane_tried       = false;
+  bool _ane_skip_warned = false;
+  bool ane_setup_(int rows);
+  bool ane_eligible_(int L, const Block& b);
+  // w1 is [gate | up] rows with a [2*ffn] bias, gate first; w2 [dim, ffn].
+  void ane_stage_(int L, const Block& b);
 
   // One causal conv3d over a whole clip: `in` is [Ti, H*W, cin] and
   // `out` becomes [To, Ho*Wo, cout], with the output frame count that

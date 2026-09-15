@@ -467,6 +467,179 @@ scratch_claims(std::string label, std::size_t bytes, std::string_view phase)
                         std::string(phase)}};
 }
 
+namespace {
+
+// One CoreML claim as the plan recorded it, and what it was granted.
+struct CoreMLRec {
+  std::string label, phase, last_phase;
+  std::size_t unit_bytes = 0;
+  int         units      = 0;
+  int         granted    = 0;
+};
+
+// Process-wide, launch-scoped: begin_plan clears it, end_plan fills the
+// grants, and coreml_grant() reads them back at load. Kept here rather
+// than on the planner so the read-back is a free function like every
+// other query in this file.
+struct CoreMLLedger {
+  std::mutex              mu;
+  std::vector<CoreMLRec>  recs;
+
+  static CoreMLLedger& get()
+  {
+    static CoreMLLedger g;
+    return g;
+  }
+};
+
+// The cushion a CoreML grant keeps back from believed RAM: a quarter of
+// it, up to kStreamHeadroom. A flat 8 GB is right on a 64 GB box and
+// absurd on a 16 GB one, where it reserves half the machine and leaves no
+// graph with a real model anything to grant into.
+std::size_t
+coreml_headroom_(std::size_t ram)
+{
+  return std::min(ram / 4, kStreamHeadroom);
+}
+
+// What the plan already holds DURING a claim's lifetime, and at the
+// graph's worst moment -- both with every streamable component at its
+// floor and the activation scratch included.
+struct CoreMLLoad {
+  std::size_t in_phase = 0;
+  std::size_t peak     = 0;
+};
+
+CoreMLLoad
+coreml_load_(genai::GenerativeModelManager* mgr, const std::string& phase,
+             const std::string& last_phase)
+{
+  std::vector<std::pair<std::string, std::size_t>> by;
+  const std::size_t peak = mgr->phase_peak(&by);
+  if (peak > 0 && !by.empty()) {
+    CoreMLLoad l;
+    l.peak = peak;
+    const int a = phase.empty() ? -1 : phase_order(phase);
+    if (a < 0) {
+      // Unphased -- or a phase the vocabulary does not know -- is alive
+      // throughout, so it is judged against the worst moment.
+      l.in_phase = peak;
+      return l;
+    }
+    int b = last_phase.empty() ? a : phase_order(last_phase);
+    if (b < a) { b = a; }
+    for (const auto& ph : by) {
+      const int o = phase_order(ph.first);
+      if (o >= a && o <= b && ph.second > l.in_phase) {
+        l.in_phase = ph.second;
+      }
+    }
+    return l;
+  }
+  // No phase order yet -- a caller outside a launch. One flat reading, at
+  // FLOORS: the full-size reading counts a streaming DiT at its on-disk
+  // size, which for Krea-2 is 36 GB against a 14.6 GB floor and refused
+  // the module on every box below ~44 GB.
+  const std::size_t flat = mgr->phase_footprint_floor(std::string()) +
+                           mgr->scratch_bytes(std::string());
+  return CoreMLLoad{flat, flat};
+}
+
+// How many units fit, by the PER-PHASE rule.
+//
+// A unit is alive only in its claim's phases, so it is judged there: grant
+// what keeps that phase within max(the graph's current peak, RAM less the
+// headroom). The first term is what makes this right rather than merely
+// generous -- a graph that already has to survive its peak somewhere
+// (Krea-2 at 1024^2 peaks at 14.6 GB in the DECODE) is made no tighter by
+// a module that lifts its denoise from 12.0 to 13.4 GB, and refusing that
+// module on a 16 GB box would be refusing memory the run already needs to
+// have. The second term is the ordinary rule for a unit that does raise
+// the peak.
+//
+// Not reversible within a run -- a module is held until its model goes --
+// which is why it keeps a headroom at all.
+int
+coreml_units_for_(const SessionContextIntf* session, const std::string& phase,
+                  const std::string& last_phase, std::size_t unit_bytes,
+                  int requested)
+{
+  if (unit_bytes == 0 || requested <= 0) { return 0; }
+  const std::size_t ram = phys_ram();
+  if (ram == 0) { return 0; }       // RAM unknown -> grant nothing
+  auto* mgr = session != nullptr
+                  ? session->services()->generative_model_manager()
+                  : nullptr;
+  if (mgr == nullptr) { return 0; }
+  const CoreMLLoad l = coreml_load_(mgr, phase, last_phase);
+  const std::size_t head = coreml_headroom_(ram);
+  const std::size_t cap = std::max(l.peak, ram > head ? ram - head : 0);
+  if (l.in_phase >= cap) { return 0; }
+  const std::size_t n = (cap - l.in_phase) / unit_bytes;
+  return n >= (std::size_t)requested ? requested : (int)n;
+}
+
+}  // namespace
+
+std::vector<ResourceClaim>
+coreml_claims(std::string label, std::size_t unit_bytes, int units,
+              std::string_view phase)
+{
+  if (label.empty() || unit_bytes == 0 || units <= 0) { return {}; }
+  // Same encoding rationale as scratch_claims: a ResourceClaim has no
+  // byte field, and here there are two numbers rather than one, because
+  // the divisibility is the whole point of the kind.
+  return {ResourceClaim{std::string(kCoreMLKind),
+                        label + "|" + std::to_string(unit_bytes) + "|" +
+                            std::to_string(units),
+                        std::string(phase)}};
+}
+
+bool
+parse_coreml_claim(const ResourceClaim& c, std::string* label,
+                   std::size_t* unit_bytes, int* units)
+{
+  if (c.kind != kCoreMLKind) { return false; }
+  // label|unit_bytes|units, and a label may itself contain '|' -- so the
+  // two numbers are read from the right.
+  const std::size_t p2 = c.key.rfind('|');
+  if (p2 == std::string::npos || p2 == 0) { return false; }
+  const std::size_t p1 = c.key.rfind('|', p2 - 1);
+  if (p1 == std::string::npos || p1 == 0) { return false; }
+  char* end = nullptr;
+  const std::string ub = c.key.substr(p1 + 1, p2 - p1 - 1);
+  const std::string un = c.key.substr(p2 + 1);
+  const unsigned long long b = std::strtoull(ub.c_str(), &end, 10);
+  if (ub.empty() || *end != '\0' || b == 0) { return false; }
+  const long n = std::strtol(un.c_str(), &end, 10);
+  if (un.empty() || *end != '\0' || n <= 0) { return false; }
+  if (label != nullptr) { *label = c.key.substr(0, p1); }
+  if (unit_bytes != nullptr) { *unit_bytes = (std::size_t)b; }
+  if (units != nullptr) { *units = (int)n; }
+  return true;
+}
+
+int
+coreml_grant(const SessionContextIntf* session, std::string_view label,
+             std::size_t unit_bytes, int requested)
+{
+  if (unit_bytes == 0 || requested <= 0) { return 0; }
+  {
+    CoreMLLedger& L = CoreMLLedger::get();
+    std::lock_guard<std::mutex> g(L.mu);
+    for (const CoreMLRec& r : L.recs) {
+      if (r.label == label) {
+        return r.granted < requested ? r.granted : requested;
+      }
+    }
+  }
+  // No plan on record. Bound it anyway rather than handing over the
+  // whole box: the caller is a test or a tool, and the failure mode
+  // this exists to prevent does not care which.
+  return coreml_units_for_(session, std::string(), std::string(), unit_bytes,
+                           requested);
+}
+
 std::vector<ResourceClaim>
 payload_claims(std::string label, std::size_t bytes,
                std::string_view first_phase, std::string_view last_phase)
@@ -1056,10 +1229,112 @@ private:
   std::atomic<unsigned>    _arenas{0};
 };
 
+// Grants CoreML/ANE residency, in units, out of what the rest of the
+// plan leaves.
+//
+// It never refuses a launch, and that is deliberate: an accelerator is
+// the one claim whose shortfall has a correct answer other than "no".
+// Fewer units means proportionally less speed, so a box that cannot
+// hold the tier runs without it instead of not running.
+//
+// Grants are first-come in claim order, which is graph order. With one
+// claimant -- the only case today -- that is no policy at all; with
+// several it favours the stage declared first, which is at least
+// deterministic. A fairer split wants a reason to prefer one, and there
+// is none yet.
+class CoreMLPlanner final : public ResourcePlanner {
+public:
+  std::string_view
+  kind() const noexcept override
+  {
+    return kCoreMLKind;
+  }
+
+  void
+  begin_plan(const SessionContextIntf* /*session*/) override
+  {
+    CoreMLLedger& L = CoreMLLedger::get();
+    std::lock_guard<std::mutex> g(L.mu);
+    L.recs.clear();
+  }
+
+  void
+  claim(const SessionContextIntf* session, const std::string& key,
+        const std::string& phase, const std::string& last_phase,
+        std::size_t /*floor*/) override
+  {
+    // No floor, because the UNITS are the floor: a claim that can hold
+    // less says so by being divisible, and one that cannot claims a
+    // single unit.
+    CoreMLRec r;
+    const std::size_t b2 = key.rfind('|');
+    const std::size_t b1 =
+        b2 == std::string::npos ? std::string::npos : key.rfind('|', b2 - 1);
+    if (b1 == std::string::npos || b2 == std::string::npos) {
+      if (session != nullptr) {
+        session->warn(fmt("resource-plan: CoreML claim '{}' is not "
+                          "'<label>|<unit_bytes>|<units>'; ignored", key));
+      }
+      return;
+    }
+    try {
+      r.unit_bytes = (std::size_t)std::stoull(key.substr(b1 + 1, b2 - b1 - 1));
+      r.units      = std::stoi(key.substr(b2 + 1));
+    } catch (const std::exception&) {
+      return;
+    }
+    if (r.unit_bytes == 0 || r.units <= 0) { return; }
+    r.label      = key.substr(0, b1);
+    r.phase      = phase;
+    r.last_phase = last_phase;
+    CoreMLLedger& L = CoreMLLedger::get();
+    std::lock_guard<std::mutex> g(L.mu);
+    L.recs.push_back(std::move(r));
+  }
+
+  bool
+  end_plan(const SessionContextIntf* session) override
+  {
+    CoreMLLedger& L = CoreMLLedger::get();
+    {
+      std::lock_guard<std::mutex> g(L.mu);
+      if (L.recs.empty()) { return true; }
+    }
+    auto* mgr = session != nullptr
+                    ? session->services()->generative_model_manager()
+                    : nullptr;
+    std::lock_guard<std::mutex> g(L.mu);
+    for (CoreMLRec& r : L.recs) {
+      // Judged in turn: each grant is declared below before the next is
+      // judged, so a later claimant sees what an earlier one took.
+      r.granted = coreml_units_for_(session, r.phase, r.last_phase,
+                                    r.unit_bytes, r.units);
+      const std::size_t took = (std::size_t)r.granted * r.unit_bytes;
+      // DECLARED INTO THE SCRATCH LEDGER, which is what makes the grant
+      // visible to phase_peak() and so to every peer that sizes after
+      // this. A grant nobody can see would be the same bug this kind
+      // was added to close, one layer further in.
+      if (mgr != nullptr && took > 0) {
+        mgr->declare_scratch("coreml:" + r.label, took, r.phase,
+                             r.last_phase);
+      }
+      if (session != nullptr) {
+        session->info(fmt(
+            "resource-plan: CoreML '{}' granted {} of {} unit(s), {} MB "
+            "of {} MB asked ({} MB per unit)", r.label, r.granted, r.units,
+            took >> 20, ((std::size_t)r.units * r.unit_bytes) >> 20,
+            r.unit_bytes >> 20));
+      }
+    }
+    return true;
+  }
+};
+
 }
 
 VPIPE_REGISTER_RESOURCE_PLANNER(ScratchPlanner)
 VPIPE_REGISTER_RESOURCE_PLANNER(ModelWeightPlanner)
+VPIPE_REGISTER_RESOURCE_PLANNER(CoreMLPlanner)
 
 }  // namespace model_memory
 }  // namespace vpipe

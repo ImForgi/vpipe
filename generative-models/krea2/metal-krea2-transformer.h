@@ -6,6 +6,7 @@
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -22,6 +23,7 @@ namespace genai {
 class MetalLlamaWeights;   // fwd
 class WeightSet;           // generative-models/weight-set.h
 class I8GemmContext;       // fwd (shared/i8-gemm.h)
+
 
 // Krea-2-Turbo denoiser (Krea2Transformer2DModel): a single-stream MMDiT
 // flow-matching transformer, run in f16 on the metal-compute backend.
@@ -64,6 +66,48 @@ class MetalKrea2Transformer {
     // above -- that one chooses how the block's GEMMs are computed and
     // this one how the attention between them is.
     sage::Config sage;
+
+    // ---- the ANE tier (LOSSY, opt-in) -------------------------------
+    //
+    // The block feed-forward on the Apple Neural Engine, which on an M4
+    // is the only unused compute on the die: the GPU's f16 GEMM already
+    // sits at 84-92% of roofline and its integer MAD is a QUARTER of the
+    // f16 rate, so there is no int8 lever there. MEASURED ~14 TOPS on a
+    // tiled DiT-shaped FFN against the GPU's achieved 6.6-7.3, and wider
+    // on a base M4 (same 16-core ANE, roughly half the GPU).
+    //
+    // DENSE CHECKPOINTS ONLY. The ANE is fp16-only -- int8 there buys
+    // footprint under its ~8-10 MB weight buffer, not arithmetic -- so a
+    // quantized block is dequantized into the module's fp16 inputs
+    // per block instead. On a
+    // bf16 checkpoint the bake converts to fp16, which is safe HERE
+    // because the FFN is self-contained: only its output `o` re-enters
+    // the bf16 residual stream, and that addition stays on the GPU.
+    //
+    // The ANE runs ONE shared module whose weights are runtime inputs:
+    // each block's gate/up/down are converted to fp16, in the checkpoint's
+    // own [out,in] layout, into IOSurface slots at the start of the block,
+    // on the ANE worker, while the GPU runs that block's attention. So the
+    // tier's memory is fixed (ane_runtime_bytes()) and it compiles once
+    // per shape. `ane_templates` is unused by it, kept for config
+    // compatibility.
+    //
+    // `ane_rows` is the ANE's share of the FFN's rows, the GPU taking
+    // the rest -- rows are independent in a feed-forward, so the split
+    // is exact. 0 means auto-balance from the measured times.
+    // `ane_layers` caps how many blocks use the tier; 0 means all.
+    // The session is how the tier reaches the shared CoreML model
+    // manager; without one there is no ANE and the tier stays off.
+    const SessionContextIntf* session = nullptr;
+    std::string ane_templates;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
+    // PROTOTYPE: the attention's q, k, v and gate projections split onto
+    // the ANE too, stacked into ONE matmul module (hidden -> q+k+v+gate
+    // wide) with its own auto share and on/off controller. Needs `session`
+    // like the rest of the tier. VPIPE_KREA2_ANE_QKV=1 also turns it on.
+    bool  ane_qkv    = false;
+
     int   text_head_dim() const { return text_hidden / text_heads; }  // 128
   };
 
@@ -207,6 +251,36 @@ class MetalKrea2Transformer {
   // under-reports is how residency growth eats the room the rest of the
   // forward needs.
   std::size_t scratch_resident_bytes() const;
+
+  // Bytes the ANE feed-forward tier holds, for the whole model, for a
+  // sequence of `seq` tokens (image plus text; <= 0 books one chunk).
+  //
+  // ONE shared runtime-weight module serves every block, so this is fixed
+  // however many blocks use it. Three terms, each MEASURED:
+  //   slots    the IOSurface weight inputs, one block's fp16 weights W:
+  //            576 MB of process footprint for Krea-2, not wired;
+  //   staging  CoreML's wired copy of those inputs plus the graph's
+  //            activations at the chunk's rows, W + rows*(3*ffn +
+  //            2*hidden)*2 -- fitted to 836 / 953 / 1078 MB against 836 /
+  //            938 / 1059 measured at 2048 / 3072 / 4096 rows;
+  //   host     the fp16 input/output buffers for the ANE's rows, at most
+  //            every whole chunk short of the sequence.
+  //
+  // Static, and takes the shape rather than reading _cfg, because the
+  // caller that needs it most is the PLAN, which asks before anything is
+  // loaded.
+  static std::size_t ane_runtime_bytes(int hidden, int ffn, int seq) noexcept;
+  // The sequence a plan should book for a width x height image (either <= 0
+  // books 1024x1024): its tokens plus the longest text the model conditions
+  // on.
+  static int ane_plan_seq(int width, int height) noexcept;
+  // Rows per ANE predict: VPIPE_KREA2_ANE_CHUNK or the default. One reading
+  // for the plan and the model, so the two cannot book different shapes.
+  static int ane_chunk_rows() noexcept;
+  // Whether the tier tried to arm, and whether it did: a plan that booked
+  // the module can release the booking when it did not.
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept { return _ane != nullptr; }
 
   // M3a: run the text-fusion tower + txt_in on the (text_seq, n_text_layers,
   // text_hidden) f16 encoder-tap stack -> the (text_seq, hidden) fused text
@@ -399,6 +473,50 @@ class MetalKrea2Transformer {
   metal_compute::SharedBuffer _te_l1b, _te_l2b;              // time_embed
   QWeight _tmp_w; metal_compute::SharedBuffer _tmp_b;        // time_mod_proj
   std::vector<Block> _blocks;                          // 28 transformer_blocks
+
+  // ---- the ANE tier ------------------------------------------------
+  //
+  // ONE runtime-weight feed-forward module for the whole model, built
+  // LAZILY at the first forward because its row count is compiled into
+  // its graph and the sequence length is not known until then. Its
+  // weights are INPUTS: each block's are staged into its slots at the start
+  // of that block, so nothing is ever baked, the tier's memory is fixed,
+  // and the graph compiles once per shape.
+  //
+  // A null module means the tier is off and every block keeps its GPU
+  // path, which is what every failure falls back to.
+  //
+  // The text a plan books beside the image tokens. See ane_plan_seq().
+  static constexpr int kAnePlanTextTokens = 512;
+  // The chunk: VPIPE_KREA2_ANE_CHUNK or the default. MEASURED on an M4 Pro,
+  // 2 blocks, 2048 against 1024 rows: 1024^2 1.417x / 1.414x, 1536^2
+  // 1.376x / 1.378x, 2048^2 1.357x / 1.329x. The finer split does reach
+  // its balance (100% of the ANE time hidden), but the feed-forward is only
+  // about a third of a block, so balancing it better buys ~2% at most --
+  // and the ANE runs ~7% fewer rows per ms at 1024. So 2048 stays; the
+  // override is for retuning on other hardware.
+  std::unique_ptr<AneFeedForward> _ane;
+  bool _ane_skip_warned = false;   // one warning for ineligible blocks
+  bool _ane_tried       = false;
+  // The q/k/v/gate tier (prototype): one stacked matmul module.
+  std::unique_ptr<AneFeedForward> _ane_qkv;
+  bool _ane_qkv_tried = false;
+  bool ane_qkv_setup_(int seq);
+  bool ane_qkv_eligible_(int L, const Block& b);
+  void ane_qkv_stage_(int L, const Block& b);
+
+  // Whether block L runs its feed-forward on the ANE: the tier is armed,
+  // L is under the cap, and every projection is fp16/bf16 or 4/8-bit affine
+  // -- gate and up split, or fused into ff_gu.
+  bool ane_eligible_(int L, const Block& b);
+  // Dispatch block L's weights into the module's slots and return at once,
+  // so the conversion runs under the GPU's attention for the same block.
+  // Dense weights convert bf16 -> fp16 row for row through a table (~44 ms
+  // a Krea-2 block); quantized ones are dequantized into the same fp16
+  // slots (4-bit ~21 ms, 8-bit ~50 ms). Takes the LIVE block: under
+  // streaming, _blocks[L] is empty.
+  void ane_stage_(int L, const Block& b);
+  bool ane_setup_(int seq);      // shared one-time part; false == tier off
   // Streaming-blocks mode: _blocks starts EMPTY and holds only what
   // residency has promoted; every other block comes from the weight set (the
   // retained source mmap) on demand in forward_dit and freed after use.

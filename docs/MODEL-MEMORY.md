@@ -680,6 +680,79 @@ MEASURED, FLUX.2 klein-9B-4bit at a simulated 16 GB (peers 10059 MB):
 | 1024² | 3584 MB | keep | keep |
 | 2048² | 14336 MB | **keep** — wrong | **unload** |
 
+### CoreML residency — bytes no other ledger can see
+
+A third claim kind, `model_memory::kCoreMLKind`, exists for one reason:
+a CoreML model's memory is held by CoreML. It is not in a weight set, not
+a `SharedBuffer`, and not a Metal allocation — so `weight_footprint()`
+cannot see it, `revise_declaration()` cannot report it, the wired pool
+cannot protect it, and `MetalCompute::memory_budget().headroom` cannot
+count it either, since that is a *Metal device* figure. Only the
+physical-RAM reading sees it at all, and that is the backstop, not the
+plan.
+
+How much it is depends on the module's design, and the two designs an
+accelerated feed-forward can take differ by an order of magnitude:
+
+- **Weights baked per block.** Each block's module holds its weights in
+  wired memory for the run — ~0.84 GB a block on a 6144×16384 FFN — so
+  the cost scales with depth and a 28-block model asks for more than its
+  checkpoint.
+- **Weights as runtime inputs, one shared module.** The graph holds no
+  weights; the model stages its inputs into wired memory once, and the
+  caller refills IOSurface weight buffers per block. The cost is fixed —
+  ~1.4 GB for the same FFN — however many blocks share it.
+
+So the claim is in **units**, not bytes. A per-block design claims one
+unit per block and can be granted fewer; a shared module claims one:
+
+```cpp
+return model_memory::coreml_claims(
+    label, module_bytes, /*units=*/1, model_memory::kPhaseDenoise);
+```
+
+and the stage reads back, at load, what the plan granted:
+
+```cpp
+if (model_memory::coreml_grant(session(), label, module_bytes, 1) <= 0) {
+  // keep the GPU path
+}
+```
+
+Two properties make this kind different from the other two, and both
+follow from what an accelerator *is*:
+
+- **It never refuses a launch.** A shortfall of weights means the graph
+  cannot run; a shortfall of accelerator means it runs slower. The
+  planner grants what fits — possibly zero, which the caller reads as
+  "keep the GPU path" — and returns true regardless.
+- **A partial grant is a real answer, not a degraded one**, for a claim
+  that has more than one unit: the speedup is proportional to the blocks
+  covered, so *k* of *n* is a linear trade rather than a cliff.
+
+A grant is judged **in its claim's own phase**. A unit that lives only
+in the denoise is compared against what the denoise already holds, and
+granted as far as that phase stays within the larger of two limits:
+
+- **the graph's current peak** — a graph that already has to survive a
+  higher moment elsewhere is made no tighter by filling a lower phase up
+  to it. A 1024×1024 Krea-2 graph peaks at 14.6 GB in its decode and holds
+  12.0 GB in its denoise; its 1.4 GB module lifts the denoise to 13.4 GB
+  and moves the peak not at all, so refusing it would refuse memory the
+  run already has to have;
+- **believed RAM less a headroom** of a quarter of RAM, at most
+  `kStreamHeadroom` — the ordinary rule, for a unit that does raise the
+  peak. A flat 8 GB is right on a 64 GB box and reserves half of a 16 GB
+  one.
+
+Everything is read at floors, with the activation scratch included. When
+no phase order has been set — a caller outside a launch — one flat reading
+at floors stands in for both.
+
+What is granted is then **declared into the scratch ledger**, so it
+reaches `phase_peak()` and every peer that sizes after it. A grant
+nobody could see would be the same bug one layer further in.
+
 ---
 
 ## 4. The memory plan — derived from the graph, not from phase names

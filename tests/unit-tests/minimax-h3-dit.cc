@@ -321,6 +321,13 @@ run_dit_golden_(const std::string& root, const std::string& gdir,
   // visible -- a fixed depth 2 cannot tell a sound block from one with a
   // small per-block error.
   cfg.n_layers = golden_n_layers_(gdir);
+  // VPIPE_MINIMAX_H3_GOLDEN_ANE: the same golden with the ANE feed-forward
+  // tier on -- real activations through the whole depth, which random
+  // inputs over two blocks do not reach. Pair with VPIPE_H3_ANE_CHUNK for a
+  // sequence shorter than one default chunk.
+  if (std::getenv("VPIPE_MINIMAX_H3_GOLDEN_ANE") != nullptr) {
+    cfg.ane_ffn = true;
+  }
   // Geometry from the golden too, so ONE harness serves both the small
   // anchored goldens and a PRODUCTION-layout dump. Everything verified
   // so far ran either a small geometry or random rows; this is the first
@@ -1107,6 +1114,11 @@ TEST(minimax_h3_dit, denoise_holds_the_anchors)
 //
 // Env: VPIPE_MINIMAX_H3_DIT_BENCH=1 + VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
 // Geometry: ..._BENCH_{LATF,LATH,LATW,AUD,TEXT,LAYERS,ITERS}.
+// Arms: ..._BENCH_NOANCHOR=1 (text-to-video, no conditioning frame),
+// ..._BENCH_SAGE=1, ..._BENCH_SOL=1 (+ _SOL_DENSE=<n>),
+// ..._BENCH_LORA=<adapter file>,
+// ..._BENCH_ANE=1 with ..._BENCH_ANE_ROWS=<share> (pinned, so the on/off
+// controller does not probe inside a short bench), ..._BENCH_ANE_QKV=1.
 TEST(minimax_h3_dit, step_bench)
 {
   const char* on   = std::getenv("VPIPE_MINIMAX_H3_DIT_BENCH");
@@ -1127,6 +1139,7 @@ TEST(minimax_h3_dit, step_bench)
   const int naud   = envi("VPIPE_MINIMAX_H3_BENCH_AUD", 93);
   const int ntext  = envi("VPIPE_MINIMAX_H3_BENCH_TEXT", 16);
   const int layers = envi("VPIPE_MINIMAX_H3_BENCH_LAYERS", 2);
+  const bool anchor = envi("VPIPE_MINIMAX_H3_BENCH_NOANCHOR", 0) == 0;
   // At least two: iteration 0 of each arm pays for scratch allocation and
   // function binding and is discarded, so ITERS=1 would time nothing and
   // fail the `best` assertion rather than report a number.
@@ -1139,12 +1152,37 @@ TEST(minimax_h3_dit, step_bench)
     return;
   }
   cfg.n_layers = layers;
+  cfg.sage.enabled = envi("VPIPE_MINIMAX_H3_BENCH_SAGE", 0) != 0;
+  // Sol-Attn at its defaults (tau 1, block 0 dense, local radius 1); the
+  // KV sink comes from the layout inside the forward.
+  cfg.sol.enabled = envi("VPIPE_MINIMAX_H3_BENCH_SOL", 0) != 0;
+  // ..._BENCH_SOL_DENSE: leading dense blocks (default 1). 0 routes every
+  // block, so a 2-block bench measures the ROUTED block a 50-block forward
+  // is made of, rather than averaging it with the one dense block.
+  if (const char* sd = std::getenv("VPIPE_MINIMAX_H3_BENCH_SOL_DENSE")) {
+    cfg.sol.dense_layers = std::atoi(sd);
+  }
+  cfg.ane_ffn = envi("VPIPE_MINIMAX_H3_BENCH_ANE", 0) != 0;
+  cfg.ane_qkv = envi("VPIPE_MINIMAX_H3_BENCH_ANE_QKV", 0) != 0;
+  if (const char* r = std::getenv("VPIPE_MINIMAX_H3_BENCH_ANE_ROWS")) {
+    cfg.ane_rows = (float)std::atof(r);
+  }
+  std::vector<MetalMiniMaxH3Transformer::LoraSpec> loras;
+  if (const char* lp = std::getenv("VPIPE_MINIMAX_H3_BENCH_LORA")) {
+    MetalMiniMaxH3Transformer::LoraSpec sp;
+    sp.path  = lp;
+    sp.scale = 1.0f;
+    loras.push_back(sp);
+  }
 
   h3::PackedLayout L;
   const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
   ASSERT_TRUE(h3::build_packed_sequence(
       text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
-      h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
+      h3::kAudioChannels,
+      anchor ? std::vector<h3::Anchor>{h3::Anchor::kFirst}
+             : std::vector<h3::Anchor>{},
+      &L));
 
   std::vector<float> uniq;
   std::vector<int>   row_idx;
@@ -1164,7 +1202,7 @@ TEST(minimax_h3_dit, step_bench)
     tin[i] = 0.01f * (float)((i % 131) - 65);
   }
 
-  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, loras);
   if (m == nullptr) { std::printf("[minimax_h3_dit] load failed\n"); }
   ASSERT_TRUE(m != nullptr);
 
@@ -1309,7 +1347,12 @@ TEST(minimax_h3_dit, step_bench)
   std::printf("[minimax_h3_dit] best %.1f ms/step at %d rows, %d blocks "
               "-> %.1f ms/block\n", best, L.seq_len, cfg.n_layers,
               best / (double)(cfg.n_layers ? cfg.n_layers : 1));
-  EXPECT_TRUE(l2_stable);
+  // Stable output is the tile and fusion A/Bs' correctness check: those
+  // arms are the same arithmetic. With the ANE tier on it is not -- the
+  // balancer moves rows between engines and the on/off controller runs
+  // GPU-only probe blocks, so fp16 on a varying share moves the rms in
+  // the fourth digit.
+  if (!cfg.ane_ffn) { EXPECT_TRUE(l2_stable); }
   EXPECT_TRUE(best < 1e29);
 }
 
@@ -2441,4 +2484,169 @@ TEST(minimax_h3_dit, baked_adaln_matches_the_projections)
                 den > 0.0 ? std::sqrt(num / den) : 0.0);
     EXPECT_TRUE(diff == 0);
   }
+}
+
+// The ANE feed-forward tier against the GPU alone, over the same forward.
+//
+// The split is exact in the arithmetic -- rows are independent in a
+// feed-forward -- so what separates the two runs is fp16 on the ANE's rows
+// against bf16 on the GPU's. That is the bar: small, and NOT zero, because
+// zero would mean no row ever reached the ANE (which is how a quantized
+// Krea-2 block once bypassed the split and still passed).
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, geometry from the bench's
+// ..._BENCH_{LATF,LATH,LATW,AUD,TEXT,LAYERS} (default 17x34x60 latents,
+// 2 blocks, ~8.8k rows: four whole chunks). VPIPE_MINIMAX_H3_ANE_ITERS
+// timed forwards per arm after one warm-up (default 1),
+// VPIPE_MINIMAX_H3_ANE_ROWS pins the share, VPIPE_MINIMAX_H3_ANE_STREAM=1
+// streams the blocks.
+TEST(minimax_h3_dit, forward_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int latf   = envi("VPIPE_MINIMAX_H3_BENCH_LATF", 17);
+  const int lath   = envi("VPIPE_MINIMAX_H3_BENCH_LATH", 34);
+  const int latw   = envi("VPIPE_MINIMAX_H3_BENCH_LATW", 60);
+  const int naud   = envi("VPIPE_MINIMAX_H3_BENCH_AUD", 93);
+  const int ntext  = envi("VPIPE_MINIMAX_H3_BENCH_TEXT", 16);
+  const int layers = envi("VPIPE_MINIMAX_H3_BENCH_LAYERS", 2);
+  const int iters  = std::max(1, envi("VPIPE_MINIMAX_H3_ANE_ITERS", 1));
+  const bool stream = envi("VPIPE_MINIMAX_H3_ANE_STREAM", 0) != 0;
+  const char* rr = std::getenv("VPIPE_MINIMAX_H3_ANE_ROWS");
+  // A runtime LoRA on both arms: the GPU applies it as side GEMMs, the
+  // ANE's rows get it merged into their staged weights.
+  std::vector<MetalMiniMaxH3Transformer::LoraSpec> loras;
+  if (const char* lp = std::getenv("VPIPE_MINIMAX_H3_ANE_LORA")) {
+    MetalMiniMaxH3Transformer::LoraSpec sp;
+    sp.path  = lp;
+    sp.scale = 1.0f;
+    loras.push_back(sp);
+  }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = layers;
+
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(
+      text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
+      h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+
+  const int n_video = (int)L.video_indices.size();
+  std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems());
+  std::vector<float> ain((std::size_t)L.num_audio_rows * cfg.audio_channels);
+  std::vector<float> tin((std::size_t)ntext * cfg.text_dim);
+  std::uint32_t sd = 0x51ced00du;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      sd = sd * 1664525u + 1013904223u;
+      e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(vin);
+  fill(ain);
+  fill(tin);
+  const SharedBuffer vb = to_bf16_buf_(mc, vin);
+  const SharedBuffer ab = to_bf16_buf_(mc, ain);
+  const SharedBuffer tb = to_bf16_buf_(mc, tin);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+  if (vb.empty() || ab.empty() || tb.empty()) { return; }
+
+  MetalMiniMaxH3Transformer::Step step;
+  step.video  = &vb;
+  step.audio  = &ab;
+  step.text   = &tb;
+  step.layout = &L;
+  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+
+  auto to_f32 = [](const SharedBuffer& b) {
+    std::vector<float> v(b.byte_size() / 2);
+    const auto* p = static_cast<const std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < v.size(); ++i) { v[i] = bf16_to_f32_(p[i]); }
+    return v;
+  };
+  struct Arm {
+    std::vector<float> video, audio;
+    double best_ms = 0.0;
+    bool   armed   = false;
+  };
+  auto run = [&](bool ane) {
+    Arm arm;
+    MetalMiniMaxH3Transformer::Config rc = cfg;
+    rc.ane_ffn  = ane;
+    rc.ane_qkv  = ane && std::getenv("VPIPE_MINIMAX_H3_ANE_QKV") != nullptr;
+    rc.ane_rows = (ane && rr != nullptr) ? (float)std::atof(rr) : 0.0f;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, rc, stream, loras);
+    if (m == nullptr) { return arm; }
+    // Iteration 0 is the warm-up: scratch, pipeline binding and, for the
+    // ANE arm, the module build. Its output is the one compared.
+    for (int i = 0; i <= iters; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      std::string ferr;
+      MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (out.empty()) {
+        std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+        return Arm{};
+      }
+      if (i == 0) {
+        arm.video = to_f32(out.video);
+        arm.audio = to_f32(out.audio);
+      } else if (arm.best_ms == 0.0 || ms < arm.best_ms) {
+        arm.best_ms = ms;
+      }
+    }
+    arm.armed = m->ane_armed();
+    return arm;
+  };
+  const Arm gpu = run(false);
+  const Arm ane = run(true);
+  ASSERT_TRUE(!gpu.video.empty() && !ane.video.empty());
+  if (gpu.video.empty() || ane.video.empty()) { return; }
+  ASSERT_TRUE(gpu.video.size() == ane.video.size() &&
+              gpu.audio.size() == ane.audio.size());
+  if (gpu.video.size() != ane.video.size() ||
+      gpu.audio.size() != ane.audio.size()) {
+    return;
+  }
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 0.0;
+  };
+  const double rv = rel(ane.video, gpu.video);
+  const double ra = rel(ane.audio, gpu.audio);
+  std::printf("[minimax_h3_dit] ANE vs GPU, seq %d, %d blocks%s%s: video "
+              "rel-L2 %.6f, audio %.6f | GPU-only %.1f ms, ANE split %.1f "
+              "ms, %.3fx\n", L.seq_len, cfg.n_layers,
+              stream ? " (streamed)" : "", loras.empty() ? "" : " +LoRA",
+              rv, ra, gpu.best_ms, ane.best_ms,
+              ane.best_ms > 0.0 ? gpu.best_ms / ane.best_ms : 0.0);
+  EXPECT_TRUE(ane.armed);
+  // fp16 on the ANE's rows: small, and not zero -- zero means no row
+  // reached the ANE at all.
+  EXPECT_TRUE(rv < 0.02 && ra < 0.02);
+  EXPECT_TRUE(rv > 0.0);
 }

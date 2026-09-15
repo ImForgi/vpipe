@@ -68,7 +68,11 @@ scalar_f32(const MetalLlamaWeights& w, const std::string& name,
 // is a lookup with two spellings rather than a conversion. An adapter
 // that needs more than a prefix is not one of these and must not be
 // coerced into looking like one.
-const char* const kPrefixes[] = {"", "diffusion_model."};
+// "transformer." is diffusers' own pipeline save (save_lora_weights keys
+// every module `transformer.<module>`) -- the format Krea-2's published
+// adapters ship in, which bound NOTHING before it was listed. Tried after
+// the bare name, so a model whose own names begin with it still matches.
+const char* const kPrefixes[] = {"", "diffusion_model.", "transformer."};
 
 // Two spellings of a factor tensor are in the wild and they differ by
 // an infix: `<module>.lora_A.weight`, and peft's

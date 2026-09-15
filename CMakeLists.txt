@@ -270,6 +270,7 @@ if(VPIPE_SOURCES)
         # values when dyld returns null. vpipe itself never reads
         # them.
         target_link_libraries(vpipe PRIVATE
+            "-framework Accelerate"
             "-framework CoreML"
             "-framework CoreVideo"
             "-framework Foundation"
@@ -582,6 +583,14 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sage-attention.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.h
+        DESTINATION include/generative-models/shared)
+    # The ANE tier (`ane_ffn` and whatever follows it), for a family that
+    # splits its own blocks. ane-tier.h ALONE: it describes the work in
+    # FlexData and binds buffers by name, so the machinery under it --
+    # ane-ffn.h, ane-module.h, the emitter -- stays uninstalled and free
+    # to change without touching the plugin ABI.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/ane-tier.h
         DESTINATION include/generative-models/shared)
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-sets/vae-conv3x3-tune.h

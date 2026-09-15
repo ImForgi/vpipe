@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 
 #include "generative-models/shared/riffle-rows.h"
@@ -1557,7 +1558,8 @@ MetalFlux2Transformer::wire_block_(DoubleBlock& b, bool on)
   auto one = [&](metal_compute::SharedBuffer& p) {
     if (stop) { return; }
     const std::size_t n = _wire.wire_one(_mc, p, on);
-    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
       stop = true;
       return;
     }
@@ -1581,7 +1583,8 @@ MetalFlux2Transformer::wire_block_(SingleBlock& b, bool on)
   auto one = [&](metal_compute::SharedBuffer& p) {
     if (stop) { return; }
     const std::size_t n = _wire.wire_one(_mc, p, on);
-    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
       stop = true;
       return;
     }
@@ -1722,6 +1725,10 @@ MetalFlux2Transformer::resident_pages_(std::size_t* examined,
     // shortfall, and that is the correct answer: there is nothing this
     // walk could have found.
     if (p.is_wired()) { return; }
+    // Nor one below the pool's minimum: never wired, heap-owned pages that
+    // read partly out of RAM for reasons unrelated to this block. See
+    // GenerativeModelManager::pool_wirable.
+    if (!GenerativeModelManager::pool_wirable(p)) { return; }
     const auto r = p.page_residency(64);
     if (!r.valid) { return; }
     *examined += r.examined;

@@ -12,6 +12,8 @@
 #include "interfaces/session-services-intf.h"
 
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 #include <cerrno>
 #include <cstring>
@@ -561,11 +563,76 @@ GenerativeModelManager::wired_pool_can_take(std::size_t bytes) const
   return _pool_used.load(std::memory_order_relaxed) + bytes <= lim;
 }
 
+namespace {
+
+// The kernel's view of the pages behind `p`: whether they are file-backed,
+// which decides whether a refused mlock is a shortage, and a line for the
+// log that names what was refused.
+struct PageRegion {
+  bool        known       = false;
+  bool        file_backed = false;
+  std::string text        = "region unknown";
+};
+
+PageRegion
+page_region_(const void* p)
+{
+  PageRegion r;
+  mach_vm_address_t addr = (mach_vm_address_t)(std::uintptr_t)p;
+  mach_vm_size_t rsize = 0;
+  vm_region_extended_info_data_t info{};
+  mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+  mach_port_t obj = MACH_PORT_NULL;
+  if (mach_vm_region(mach_task_self(), &addr, &rsize,
+                     VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &cnt,
+                     &obj) != KERN_SUCCESS) {
+    return r;
+  }
+  r.known       = true;
+  r.file_backed = info.external_pager != 0;
+  r.text = fmt("region {} KB at +{} KB, prot {}, share_mode {}, user_tag {}, "
+               "external_pager {}, resident {} of {} pages",
+               rsize >> 10,
+               ((std::uintptr_t)p - (std::uintptr_t)addr) >> 10,
+               info.protection, info.share_mode, info.user_tag,
+               info.external_pager, info.pages_resident,
+               rsize / vm_page_size)();
+  return r;
+}
+
+}  // namespace
+
+bool
+GenerativeModelManager::pool_wirable(
+    const metal_compute::SharedBuffer& b) noexcept
+{
+  return b.byte_size() >= kMinWiredBytes;
+}
+
+void
+GenerativeModelManager::charge_external_wired(std::size_t bytes)
+{
+  if (bytes == 0) { return; }
+  _pool_used.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void
+GenerativeModelManager::release_external_wired(std::size_t bytes)
+{
+  if (bytes == 0) { return; }
+  std::size_t was = _pool_used.load(std::memory_order_relaxed);
+  while (!_pool_used.compare_exchange_weak(
+      was, was > bytes ? was - bytes : 0, std::memory_order_relaxed)) {}
+}
+
 std::size_t
 GenerativeModelManager::wire_into_pool(metal_compute::SharedBuffer& b)
 {
   const std::size_t n = b.byte_size();
   if (n == 0 || b.is_wired()) { return 0; }
+  // NOT A POOL QUESTION -- see pool_wirable(). Skipped silently, and above
+  // all without touching the ceiling.
+  if (!pool_wirable(b)) { return 0; }
   if (!wired_pool_can_take(n)) {
     // SAID ONCE. A caller sees only "0 bytes wired" and cannot tell a
     // full pool from a box that refused -- and those want opposite
@@ -582,25 +649,57 @@ GenerativeModelManager::wire_into_pool(metal_compute::SharedBuffer& b)
   }
   if (!b.set_wired(true)) {
     const int e = errno;
+    const PageRegion rg = page_region_(b.contents());
+    // ONLY A SHORTAGE CAPS THE POOL. ENOMEM / EAGAIN on anonymous memory is
+    // the box saying what it will give; a file-backed page (external
+    // pager) will not wire at any budget, and any other errno is this
+    // buffer's own property. Those skip THIS buffer and leave the ceiling
+    // alone -- the collapse on them is what froze identical runs at
+    // random levels. An unreadable region keeps the old, cautious answer.
+    const bool shortage =
+        (e == ENOMEM || e == EAGAIN) && !(rg.known && rg.file_backed);
+    if (!shortage) {
+      // The FIRST skip is said at info: a buffer class that never wires is
+      // silent protection lost, and the log is the only place it shows.
+      // Function-local so the manager's layout -- which plugins compile
+      // against -- does not move.
+      static std::atomic<bool> skip_said{false};
+      if (!skip_said.exchange(true, std::memory_order_relaxed) &&
+          session() != nullptr) {
+        session()->info(fmt(
+            "wired pool: {} bytes would not wire (errno {}: {}; the buffer "
+            "is {}, {}); skipped, the pool is unchanged (further skips are "
+            "logged at debug)", n, e, std::strerror(e),
+            b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+            rg.text));
+      } else if (session() != nullptr) {
+        session()->log_debug(fmt(
+            "wired pool: {} bytes would not wire (errno {}: {}; the buffer "
+            "is {}, {}); skipped, the pool is unchanged", n, e,
+            std::strerror(e),
+            b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+            rg.text));
+      }
+      return 0;
+    }
     // The box refused. Collapse the ceiling to what is already held so
     // callers stop asking -- the percentage was only ever an up-to, and
-    // this is the box saying what it will actually give.
+    // this is the box saying what it will actually give. reopen_wired_pool
+    // is how a caller asks again later.
     const std::size_t used = _pool_used.load(std::memory_order_relaxed);
     _pool_granted.store(used > 0 ? used : 1, std::memory_order_relaxed);
-    // WARN, not info: the pool has just collapsed to whatever happened
-    // to be held, so every later request fails too and the run silently
-    // loses the protection it was configured for. errno is the part
-    // that says WHY -- ENOMEM against a limit far above what was asked
-    // means the pages themselves would not wire, which is what a
-    // read-only file mapping does.
+    // WARN, not info: every later request fails too until a reopen, and
+    // the run loses protection it was configured for. WHAT was refused is
+    // named, in bytes, because that is what says why.
     if (!_pool_refused_said.exchange(true, std::memory_order_relaxed)
         && session() != nullptr) {
       session()->warn(fmt(
-          "wired pool: the box refused to wire {} MB (errno {}: {}) with "
-          "{} MB of a {} MB pool in use. The pool is capped at what is "
-          "already held; the rest of this run's weights stay reclaimable",
-          n >> 20, e, std::strerror(e), used >> 20,
-          wired_pool_limit() >> 20));
+          "wired pool: the box refused to wire {} bytes (errno {}: {}) with "
+          "{} MB of a {} MB pool in use; the buffer is {}, offset {}, {}. "
+          "The pool is capped at what is already held until a model reopens "
+          "it", n, e, std::strerror(e), used >> 20, wired_pool_limit() >> 20,
+          b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+          b.byte_offset(), rg.text));
     }
     return 0;
   }

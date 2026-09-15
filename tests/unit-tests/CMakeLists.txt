@@ -108,6 +108,9 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         coreml-cpp.cc
         coreml-inference-stage.cc
         coreml-model-manager.cc
+        ane-boundary.cc
+        ane-module.cc
+        ane-emitter.cc
         metal-compute.cc
         metal-compute-gemm-mma.cc
         optiq-block-perf.cc

@@ -265,6 +265,12 @@ private:
   // const and runs before any driver, so it reads the folded constant
   // rather than a value the runtime latch has not set yet.
   std::string vdn_dir_() const;
+  // The MiniMax-H3 ANE feed-forward tier: the plan's key for its module,
+  // the bytes it books for the planned clip, and carrying the granted tier
+  // onto _h3_cfg. See apply_h3_ane_().
+  std::string ane_claim_label_() const;
+  std::size_t h3_ane_bytes_() const;
+  void apply_h3_ane_();
   int           _height = 480;
   int           _width  = 832;
   int           _frames = 81;

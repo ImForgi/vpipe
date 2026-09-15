@@ -416,6 +416,13 @@ class MetalFlux2Vae {
   static constexpr int kTileOvDen = 4;
   // Largest square latent window whose decode peak fits `budget` (0 if none).
   int decode_tile_side_(std::size_t budget) const noexcept;
+  // Bytes of im2col band scratch a decode at this latent size allocates.
+  // CAPPED, and the cap is the whole point -- see the definition.
+  std::size_t decode_band_bytes_(int h16, int w16) const noexcept;
+  // The cap. A band is a GEMM M-dimension and nothing else, so it needs to
+  // be big enough to keep the GEMM efficient and not one byte more. Same
+  // figure as MetalKrea2Vae::kDecodeBandMax, for the same reason.
+  static constexpr std::size_t kDecodeBandMax = 128ull << 20;
   metal_compute::SharedBuffer decode_tiled_(
       const metal_compute::SharedBuffer& z, int h16, int w16, int tile16,
       std::string* err);

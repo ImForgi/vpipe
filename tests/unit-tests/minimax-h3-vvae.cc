@@ -499,6 +499,16 @@ TEST(minimax_h3_vvae, video_chunking_matches_golden)
   }
   cfg.tile_size        = tile;
   cfg.tile_overlap_min = tov;
+  // VPIPE_MINIMAX_H3_VVAE_GOLDEN_ANE: the same golden with the ANE
+  // feed-forward tier on -- real encoded latents through the whole decoder.
+  // Pair with VPIPE_H3_VVAE_ANE_CHUNK (and _ANE_ROWS) for tiles shorter
+  // than one default chunk.
+  if (std::getenv("VPIPE_MINIMAX_H3_VVAE_GOLDEN_ANE") != nullptr) {
+    cfg.ane_ffn = true;
+    if (const char* r = std::getenv("VPIPE_MINIMAX_H3_VVAE_ANE_ROWS")) {
+      cfg.ane_rows = (float)std::atof(r);
+    }
+  }
 
   auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
   ASSERT_TRUE(m != nullptr);
@@ -728,4 +738,103 @@ TEST(minimax_h3_vvae, decode_bench)
               LT, lh, lw, frames, lw * cfg.patch, lh * cfg.patch, ms,
               ms / (double)frames, cfg.tile_size);
   EXPECT_TRUE(ms > 0.0);
+}
+
+// The ANE feed-forward tier against the GPU alone, one decode() tile.
+//
+// The split is exact arithmetic -- the feed-forward is row-independent -- so
+// what separates the runs is fp16 on the ANE's rows against bf16. Small, and
+// not zero: zero would mean no row reached the ANE.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, geometry ..._ANE_{LT,LH,LW}
+// (default 7x16x16: one production tile, 1797 rows), VPIPE_H3_VVAE_ANE_ROWS
+// pins the share.
+TEST(minimax_h3_vvae, decode_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int LT = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LT", 7);
+  const int lh = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LH", 16);
+  const int lw = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LW", 16);
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+
+  const std::size_t n = (std::size_t)cfg.z_channels * LT * lh * lw;
+  SharedBuffer z = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!z.empty());
+  if (z.empty()) { return; }
+  {
+    std::uint32_t sd = 0x51ced00du;
+    auto* d = static_cast<std::uint16_t*>(z.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      sd = sd * 1664525u + 1013904223u;
+      d[i] = f32_to_bf16_(((float)(sd >> 9) / 4194304.0f - 1.0f));
+    }
+  }
+  struct Arm {
+    std::vector<float> rgb;
+    double best_ms = 0.0;
+    bool   armed   = false;
+  };
+  auto run = [&](bool ane) {
+    Arm arm;
+    MetalMiniMaxH3VideoVae::Config rc = cfg;
+    rc.ane_ffn = ane;
+    if (const char* r = std::getenv("VPIPE_H3_VVAE_ANE_ROWS")) {
+      rc.ane_rows = (float)std::atof(r);
+    }
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, rc);
+    if (m == nullptr) { return arm; }
+    for (int i = 0; i < 3; ++i) {         // 0 warms, then best of two
+      const auto t0 = std::chrono::steady_clock::now();
+      std::string derr;
+      SharedBuffer out = m->decode(z, LT, lh, lw, &derr);
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (out.empty()) {
+        std::printf("[minimax_h3_vvae] decode: %s\n", derr.c_str());
+        return Arm{};
+      }
+      if (i == 0) {
+        const auto* p = static_cast<const std::uint16_t*>(out.contents());
+        arm.rgb.resize(out.byte_size() / 2);
+        for (std::size_t k = 0; k < arm.rgb.size(); ++k) {
+          arm.rgb[k] = bf16_to_f32_(p[k]);
+        }
+      } else if (arm.best_ms == 0.0 || ms < arm.best_ms) {
+        arm.best_ms = ms;
+      }
+    }
+    arm.armed = m->ane_armed();
+    return arm;
+  };
+  const Arm gpu = run(false);
+  const Arm ane = run(true);
+  ASSERT_TRUE(!gpu.rgb.empty() && gpu.rgb.size() == ane.rgb.size());
+  if (gpu.rgb.empty() || gpu.rgb.size() != ane.rgb.size()) { return; }
+  double num = 0.0, den = 0.0, worst = 0.0;
+  std::size_t bad = 0;
+  for (std::size_t k = 0; k < gpu.rgb.size(); ++k) {
+    if (!std::isfinite(ane.rgb[k])) { ++bad; continue; }
+    const double d = (double)ane.rgb[k] - (double)gpu.rgb[k];
+    num += d * d;
+    den += (double)gpu.rgb[k] * (double)gpu.rgb[k];
+    worst = std::max(worst, std::fabs(d));
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[minimax_h3_vvae] ANE vs GPU decode %dx%dx%d: rel-L2 %.6f, max "
+              "abs %.4f, %zu non-finite | GPU-only %.0f ms, ANE split %.0f "
+              "ms, %.3fx\n", LT, lh, lw, rel, worst, bad, gpu.best_ms,
+              ane.best_ms, ane.best_ms > 0.0 ? gpu.best_ms / ane.best_ms : 0.0);
+  EXPECT_TRUE(ane.armed);
+  EXPECT_TRUE(bad == 0);
+  EXPECT_TRUE(rel < 0.02 && rel > 0.0);
 }

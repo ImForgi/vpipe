@@ -196,6 +196,11 @@ private:
   // the beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
+  // The plan's key for the MiniMax-H3 VAE's ANE module, and the bytes the
+  // module holds while the loaded VAE has it armed (0 otherwise) -- counted
+  // in the per-beat unload decision beside the decode arena.
+  std::string ane_claim_label_() const;
+  std::size_t _ane_bytes = 0;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Loaded lazily (exactly one per the detected family) by ensure_loaded_ --

@@ -1262,6 +1262,40 @@ MetalFlux2Vae::tiled_conv3x3_(ComputeEncoder& enc, const SharedBuffer& in,
   }
 }
 
+// The im2col band: the scratch a gathering 3x3 streams its [H*W, 9*cin]
+// through, sized for the widest cin that reaches it -- which is
+// block_out[0] on the hardware-conv path (only the small-cout convs fall
+// back) and max(block_out[0], block_out[1]) without it.
+//
+// THE CAP IS THE POINT. The band used to be sized from whatever headroom
+// was left after reserving the activation pool, which made the band and
+// the preflight unable to agree by construction: the preflight books a
+// figure, the band then grows to fill everything the box has BESIDE that
+// figure, and the peak is the sum. MEASURED at 512x512 on a 64 GB M4 with
+// FLUX.2-klein-4B (no hardware conv, so every conv gathers): a 1152 MB
+// band inside a 1600 MB peak, against 896 MB booked.
+//
+// A band is a GEMM M-dimension and nothing else, so paying for a bigger
+// one buys nothing -- see MetalKrea2Vae::decode_band_bytes_, where the
+// same cap was measured to cost nothing on either VAE's shapes. So cap
+// it, book the cap, and let the headroom only ever shrink it from there.
+std::size_t
+MetalFlux2Vae::decode_band_bytes_(int h16, int w16) const noexcept
+{
+  if (h16 <= 0 || w16 <= 0) { return 0; }
+  const std::size_t px = (std::size_t)8 * _cfg.patch;
+  const std::size_t Hout = (std::size_t)h16 * px;
+  const std::size_t Wout = (std::size_t)w16 * px;
+  const std::size_t big_cin =
+      _use_hwconv ? (std::size_t)_cfg.block_out[0]
+                  : (std::size_t)std::max(_cfg.block_out[0],
+                                          _cfg.block_out[1]);
+  const std::size_t full = Hout * Wout * 9 * big_cin * 2;   // whole image
+  const std::size_t floor_ = Wout * 9 * big_cin * 8 * 2;    // 8 output rows
+  if (full <= kDecodeBandMax) { return full; }
+  return std::max(floor_, kDecodeBandMax);
+}
+
 std::size_t
 MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
 {
@@ -1282,6 +1316,19 @@ MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
   // opts out) commits + frees each up-level, so the resident peak is ONE
   // level's working set, not the summed up-path.
   const bool split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
+  // ...and the buffer pool (default on; VPIPE_FLUX2_NO_VAE_POOL opts out)
+  // bounds a level to its CONCURRENT working set. Without it nothing is
+  // reused and a level holds its whole op chain. MEASURED on the im2col
+  // path at a capped band, and the figure is the same at both sizes: 9.5x
+  // `top` against 3.5x with the pool split-on (1216 MB at 512x512, 4865 at
+  // 1024x1024), and 19.4x split-off (2487 / 9950 MB). Booked at 11 and 21.
+  // The op chain is the same one the hardware-conv path runs, minus the col
+  // buffers, so those figures bound it too -- which is why the pool-off
+  // multipliers below do not depend on _use_hwconv.
+  const bool pool = std::getenv("VPIPE_FLUX2_NO_VAE_POOL") == nullptr;
+  if (!pool) {
+    return top * (split ? 11 : 21) + decode_band_bytes_(h16, w16);
+  }
   if (_use_hwconv) {
     // Hardware-conv path (DEFAULT): the big convs run through conv3x3_hw_ and
     // NEVER materialize the [Hout*Wout, 9*base] im2col scratch -- only the tiny
@@ -1292,19 +1339,25 @@ MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
     // The old 9x-im2col figure (13.5x top split-on) was a ~2.3x PHANTOM -- it
     // budgeted scratch this path never allocates and, once the doubled `base`
     // pushed it to 6912 MB, falsely rejected a 1024 decode sharing the box with
-    // other resident models (it fit in ~3 GB the whole time).
-    return split ? top * 7 : top * 10;     // split frees per level; no-split sums
+    // other resident models (it fit in ~3 GB the whole time). The band is on
+    // top: decode() allocates its scratch unconditionally, so it is resident
+    // on this path too whether or not a conv gathers into it.
+    // split frees per level; no-split sums.
+    return (split ? top * 7 : top * 10) + decode_band_bytes_(h16, w16);
   }
-  // im2col fallback (VPIPE_VAE_NO_HWCONV, or any non-matrix-core M4 GPU): the big
-  // convs materialize im2col, but conv3x3 ROW-TILES it into bands bounded to fit
-  // the free headroom (im2col_cap), so the split-on peak is the activation pool
-  // + one band -- the SAME order as the hw path (the band never exceeds the
-  // headroom). Budget top*7 like the hw path; the actual band shrinks to fit.
-  // Split-off keeps everything in one command buffer (pool holds every level),
-  // so keep the conservative summed im2col figure there.
-  if (split) { return top * 7; }
+  // im2col fallback (VPIPE_VAE_NO_HWCONV, or any non-matrix-core M4 GPU): the
+  // big convs materialize im2col, and conv3x3 ROW-TILES it into bands out of
+  // one shared scratch -- so the split-on peak is the activation pool plus
+  // that scratch. It used to be booked as the pool ALONE, on the reasoning
+  // that the band "never exceeds the headroom": true, and beside the point,
+  // because the headroom is not what was booked. MEASURED at 512x512, a 1600
+  // MB peak against 896 booked. Budget top*7 for the pool like the hw path,
+  // and the band explicitly. Split-off keeps everything in one command buffer
+  // (the pool holds every level), so keep the conservative summed im2col
+  // figure there.
+  if (split) { return top * 7 + decode_band_bytes_(h16, w16); }
   const std::size_t im2col = Hout * Wout * 9 * base * 2;
-  return im2col * 2;
+  return im2col * 2 + decode_band_bytes_(h16, w16);
 }
 
 int
@@ -1604,16 +1657,19 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
   const std::size_t k_safe_band =                            // corruption cap
       _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)Hout * Wout;
-  const std::size_t full_band =
-      (std::size_t)Hout * Wout * 9 * big_cin;                // full im2col elems
   const std::size_t floor_band = (std::size_t)Wout * 9 * big_cin * 8;  // 8 rows
   const std::size_t act_reserve = (std::size_t)Hout * Wout * base_max * 7;
-  std::size_t im2col_cap = full_band;                        // roomy default
+  // The memory cap is decode_band_bytes_() -- THE SAME FIGURE THE PREFLIGHT
+  // BOOKED, which is what makes the preflight an upper bound rather than a
+  // guess. The headroom can only take it DOWN from there: the band used to
+  // be handed the headroom left over BESIDE the reserve, so the decode's
+  // peak grew with the size of the box while the book stayed put.
+  std::size_t im2col_cap = decode_band_bytes_(h16, w16) / 2;
   if (decode_headroom > 0) {
     const std::size_t avail_el =                             // bytes -> elems
         decode_headroom > act_reserve * 2
             ? (decode_headroom - act_reserve * 2) / 2 : 0;
-    im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+    im2col_cap = std::min(im2col_cap, std::max(floor_band, avail_el));
   }
   // Never size the scratch past one safe band for the widest conv -- a bigger
   // buffer just wastes UMA (the per-conv band is safe-capped at k_safe_band).
@@ -1910,8 +1966,11 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   // Row-tiled im2col band scratch (see decode()): stream each conv's [H*W, 9*cin]
   // (or the s2 downsample's [(H/2)(W/2), 9*cin]) in output-row bands so the
   // shared col scratch is bounded to ONE band -- a full-res encode conv is
-  // otherwise ~2.4 GB. Cap the band by memory (headroom, no encode preflight so
-  // query it here) AND correctness (k_safe_band rows, matmul2d M-corruption).
+  // otherwise ~2.4 GB. Cap the band by kDecodeBandMax -- a band is a GEMM
+  // M-dimension and a bigger one measured no faster, so it is capped outright
+  // rather than handed the headroom (which made a decode's peak a function of
+  // the size of the box; see decode_band_bytes_) -- AND by correctness
+  // (k_safe_band rows, matmul2d M-corruption). Headroom only shrinks it.
   const std::size_t base_max =
       (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
   const std::size_t big_cin =
@@ -1921,13 +1980,14 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   const std::size_t full_band = (std::size_t)H0 * W0 * 9 * big_cin;
   const std::size_t floor_band = (std::size_t)W0 * 9 * big_cin * 8;
   const std::size_t act_reserve = (std::size_t)H0 * W0 * base_max * 7;
-  std::size_t im2col_cap = full_band;
+  std::size_t im2col_cap =
+      std::min(full_band, std::max(floor_band, kDecodeBandMax / 2));
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
     if (mb.recommended != 0) {
       const std::size_t avail_el = mb.headroom > act_reserve * 2
           ? (mb.headroom - act_reserve * 2) / 2 : 0;
-      im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+      im2col_cap = std::min(im2col_cap, std::max(floor_band, avail_el));
     }
   }
   im2col_cap = std::min(im2col_cap, k_safe_band * 9 * big_cin);

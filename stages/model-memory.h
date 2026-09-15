@@ -202,6 +202,62 @@ inline constexpr std::size_t kUnknownArena = 4096;
 std::vector<ResourceClaim>
 scratch_claims(std::string label, std::size_t bytes, std::string_view phase);
 
+// ---- CoreML / ANE residency -------------------------------------------
+//
+// Bytes a CoreML model holds that NOTHING ELSE in this process can see.
+// A weight set knows what it cached and a SharedBuffer knows what it
+// allocated; a CoreML model's weights are neither. They are handed to
+// CoreML at load and the file they came from is deleted, so they are
+// invisible to weight_footprint(), to revise_declaration(), to the
+// wired pool, and -- because they are not Metal resources -- to
+// MetalCompute::memory_budget().headroom as well. Only the physical-RAM
+// reading sees them, which is the backstop, not the plan.
+//
+// That was tolerable while the only CoreML models here were small
+// towers. It stopped being tolerable with the ANE feed-forward tier,
+// where the hold is per DiT BLOCK and scales with depth: measured at
+// ~1.2 GB a block on Krea-2, so a 28-block model asks for ~34 GB, more
+// than the checkpoint, against a declared streaming floor of 3.5 GB.
+// A floor is a promise (see the weights section above), and an
+// unaccounted hold of that size breaks it silently -- the revised-down
+// number reads as ROOM to whoever sizes next.
+//
+// So the claim is UNITS, not bytes: `unit_bytes` each, `units` of them,
+// and the planner grants as many as the box has room for -- possibly
+// zero, which means the accelerator stays off. That shape is what makes
+// this plannable at all. An accelerator is the one resource where
+// taking less is a real option: it costs proportional speed and nothing
+// else, so the planner never REFUSES a launch over it the way the
+// weight planner does. A model that cannot bear a partial grant should
+// claim one unit.
+inline constexpr std::string_view kCoreMLKind = "coreml-resident";
+
+// `label` names the holder for the log and is the key coreml_grant()
+// reads back, so it must be stable across the two calls and unique
+// within a graph (two stages sharing one label share its grant).
+std::vector<ResourceClaim>
+coreml_claims(std::string label, std::size_t unit_bytes, int units,
+              std::string_view phase = {});
+
+// How many units the plan granted `label`. Call it where the decision is
+// TAKEN -- at load, after the init barrier -- not at claim time: the
+// grant is not computed until every stage has claimed.
+//
+// `requested` is what the caller would take if the box were empty, and
+// the answer is never more than it. With no plan on record (a test, a
+// tool, anything not launched through PipelineRuntime) the same budget
+// arithmetic runs inline, so an unplanned caller is bounded too rather
+// than silently taking everything.
+int coreml_grant(const SessionContextIntf* session, std::string_view label,
+                 std::size_t unit_bytes, int requested);
+
+// The inverse of coreml_claims(), for a stage that books a claim it did not
+// make -- a plugin family's -- under a label of its own: the family cannot
+// know the stage's id, and two stages sharing one label share one grant.
+// False for anything that is not a well-formed CoreML claim.
+bool parse_coreml_claim(const ResourceClaim& c, std::string* label,
+                        std::size_t* unit_bytes, int* units);
+
 // A PAYLOAD: bytes that outlive the phase producing them.
 //
 // Same machinery as an arena -- a label, a size, a lifetime -- and a

@@ -953,6 +953,11 @@ TEST(flux2_smoke, vae_decode_bench)
     std::string err;
     m->decode(z, h16, w16, &err);                    // warm
     double best = 1e18;
+    // The measured peak beside the estimate: live SharedBuffer bytes above
+    // what was held before the timed decodes.
+    const std::size_t live0 =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    metal_compute::shared_buffer_reset_peak();
     for (int i = 0; i < 3; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       SharedBuffer o = m->decode(z, h16, w16, &err);
@@ -960,10 +965,77 @@ TEST(flux2_smoke, vae_decode_bench)
           std::chrono::steady_clock::now() - t0).count();
       if (!o.empty() && ms < best) { best = ms; }
     }
-    std::printf("[flux2_smoke] decode %dhx%dw: %.1f ms (peak est %llu MB)\n",
-                h16 * 16, w16 * 16, best,
+    const std::size_t pk =
+        metal_compute::shared_buffer_memory_stats().peak_bytes;
+    std::printf("[flux2_smoke] decode %dhx%dw: %.1f ms (peak %zu MB, est %llu "
+                "MB)\n", h16 * 16, w16 * 16, best,
+                pk > live0 ? (pk - live0) >> 20 : 0,
                 (unsigned long long)(m->decode_peak_bytes(h16, w16) >> 20));
+    // The preflight must not book less than a decode takes.
+    EXPECT_TRUE(m->decode_peak_bytes(h16, w16) >=
+                (pk > live0 ? pk - live0 : 0));
   }
+}
+
+// The row band the im2col fallback streams through is a memory knob, not a
+// numerical one: it splits a conv's GEMM along M, and rows are independent.
+// So the decode must not depend on it. Worth its own test because the band
+// is now CAPPED rather than sized from free headroom (decode_band_bytes_),
+// and because the hwconv A/B above needs matrix cores -- on a GPU without
+// the hardware conv, where every 3x3 gathers and the band therefore matters
+// most, nothing else watches this. VPIPE_FLUX2_TEST_MODEL_PATH gated.
+TEST(flux2_smoke, vae_decode_band_size_invariant)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  // Force every 3x3 onto the gathering path -- the hardware conv bands
+  // nothing, so the two arms would be identical by construction on it.
+  ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1);
+  auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+  ::unsetenv("VPIPE_VAE_NO_HWCONV");
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const int C = m->config().dit_channels();
+  const int h16 = 24, w16 = 24;                        // 384x384 at patch 2
+  const std::size_t hw = (std::size_t)h16 * w16;
+  SharedBuffer z = mc->make_shared_buffer((std::size_t)C * hw * 2);
+  std::uint32_t s = 0x7f4a7c15u;
+  auto* d = static_cast<_Float16*>(z.contents());
+  for (std::size_t i = 0; i < (std::size_t)C * hw; ++i) {
+    s = s * 1664525u + 1013904223u;
+    d[i] = (_Float16)(((float)(s >> 8) / 8388608.0f - 1.0f) * 3.0f);
+  }
+  std::vector<float> a, b;
+  auto run = [&](const char* rows, std::vector<float>* out) {
+    if (rows != nullptr) { ::setenv("VPIPE_FLUX2_VAE_BAND_ROWS", rows, 1); }
+    else                 { ::unsetenv("VPIPE_FLUX2_VAE_BAND_ROWS"); }
+    std::string err;
+    SharedBuffer rgb = m->decode(z, h16, w16, &err);
+    ::unsetenv("VPIPE_FLUX2_VAE_BAND_ROWS");
+    if (rgb.empty()) { return; }
+    const std::size_t n = rgb.byte_size() / 2;
+    out->resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)p[i]; }
+  };
+  run(nullptr, &a);                                    // the capped default
+  run("64", &b);                                       // many small bands
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  if (a.empty() || a.size() != b.size()) { return; }
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) { ++diff; }
+  }
+  const double r = rel_l2_(a.data(), b.data(), a.size());
+  std::printf("[flux2_smoke] band-size rel-L2 = %.6g (%zu/%zu elems differ)\n",
+              r, diff, a.size());
+  EXPECT_TRUE(std::isfinite(r) && r < 2e-3);
 }
 
 // NAX hardware conv A/B for the ENCODER (stride-2 downsample convs +

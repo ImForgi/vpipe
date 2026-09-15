@@ -68,7 +68,7 @@ cp ~/src/vpipe/docs/pipelines/prepare-qwen35-9b-optiq-4bit.vpipeline .
 
 **One stage — `model-fetch` — and no quantize step.** That is the point of
 picking a pre-quantized checkpoint for a first example: the heavier docs here
-([MiniMax H3](MINIMAX-H3.md), [klein-9b-kv](KLEIN-KV.md)) spend their step 1
+([MiniMax H3](MINIMAX-H3.md), [FLUX.2-klein](KLEIN.md)) spend their step 1
 converting tens of gigabytes, and this one just downloads.
 
 `skip_existing_files` is on, so `Ctrl-C` and re-run picks up where it left

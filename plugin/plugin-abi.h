@@ -68,6 +68,15 @@
 // memory_budget(), so every field after it moved. Both landed before any
 // plugin was rebuilt against 4, so no binary reports 4 and means only
 // the first.
+// THE ANE TIER IS THE SAME SHAPE OF PROMISE, and was built that way so
+// new work never costs a bump. generative-models/shared/ane-tier.h
+// FREEZES ane::Binding, the signatures of ane::create/runtime_bytes and of
+// ane::Tier's methods, and Tier::Plan's values -- a change to any of those
+// is a bump. It does NOT freeze its vocabulary: a new kind (another
+// activation, another projection, an attention block), a new spec or
+// params key, a new binding name, a new info() field are all additions an
+// old plugin never asks for. Tier itself is one pointer with out-of-line
+// methods, so its layout is not compiled into anything.
 #define VPIPE_PLUGIN_ABI_VERSION 4u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively

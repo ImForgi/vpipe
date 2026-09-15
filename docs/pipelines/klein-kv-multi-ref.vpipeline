@@ -1,0 +1,201 @@
+{
+  "id": "klein-kv-multi-ref",
+  "stages": [
+    {
+      "id": "load-image-1",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "minimax-h3-reference-subject.jpg"
+        ]
+      }
+    },
+    {
+      "id": "load-image-2",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "klein-multi-ref-panda.jpg"
+        ]
+      }
+    },
+    {
+      "id": "image-resample-1",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image-1",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 512,
+        "height": 512,
+        "fit": "crop"
+      }
+    },
+    {
+      "id": "image-resample-2",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image-2",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 512,
+        "height": 512,
+        "fit": "crop"
+      }
+    },
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/FLUX.2-klein-9b-kv-4bit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "The orange tabby cat wearing the navy velvet jacket from image 1 sits beside the giant panda from image 2 on a mossy rock in a misty bamboo forest. The panda offers the cat a bamboo stalk. Keep the cat's face, fur pattern and jacket exactly as in image 1. Paint the whole scene in the soft watercolor style of image 2."
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-encode-1",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "image-resample-1",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-encode-2",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "image-resample-2",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "flux2-model-config",
+      "type": "flux2-model-config",
+      "iports": [],
+      "config": {
+        "klein_kv": true
+      }
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode-1",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode-2",
+          "oport": 0
+        },
+        {
+          "src": "flux2-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 768,
+        "height": 512,
+        "steps": 4,
+        "i8_gemm": true
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-image",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "klein-kv-multi-ref.jpeg"
+      }
+    }
+  ],
+  "subpipelines": []
+}

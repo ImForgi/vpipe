@@ -50,6 +50,16 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   _accel = FlexData::make_object();
   genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
                          attr_bool("i8_gemm"));
+  genai::accel::set_flag(&_accel, genai::accel::kAneFfn, attr_bool("ane_ffn"));
+  {
+    double rows = attr_real("ane_rows");
+    if (!(rows >= 0.0)) { rows = 0.0; }
+    if (rows > 1.0) { rows = 1.0; }
+    genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
+    const long long layers = attr_int("ane_layers");
+    genai::accel::set_integer(&_accel, genai::accel::kAneLayers,
+                              layers > 0 ? layers : 0);
+  }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _fps = attr_real("fps");
   if (!(_fps > 0.0)) { _fps = 24.0; }
@@ -124,6 +134,24 @@ const ConfigKey kAttrs[] = {
           "trade can be MEASURED. Only a REGISTERED family reads it; the "
           "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
    .def_bool = false},
+  {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated decode (LOSSY, fp16): split the decoder blocks' "
+          "feed-forward between the GPU and the Apple Neural Engine by rows, "
+          "concurrently. MiniMax-H3's video VAE only: its decoder is a ViT "
+          "whose feed-forward is ~70% of the decode, and attention stays on "
+          "the GPU. One shared runtime-weight module (~0.3 GB), claimed from "
+          "the resource plan and staged per tile per block. Other families "
+          "ignore it",
+   .def_bool = false},
+  {.key = "ane_rows", .type = ConfigType::Real, .required = false,
+   .doc = "the ANE's share of each feed-forward's rows, rounded to whole "
+          "chunks; 0 (default) balances from the two engines' measured times",
+   .def_real = 0.0},
+  {.key = "ane_layers", .type = ConfigType::Int, .required = false,
+   .doc = "cap on how many decoder blocks use the ANE feed-forward; 0 "
+          "(default) means all. Not a memory setting -- the blocks share one "
+          "module -- so set it only to cover fewer blocks on purpose",
+   .def_int = 0},
 };
 const PortSpec kIports[] = {
   {.name = "latent",
@@ -376,8 +404,38 @@ VaeDecodeStage::declare_resources() const
   // Through the same resolver the release uses, so the claim and its
   // release cannot name different things -- and so a repack does not
   // claim its whole repository.
-  return model_memory::weight_claims_in_phase({vae_dir_for_release_()},
-                                              model_memory::kPhaseDecode);
+  std::vector<ResourceClaim> out = model_memory::weight_claims_in_phase(
+      {vae_dir_for_release_()}, model_memory::kPhaseDecode);
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // ANE RESIDENCY: one unit in the decode phase, for MiniMax-H3's VAE --
+  // the only codec with the tier. CoreML holds the module's bytes where no
+  // other ledger can see them. See ensure_loaded_ for the grant.
+  // Gated on the SAME family probe ensure_loaded_ dispatches on: the H3
+  // config reader parses other families' config.json too, and a claim for
+  // a module nothing builds is a lie the plan would size peers against.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      vae_family_(resolve_vae_dir(root)) == "minimax-h3") {
+    genai::MetalMiniMaxH3VideoVae::Config hc;
+    std::string herr;
+    if (genai::MetalMiniMaxH3VideoVae::config_from_json(
+            genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root), hc,
+            &herr)) {
+      for (auto& c : model_memory::coreml_claims(
+               ane_claim_label_(),
+               genai::MetalMiniMaxH3VideoVae::ane_runtime_bytes(hc), 1,
+               model_memory::kPhaseDecode)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
+#endif
+  return out;
+}
+
+std::string
+VaeDecodeStage::ane_claim_label_() const
+{
+  return "ane-ffn/" + std::string(this->id());
 }
 
 Job
@@ -472,8 +530,10 @@ VaeDecodeStage::revise_decode_arena_(std::size_t bytes)
   const std::size_t ram = model_memory::phys_ram();
   const std::size_t fp  = model_memory::weight_footprint(session(),
                                                          _idle_peers);
-  const bool want =
-      model_memory::resolve_idle_unload(ram, fp, bytes, _unload_idle);
+  // The ANE module sits beside the arena for the whole decode, so the
+  // question is whether BOTH fit next to the peers.
+  const bool want = model_memory::resolve_idle_unload(
+      ram, fp, bytes + _ane_bytes, _unload_idle);
   if (want == _unload_idle) { return; }
   _unload_idle = want;
   session()->log_debug(fmt(
@@ -818,6 +878,26 @@ VaeDecodeStage::ensure_loaded_()
       session()->error(fmt(
           "VaeDecodeStage('{}'): {}; inert", this->id(), h3err));
       return;
+    }
+    // The ANE tier runs only on the plan's grant: its module is one fixed
+    // unit, and without the grant the config stays off.
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      const std::size_t bytes =
+          genai::MetalMiniMaxH3VideoVae::ane_runtime_bytes(h3cfg);
+      if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes,
+                                     1) > 0) {
+        h3cfg.ane_ffn    = true;
+        h3cfg.ane_rows   =
+            (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
+        h3cfg.ane_layers = (int)genai::accel::integer(
+            &_accel, genai::accel::kAneLayers, 0);
+        _ane_bytes = bytes;
+      } else {
+        session()->info(fmt(
+            "VaeDecodeStage('{}'): the ANE feed-forward was requested but "
+            "the plan left no room for its module ({} MB); keeping the GPU",
+            this->id(), bytes >> 20));
+      }
     }
     load_note_(fmt("VaeDecodeStage('{}'): loading the MiniMax-H3 video VAE "
                    "from '{}'", this->id(), vae_dir));
@@ -1355,6 +1435,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // into the next decode.
       _h3_vae->set_tile_progress(nullptr);
       bar.finish();
+      // Set the module booking to what is HELD after this decode: the
+      // module's bytes when the tier armed, 0 when it declined. Both ways,
+      // every clip, so the ledger follows a reload that arms after one that
+      // did not.
+      if (_h3_vae->ane_attempted()) {
+        if (!_h3_vae->ane_armed()) { _ane_bytes = 0; }
+        if (auto* mgr = session()->services()->generative_model_manager()) {
+          mgr->revise_scratch("coreml:" + ane_claim_label_(), _ane_bytes);
+        }
+      }
     }
     if (rgb.empty() || F <= 0) {
       session()->warn(fmt(

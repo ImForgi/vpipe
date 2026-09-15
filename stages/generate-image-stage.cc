@@ -25,6 +25,7 @@
 #include <type_traits>
 #include <sys/sysctl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -97,6 +98,41 @@ const ConfigKey kAttrs[] = {
           "a negative prompt on iport1 runs a 2nd DiT pass per step"},
   {.key = "init_latents", .type = ConfigType::String, .required = false,
    .doc = "debug: raw f32 packed initial latents [img_seq, 64] (repro/golden)"},
+  {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated FFN (LOSSY, fp16): run the block feed-forward on "
+          "the Apple Neural Engine, which on an M4 is the only unused "
+          "compute on the die -- the GPU's f16 GEMM already sits at "
+          "84-92% of roofline and its integer MAD is a QUARTER of the "
+          "f16 rate, so there is no int8 lever there. The rows are split "
+          "between the two engines and run concurrently. The ANE runs "
+          "ONE shared module whose weights are runtime inputs, staged "
+          "per block into IOSurface buffers: its memory is fixed (~1.4 "
+          "GB for Krea-2, however many blocks use it), it compiles once "
+          "per shape and is cached after, and it measured 10.4 TOPS on "
+          "a Krea-2 feed-forward. The resource plan decides whether the "
+          "module fits. A 4/8-bit affine checkpoint is dequantized "
+          "into those buffers per block. Ignored by families that do "
+          "not implement it -- they say so in the log"},
+  {.key = "ane_rows", .type = ConfigType::Real, .required = false,
+   .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
+          "rest CONCURRENTLY (rows are independent in a feed-forward, so "
+          "the split is exact -- no partial sums, no seam). 0 (default) "
+          "lets the family balance from the two engines' measured rates; "
+          "~12.6 TOPS ANE against ~7 TFLOP/s GPU puts it near 0.64. 1 "
+          "gives the whole FFN to the ANE and idles the GPU for its "
+          "duration. The crossing itself is free: measured at -0.3 to "
+          "-1.0 ms against a GPU-only control with the same commit "
+          "count, i.e. the ANE phase overlaps the GPU's commit/wait "
+          "rather than serialising behind it"},
+  {.key = "ane_templates", .type = ConfigType::String, .required = false,
+   .doc = "directory of precompiled ANE module templates. Unused by the "
+          "runtime-weight feed-forward, which emits its own graph; "
+          "accepted so existing graphs keep loading"},
+  {.key = "ane_layers", .type = ConfigType::Int, .required = false,
+   .doc = "cap on how many blocks use the ANE feed-forward; 0 (default) "
+          "means every dense block. Not a memory setting -- the blocks "
+          "share one module whose cost is fixed -- so set it only to "
+          "cover fewer blocks on purpose, e.g. for a benchmark"},
   {.key = "sage_attn", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated attention (LOSSY): SageAttention runs the QK^T "
           "product of the flash kernel in INT8, one scale per attention "
@@ -510,6 +546,22 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
                             _sol.dense_layers);
   genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
                             _sol.local_radius);
+  // The ANE tier. An empty `ane_templates` does NOT disable it: a family
+  // that can emit its own graph needs no template, and only the family
+  // knows whether it can, so the decision belongs there and not here.
+  // `ane_layers` caps the blocks that use it;
+  {
+    const std::string tdir = attr_str("ane_templates");
+    const bool on = attr_bool("ane_ffn");
+    double rows = attr_real("ane_rows");
+    if (!(rows >= 0.0) || rows > 1.0) { rows = 0.0; }
+    long long layers = attr_int("ane_layers");
+    if (layers < 0) { layers = 0; }
+    genai::accel::set_flag(&_accel, genai::accel::kAneFfn, on);
+    genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
+    genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
+    genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
+  }
   // ...and back out, which is the half that makes it one decision. If a
   // key is ever written under one name and read under another, this is
   // where it stops being true rather than three plugins away.
@@ -564,6 +616,59 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _scheduler_spec.steps = _steps;   // config default; port beats override
 #endif
+}
+
+// Carry the settled ANE tier out of the accel bag and onto a family's
+// config. WITHOUT THIS the keys are documented, validated and put in
+// the bag, and then nothing reads them -- the tier is reachable from a
+// test and from no graph at all, which is exactly how it shipped
+// unreachable the first time.
+//
+// Templated because every family that grows the tier takes the same
+// three fields; the bag is the shared vocabulary, this is the one place
+// that spends it.
+std::string
+GenerateImageStage::ane_claim_label_() const
+{
+  return "ane-ffn/" + std::string(this->id());
+}
+
+template <typename Cfg>
+void
+GenerateImageStage::apply_ane_(Cfg& cfg) const
+{
+  namespace a = genai::accel;
+  if (!a::flag(&_accel, a::kAneFfn)) { return; }
+  cfg.session       = session();
+  cfg.ane_templates = a::text(&_accel, a::kAneTemplates);
+  cfg.ane_rows      = (float)a::real(&_accel, a::kAneRows, 0.0);
+  // WHETHER the tier runs is the plan's call; HOW MANY blocks use it is
+  // not a memory question.
+  //
+  // The feed-forward runs on ONE shared runtime-weight module whose
+  // weights are staged per block into IOSurface slots, so its cost is
+  // fixed -- the module's staged weights plus the slots, ~1.4 GB for
+  // Krea-2 -- however many blocks use it. The plan grants that one unit
+  // or nothing, and without it the config carries no session, which is
+  // how the family is told to keep its GPU path. Read HERE rather than at
+  // claim time because the grant is not computed until every stage has
+  // claimed.
+  const std::size_t bytes = genai::MetalKrea2Transformer::ane_runtime_bytes(
+      cfg.hidden, cfg.ffn,
+      genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
+  if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
+      0) {
+    cfg.session = nullptr;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): the ANE feed-forward was requested but "
+        "the plan left no room for its module ({} MB); keeping the GPU "
+        "feed-forward", this->id(), bytes >> 20));
+    return;
+  }
+  // `ane_layers` is only a CAP now -- a run covering fewer blocks, say a
+  // benchmark. 0 means every dense block.
+  cfg.ane_layers =
+      (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));
 }
 
 GenerateImageStage::~GenerateImageStage() = default;
@@ -792,19 +897,26 @@ flux2_decode_peak_(int w, int h, int base)
 }
 
 // AutoencoderKLQwenImage -- Krea-2 AND Qwen-Image-Edit, which run the
-// same MetalKrea2Vae. Here the largest buffer in a level IS the top-res
-// im2col scratch [Hout*Wout, 9*base]: conv_out (3 ch) and the top-level
-// resblock convs (base ch) cannot use the hardware conv (cout % 64 != 0)
-// and fall back to im2col even in hwconv mode. Plus ~50% for that
-// level's input/output/carry. Mirrors MetalKrea2Vae::decode_peak_bytes;
+// same MetalKrea2Vae. Two terms, mirroring
+// MetalKrea2Vae::decode_peak_bytes: the top level's activations (six
+// full-resolution base-channel f16 tensors, five of them measured live)
+// plus the im2col band, which a GPU without the hardware conv pays on
+// every 3x3. The band is CAPPED there (kDecodeBandMax, 128 MB) rather
+// than sized from free headroom, which is the only reason a fixed figure
+// here can be an upper bound at all. Booked unconditionally: this runs
+// before anything is loaded, so it cannot know whether this GPU gathers.
 // `base` = the checkpoint's base_dim, see krea2_vae_base_.
 std::size_t
 qwen_decode_peak_(int w, int h, int base)
 {
   if (w <= 0 || h <= 0 || base <= 0) { return 0; }
-  const std::size_t im2col =
-      (std::size_t)h * (std::size_t)w * 9 * (std::size_t)base * 2;
-  return im2col + im2col / 2;
+  const std::size_t hw = (std::size_t)h * (std::size_t)w;
+  const std::size_t acts = hw * (std::size_t)base * 2 * 6;
+  // Widest cin the decoder bands for is base*dim_mult[1], and dim_mult is
+  // {1,2,4,4} for this family.
+  const std::size_t band = std::min(hw * 9 * (std::size_t)base * 2 * 2,
+                                    (std::size_t)(128ull << 20));
+  return acts + band;
 }
 
 // The Krea-2 VAE (WanVAE-style, shared with Qwen-Image-Edit) sizes its conv
@@ -1008,6 +1120,37 @@ GenerateImageStage::declare_resources() const
   for (auto& c : model_memory::scratch_claims("vae-decode", arena,
                                               model_memory::kPhaseDecode)) {
     out.push_back(std::move(c));
+  }
+
+  // ANE RESIDENCY: one unit.
+  //
+  // The bytes a CoreML model holds are invisible to every other ledger in
+  // this process -- not a weight set, not a SharedBuffer, not even a Metal
+  // allocation -- so without this claim the tier's module appears nowhere,
+  // beside a DiT that has revised its own declaration DOWN to a streaming
+  // floor. The feed-forward runs on ONE shared runtime-weight module
+  // (weights staged per block), so the cost is a single fixed unit:
+  // granted or not, never partial. Claimed in the DENOISE phase, the only
+  // one the DiT is alive in.
+  //
+  // Only for the family that HAS the tier. Claiming for a graph whose
+  // config sites never call apply_ane_() would declare bytes nothing
+  // allocates, which is the same lie pointing the other way.
+  //
+  // A QUANTIZED checkpoint claims the same unit: its feed-forward is
+  // dequantized into the module's fp16 inputs per block, so the module
+  // costs what it costs a dense one.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "krea2") {
+    const genai::MetalKrea2Transformer::Config kc;
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalKrea2Transformer::ane_runtime_bytes(
+                 kc.hidden, kc.ffn,
+                 genai::MetalKrea2Transformer::ane_plan_seq(_width, _height)),
+             1, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
   }
   return out;
 }
@@ -1550,6 +1693,7 @@ GenerateImageStage::ensure_loaded_()
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
     kcfg.sage = _sage;
+    apply_ane_(kcfg);
     _dit = genai::MetalKrea2Transformer::load(
         weight_set_(dit_dir), mc, kcfg, stream_blocks,
         lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
@@ -1964,6 +2108,7 @@ GenerateImageStage::load_krea2_dit_()
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
   kcfg.sage = _sage;
+  apply_ane_(kcfg);
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or un-adapted,
   // on the graph that asked for both.
@@ -2080,7 +2225,22 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
     // No budget to read -> the free bails out too, so the DiT survives.
     const bool decode_runs_beside_us =
         mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
-    _dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    // Plus the ANE module when the plan granted it: CoreML holds its staged
+    // weights beside every forward, and a block kept resident into that
+    // memory is the same failure as one kept into the decode.
+    std::size_t ane = 0;
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      const genai::MetalKrea2Transformer::Config kc;
+      const std::size_t bytes =
+          genai::MetalKrea2Transformer::ane_runtime_bytes(
+              kc.hidden, kc.ffn,
+              genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
+      if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes,
+                                     1) > 0) {
+        ane = bytes;
+      }
+    }
+    _dit->set_residency_reserve((decode_runs_beside_us ? peak : 0) + ane);
     // And the RATES for this schedule. Both of BlockResidency's defaults
     // are tuned for a ~30-step run: on a short one the probe would reach
     // full residency only near the end, where nothing is left to use it.
@@ -2234,6 +2394,14 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
   DenoiseProgress prog(&bar, S - start, cfg ? 2 : 1);
   ScopedBlockProgress<std::remove_reference_t<decltype(*_dit)>>
       prog_guard(_dit.get(), prog);
+  // Once per generation, after the first forward -- which is where the ANE
+  // tier arms or declines -- set the module booking to what is HELD: the
+  // bytes at this generation's sequence when armed, 0 when it declined
+  // (emitter unverified, nothing eligible). Both ways, so a declined size
+  // followed by one that arms does not leave the ledger at zero.
+  // revise_scratch() refuses to create, so this is a no-op when the plan
+  // booked nothing.
+  bool ane_checked = false;
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
@@ -2241,6 +2409,20 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
     SharedBuffer vel = _dit->forward_dit(fused, n_real, latbuf, img_seq, gh, gw,
                                          (float)sigma, -1, ri);
     prog.end_forward();
+    if (!ane_checked) {
+      ane_checked = true;
+      if (_dit->ane_attempted()) {
+        if (auto* mgr = session()->services()->generative_model_manager()) {
+          const genai::MetalKrea2Transformer::Config kc;
+          mgr->revise_scratch(
+              "coreml:" + ane_claim_label_(),
+              _dit->ane_armed()
+                  ? genai::MetalKrea2Transformer::ane_runtime_bytes(
+                        kc.hidden, kc.ffn, n_real + img_seq)
+                  : 0);
+        }
+      }
+    }
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());

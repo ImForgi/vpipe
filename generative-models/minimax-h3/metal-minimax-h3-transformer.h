@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "generative-models/shared/ane-ffn.h"
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/block-residency.h"
@@ -180,6 +181,33 @@ class MetalMiniMaxH3Transformer {
     // are get computed, and i8_gemm how the GEMMs around them do. None
     // of the three reads the others.
     sage::Config sage;
+
+    // ---- the ANE tier (LOSSY, opt-in) -------------------------------
+    //
+    // The block feed-forward on the Apple Neural Engine beside the GPU:
+    // the rows are split between the two engines and run concurrently,
+    // which is exact because a feed-forward is row-independent. ONE
+    // runtime-weight module serves every block (see shared/ane-ffn.h), so
+    // the tier's memory is fixed -- ane_runtime_bytes() -- and it compiles
+    // once per shape. fp16 on the ANE, which is safe for the feed-forward
+    // alone: only its output re-enters the bf16 residual stream, and that
+    // addition stays on the GPU. A 4/8-bit affine checkpoint is
+    // dequantized into the module's inputs per block.
+    //
+    // `ane_rows` is the ANE's share of the rows, 0 auto-balancing from the
+    // measured times; `ane_layers` caps how many blocks use it, 0 all.
+    // Refiner blocks never do: they run over the text rows alone, far
+    // under one chunk. A runtime LoRA on fc1 or fc2 is merged into the
+    // ANE's staged weights per block; the GPU's rows apply it as usual.
+    // Set from generate-video's `ane_*` keys once the plan has granted the
+    // module; VPIPE_H3_ANE_CHUNK / VPIPE_H3_ANE_PROFILE for tuning.
+    bool  ane_ffn    = false;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
+    // PROTOTYPE: the fused qkv projection split onto the ANE the same way,
+    // on its own matmul tier (auto share, same on/off controller).
+    // VPIPE_H3_ANE_QKV=1 also turns it on. Not wired to a stage yet.
+    bool  ane_qkv    = false;
 
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
@@ -428,6 +456,31 @@ class MetalMiniMaxH3Transformer {
   // in one commit. Remove once nothing asks.
   int pinned_blocks() const { return 0; }
   bool streaming() const { return _stream_blocks; }
+
+  // Bytes the ANE feed-forward tier holds for a `seq`-row forward of this
+  // shape; see AneFeedForward::runtime_bytes. Static because the PLAN asks
+  // before anything loads.
+  static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
+  // Rows per ANE predict: VPIPE_H3_ANE_CHUNK or the default.
+  static int ane_chunk_rows() noexcept;
+  // Whether the tier tried to arm, and whether it did: a plan that booked
+  // the module can release the booking when it did not.
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept { return _ane != nullptr; }
+  // Take the ANE tiers off for this model before a forward that cannot
+  // afford them: modules released, config off, and the VPIPE_H3_ANE_QKV
+  // override ignored. The stage calls this when a clip fits only without
+  // the ANE's memory, rather than refusing the clip.
+  void disable_ane() noexcept
+  {
+    _cfg.ane_ffn  = false;
+    _cfg.ane_qkv  = false;
+    _ane_disabled = true;
+    _ane.reset();
+    _ane_qkv.reset();
+    _ane_tried     = true;
+    _ane_qkv_tried = true;
+  }
 
   ~MetalMiniMaxH3Transformer();   // out-of-line: _ws is fwd-declared
 
@@ -1361,6 +1414,34 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_qmm_swiglu4, _fn_qmm_swiglu8;
   metal_compute::ComputeFunction _fn_qmm_swiglu4_bm64, _fn_qmm_swiglu8_bm64;
   bool _fuse_ff = false;
+
+  // ---- the ANE tier ------------------------------------------------
+  // Built LAZILY at the first forward, because the chunked module needs
+  // the row count to set the split and that is not known until then. A
+  // null module means every block keeps its GPU feed-forward, which is
+  // what every failure falls back to.
+  std::unique_ptr<AneFeedForward> _ane;
+  bool _ane_tried       = false;
+  bool _ane_skip_warned = false;   // one warning for ineligible blocks
+  bool _sage_off_noted  = false;   // one note when Sage fell back to dense
+  // The qkv tier: a matmul module of its own, split like the FF.
+  std::unique_ptr<AneFeedForward> _ane_qkv;
+  bool _ane_qkv_tried = false;
+  bool _ane_disabled  = false;   // disable_ane() was called
+  bool ane_qkv_setup_(int seq);
+  bool ane_qkv_eligible_(int L, const Block& b);
+  void ane_qkv_stage_(int L, const Block& b, const LoraStack& lora);
+  bool ane_setup_(int seq);        // false == tier off
+  // Whether block L's feed-forward can go to the ANE: under the cap, no
+  // bias, fc1/fc2 dense bf16 or 4/8-bit affine, and not an adapted fc1 in
+  // the interleaved layout (the adapter's rows are [gate; up]).
+  bool ane_eligible_(int L, const Block& b, bool adapted);
+  // Dispatch block L's gate/up/down into the module's slots and return at
+  // once, so the conversion runs under the block's attention. fc1 is
+  // [gate; up] halves, or interleaved pairs once fused (Linear::gu_inter).
+  // The live adapters on fc1/fc2 are merged into the staged rows.
+  void ane_stage_(int L, const Block& b, const LoraStack& fc1,
+                  const LoraStack& fc2);
 
   // ---- runtime LoRA ------------------------------------------------
   // One projection's factors. A [rank, K] and B [N, rank], both bf16 and

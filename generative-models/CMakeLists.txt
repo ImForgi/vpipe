@@ -28,6 +28,9 @@ set(LOCAL_SOURCES
   model-loader.cc
   sampler.cc
   tokenizer.cc
+  shared/ane-module.cc
+  shared/ane-ffn.cc
+  shared/ane-tier.cc
   shared/comfy-checkpoint.cc
   shared/comfy-output-config.cc
   shared/gguf-convert.cc

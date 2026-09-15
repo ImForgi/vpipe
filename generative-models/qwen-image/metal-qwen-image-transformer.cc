@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 
@@ -341,7 +342,8 @@ MetalQwenImageTransformer::wire_block_(Block& b, bool on)
   auto one = [&](metal_compute::SharedBuffer& p) {
     if (stop) { return; }
     const std::size_t n = _wire.wire_one(_mc, p, on);
-    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
       stop = true;
       return;
     }
@@ -430,6 +432,10 @@ MetalQwenImageTransformer::resident_pages_(std::size_t* examined,
       // wired `examined` stays 0, which the caller reads as "no evidence"
       // rather than as a shortfall, and that is the correct answer.
       if (p->is_wired()) { continue; }
+      // Nor one below the pool's minimum: never wired, heap-owned pages
+      // that read partly out of RAM for reasons unrelated to this block.
+      // See GenerativeModelManager::pool_wirable.
+      if (!GenerativeModelManager::pool_wirable(*p)) { continue; }
       const auto r = p->page_residency(64);
       if (!r.valid) { continue; }
       *examined += r.examined;

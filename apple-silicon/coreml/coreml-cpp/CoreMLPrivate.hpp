@@ -218,6 +218,8 @@ namespace CML::Private::Selector {
   _CML_PRIVATE_DEF_SEL(featuresAtIndex_, "featuresAtIndex:");
 
   // ---- MLMultiArray -----------------------------------------------
+  _CML_PRIVATE_DEF_SEL(initWithPixelBuffer_shape_,
+                       "initWithPixelBuffer:shape:");
   _CML_PRIVATE_DEF_SEL(initWithShape_dataType_error_,
                        "initWithShape:dataType:error:");
   _CML_PRIVATE_DEF_SEL(

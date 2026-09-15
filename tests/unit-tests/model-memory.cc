@@ -28,6 +28,10 @@
 #include "stages/model-registry.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "stages/vae-decode-stage.h"
+#include "stages/generate-video-stage.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
 
 #include <cstdlib>
@@ -924,6 +928,184 @@ TEST(model_memory, phases_peak_rather_than_sum)
 
   mgr->clear_declarations();
   fs::remove_all(root, ec);
+}
+
+// A CoreML hold is bytes nothing else in the process can see -- not a
+// weight set, not a SharedBuffer, not even a Metal allocation -- so the
+// only thing that can keep it honest is that it is CLAIMED. These check
+// the two halves that make the claim worth making: that a grant is
+// bounded by what the rest of the plan left, and that the granted bytes
+// then show up in the peak like everything else.
+// A stage books a plugin family's CoreML claim under its own label, which
+// only works if the claim reads back exactly -- including a label that
+// itself contains the separator.
+TEST(model_memory, a_coreml_claim_parses_back_under_any_label)
+{
+  const auto cs = model_memory::coreml_claims("fam|ane-ffn", 650u << 20, 3,
+                                              model_memory::kPhaseDenoise);
+  ASSERT_TRUE(cs.size() == 1u);
+  std::string label;
+  std::size_t ub = 0;
+  int un = 0;
+  EXPECT_TRUE(model_memory::parse_coreml_claim(cs[0], &label, &ub, &un));
+  EXPECT_TRUE(label == "fam|ane-ffn");
+  EXPECT_TRUE(ub == (650u << 20));
+  EXPECT_TRUE(un == 3);
+  EXPECT_TRUE(cs[0].phase == std::string(model_memory::kPhaseDenoise));
+
+  // Not CoreML, or not well formed: refused, outputs untouched.
+  ResourceClaim w = cs[0];
+  w.kind = std::string(model_memory::kWeightsKind);
+  EXPECT_FALSE(model_memory::parse_coreml_claim(w, nullptr, &ub, &un));
+  for (const char* key : {"x", "x|1", "x|0|1", "x|12|0", "x|12|y", "|12|1",
+                          "x||1"}) {
+    ResourceClaim b = cs[0];
+    b.key = key;
+    EXPECT_FALSE(model_memory::parse_coreml_claim(b, nullptr, nullptr,
+                                                  nullptr));
+  }
+}
+
+TEST(model_memory, a_coreml_grant_is_bounded_by_what_the_plan_left)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+
+  // A 32 GB box, so the arithmetic is stated rather than whatever this
+  // machine happens to have.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "32768", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  mgr->set_phase_order({std::string(model_memory::kPhaseCondition),
+                        std::string(model_memory::kPhaseDenoise),
+                        std::string(model_memory::kPhaseDecode)});
+
+  // 4 GB already planned. With kStreamHeadroom (8 GB) reserved that
+  // leaves 20 GB, so 10 units of 2 GB fit and the 28 asked for do not.
+  mgr->declare_weights("/nonexistent/dit", 4ull << 30);
+  const std::size_t unit = 2ull << 30;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 28,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  // It must never REFUSE: an accelerator that does not fit is an
+  // accelerator that stays off, not a graph that will not run.
+  EXPECT_TRUE(p->end_plan(&sess));
+
+  const int got = model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 28);
+  std::printf("[model_memory] coreml grant %d of 28 units\n", got);
+  EXPECT_TRUE(got == 10);
+  // And the grant is VISIBLE: declared into the scratch ledger, so the
+  // peak a peer sizes against includes it. 4 GB of weights + 20 GB
+  // granted, all in the denoise.
+  EXPECT_TRUE(mgr->scratch_bytes(std::string(model_memory::kPhaseDenoise))
+              == (std::size_t)got * unit);
+  EXPECT_TRUE(mgr->phase_peak() == (4ull << 30) + (std::size_t)got * unit);
+
+  // A caller asking for less than it was granted gets what it asked.
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 4) == 4);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+}
+
+// THE PER-PHASE RULE. A unit lives only in its claim's phase, so a graph
+// that already peaks higher somewhere else is made no tighter by it. 16 GB,
+// a quarter kept back: RAM alone leaves 12 GB. The denoise holds 11 GB and
+// the decode peaks at 14 GB, so a 1.4 GB module in the denoise (12.4 GB)
+// must be granted -- refusing it would refuse memory the run already has
+// to have -- and must not move the peak.
+TEST(model_memory, a_coreml_grant_is_judged_in_its_own_phase)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+  ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  mgr->set_phase_order({std::string(model_memory::kPhaseCondition),
+                        std::string(model_memory::kPhaseDenoise),
+                        std::string(model_memory::kPhaseDecode)});
+  mgr->declare_weights("/nonexistent/dit", 11ull << 30,
+                       std::string(model_memory::kPhaseDenoise));
+  mgr->declare_scratch("arena", 14ull << 30,
+                       std::string(model_memory::kPhaseDecode));
+  const std::size_t peak0 = mgr->phase_peak();
+  const std::size_t unit = 1411ull << 20;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 1,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 1) == 1);
+  EXPECT_TRUE(mgr->phase_peak() == peak0);
+  EXPECT_TRUE(mgr->scratch_bytes(std::string(model_memory::kPhaseDenoise)) ==
+              unit);
+
+  // ...and the same module where the denoise is ALREADY the peak and RAM
+  // has no room either: 11 GB denoise, no other phase, 12 GB usable -- a
+  // 1.4 GB module would raise the peak past what the box allows.
+  mgr->clear_scratch();
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 1,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 1) == 0);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+}
+
+// The box too small to hold even one unit. The tier has to come back
+// zero rather than a fraction or a refusal -- zero IS the fallback, and
+// the caller reads it as "keep the GPU path".
+TEST(model_memory, a_coreml_grant_can_be_nothing)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+
+  // No phase order set here, on purpose: outside a launch phase_peak()
+  // has nothing to walk and answers 0, and a budget that believed it
+  // would hand out the whole box.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  // 11 of 16, with a quarter of the box (4 GB) kept back: 1 GB left.
+  mgr->declare_weights("/nonexistent/dit", 11ull << 30);
+  const std::size_t unit = 2ull << 30;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 28, {})) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 28) == 0);
+  // Nothing granted, nothing declared -- a zero-byte arena in the
+  // ledger would read as an allocation that exists.
+  EXPECT_TRUE(mgr->scratch_bytes(std::string()) == 0u);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
 }
 
 // Two stages disagreeing about one checkpoint's lifetime: the WIDER
@@ -1831,8 +2013,25 @@ TEST(model_memory, a_refused_wiring_stops_growth_and_the_retry_is_capped)
   w.open(mc);
   if (!w.on() || w.budget() == 0) { mgr->set_wired_pool_pct(0); return; }
 
-  // A partial grant -- the box gave less than the block asked for.
   const std::size_t want = 4ull << 20, got = 1ull << 20;
+
+  // A SHORTFALL WITH ROOM LEFT IS NOT A REFUSAL. Every block carries
+  // buffers below GenerativeModelManager::kMinWiredBytes, which the pool
+  // never wires, so a fully wired block always reports less than its
+  // resident size. Collapsing on that stopped growth after one block.
+  {
+    genai::WiredPool v;
+    v.open(mc);
+    v.note_wired(mc, got, want);
+    EXPECT_TRUE(v.wired_bytes() == got);
+    EXPECT_TRUE(v.budget() > got);
+    EXPECT_TRUE(v.wirable(1));
+  }
+
+  // A REAL partial grant: the box gave less than the block asked for AND
+  // the pool cannot take the rest -- here because memory wired on the
+  // process's behalf fills it.
+  mgr->charge_external_wired(8ull << 20);
   w.note_wired(mc, got, want);
   EXPECT_TRUE(w.wired_bytes() == got);
   // Budget is now exactly what was granted, so nothing further is
@@ -1853,6 +2052,8 @@ TEST(model_memory, a_refused_wiring_stops_growth_and_the_retry_is_capped)
   EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit());
   EXPECT_TRUE(w.wired_bytes() <= w.budget());
 
+  mgr->release_external_wired(8ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
   mgr->set_wired_pool_pct(0);
 }
 
@@ -2117,4 +2318,91 @@ TEST(model_memory, every_phase_in_the_order_can_be_decided)
   EXPECT_TRUE(mgr->phase_peak(nullptr) == 1000u);
 
   fs::remove_all(root, ec);
+}
+
+// THE ANE MODULES ARE CLAIMED BY THE STAGES THAT BUILD THEM, AND ONLY THERE.
+//
+// A CoreML claim is the only ledger that can see a module's bytes, so a
+// stage that builds one without claiming it hides memory from every peer,
+// and a stage that claims one it never builds books memory nobody holds --
+// both of which the plan then sizes irreversible decisions against. The
+// vae-decode claim is gated on the VAE family for exactly the second
+// reason: the H3 VAE's config reader accepts other families' config.json.
+//
+// Loads nothing. Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (an H3 root or pack),
+// optionally VPIPE_KREA2_TEST_MODEL_PATH (a model whose VAE is not H3's).
+TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)
+{
+  const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (h3 == nullptr || *h3 == '\0') { return; }
+  Session sess;
+
+  struct Claim {
+    std::size_t bytes = 0;
+    int         units = 0;
+    std::string phase;
+  };
+  auto coreml = [](const std::vector<ResourceClaim>& cs) {
+    Claim out;
+    for (const ResourceClaim& c : cs) {
+      if (c.kind != model_memory::kCoreMLKind) { continue; }
+      const std::size_t b2 = c.key.rfind('|');
+      const std::size_t b1 = c.key.rfind('|', b2 - 1);
+      out.bytes = (std::size_t)std::stoull(c.key.substr(b1 + 1, b2 - b1 - 1));
+      out.units += std::stoi(c.key.substr(b2 + 1));
+      out.phase = c.phase;
+    }
+    return out;
+  };
+  auto cfg_of = [](const char* root, bool ane) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+    if (ane) { cfg.as_object().insert("ane_ffn", FlexData::make_bool(true)); }
+    return cfg;
+  };
+
+  // vae-decode over H3: one unit, sized from the VAE's own tile, in the
+  // decode -- and nothing without the key.
+  {
+    VaeDecodeStage off(&sess, "dec", std::vector<InEdge>{},
+                       cfg_of(h3, false));
+    EXPECT_TRUE(coreml(off.declare_resources()).units == 0);
+    VaeDecodeStage on(&sess, "dec", std::vector<InEdge>{}, cfg_of(h3, true));
+    const Claim c = coreml(on.declare_resources());
+    genai::MetalMiniMaxH3VideoVae::Config vc;
+    std::string err;
+    const bool have = genai::MetalMiniMaxH3VideoVae::config_from_json(
+        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(h3), vc, &err);
+    std::printf("[model_memory] vae-decode ANE claim: %d unit(s) x %zu MB "
+                "in '%s'\n", c.units, c.bytes >> 20, c.phase.c_str());
+    EXPECT_TRUE(have);
+    EXPECT_TRUE(c.units == 1);
+    EXPECT_TRUE(c.phase == model_memory::kPhaseDecode);
+    EXPECT_TRUE(have && c.bytes ==
+                genai::MetalMiniMaxH3VideoVae::ane_runtime_bytes(vc));
+  }
+  // generate-video over H3: one unit in the denoise.
+  {
+    GenerateVideoStage off(&sess, "gen", std::vector<InEdge>{},
+                           cfg_of(h3, false));
+    EXPECT_TRUE(coreml(off.declare_resources()).units == 0);
+    GenerateVideoStage on(&sess, "gen", std::vector<InEdge>{},
+                          cfg_of(h3, true));
+    const Claim c = coreml(on.declare_resources());
+    std::printf("[model_memory] generate-video ANE claim: %d unit(s) x %zu "
+                "MB in '%s'\n", c.units, c.bytes >> 20, c.phase.c_str());
+    EXPECT_TRUE(c.units == 1);
+    EXPECT_TRUE(c.phase == model_memory::kPhaseDenoise);
+    const genai::MetalMiniMaxH3Transformer::Config tc;
+    const std::size_t slots =
+        3ull * (std::size_t)tc.hidden * (std::size_t)tc.ffn * 2ull;
+    EXPECT_TRUE(c.bytes > slots);
+  }
+  // vae-decode over a VAE that is not H3's claims nothing, key or not.
+  if (const char* k = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH")) {
+    if (*k != '\0') {
+      VaeDecodeStage on(&sess, "dec", std::vector<InEdge>{}, cfg_of(k, true));
+      EXPECT_TRUE(coreml(on.declare_resources()).units == 0);
+    }
+  }
 }

@@ -148,6 +148,15 @@ class WiredPool {
   std::size_t wire_one(metal_compute::MetalCompute* mc,
                        metal_compute::SharedBuffer& b, bool on);
 
+  // After wire_one() returned 0 for `b`: did the POOL say no? True only
+  // when `b` is a buffer the pool wires (GenerativeModelManager::
+  // pool_wirable) and the pool can no longer take it -- full, or capped by
+  // a real shortage. False for a small buffer the pool never wires or one
+  // that would not wire for a reason of its own, and a per-block wire loop
+  // that stopped on those left the rest of the block unwired.
+  bool refused(metal_compute::MetalCompute* mc,
+               const metal_compute::SharedBuffer& b) const;
+
   // Book what a whole block's wiring returned against what was asked.
   //
   // A partial grant means the box has said no. The percentage was an

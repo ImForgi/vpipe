@@ -182,6 +182,18 @@ class MetalKrea2Vae {
   static constexpr int kTileOvDen = 4;
   // Largest square latent window whose decode peak fits `budget` (0 if none).
   int decode_tile_side_(std::size_t budget) const noexcept;
+  // Does any 3x3 in a decode at this latent size have to GATHER -- i.e. is
+  // the im2col band allocated at all? (No hardware conv on this GPU, or a
+  // grid the hardware conv declines.) The preflight and the band sizing
+  // must agree on this, so they ask the same question here.
+  bool decode_gathers_(int h8, int w8) const noexcept;
+  // Bytes of im2col band scratch a decode at this latent size allocates
+  // when it gathers. CAPPED, and the cap is the whole point -- see the
+  // definition.
+  std::size_t decode_band_bytes_(int h8, int w8) const noexcept;
+  // The cap. A band is a GEMM M-dimension and nothing else, so it needs to
+  // be big enough to keep the GEMM efficient and not one byte more.
+  static constexpr std::size_t kDecodeBandMax = 128ull << 20;
   metal_compute::SharedBuffer decode_tiled_(
       const metal_compute::SharedBuffer& z, int h8, int w8, int tile8,
       std::string* err);
