@@ -95,7 +95,7 @@ kernel void dense_gemm_bias_f16(
 // steel mma.h has a complex64_t BlockMMA specialization (unused here but
 // must parse); complex.h references their bfloat16_t wrapper for an unused
 // ctor -- alias it to the native type (we never touch bf16 or complex).
-typedef bfloat16 bfloat16_t;
+typedef bfloat bfloat16_t;
 #include "mlx/backend/metal/kernels/complex.h"
 #include "mlx/backend/metal/kernels/steel/gemm/mma.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"

@@ -1099,7 +1099,7 @@ private:
       // MLX steel register-resident flash attention (attn_steel, half-only):
       // the bd256 instantiation drives Qwen full-attn FRESH prefill (contiguous
       // K/V). Invalid for bf16 models -> the paged path stays the fallback.
-      _lib_attn;
+      _lib_attn, _lib_attn_nax;   // _lib_attn_nax: M5 NAX (prefill set)
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmv_swiglu, _fn_qmm,
       _fn_qmm_swiglu,
       // Q4_K->affine-g32 decode repack: the affine 4-bit g32 qmv (+fused-add)

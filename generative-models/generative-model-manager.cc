@@ -1358,6 +1358,79 @@ GenerativeModelManager::memory_cap() const
   return _memory_cap.load(memory_order_relaxed);
 }
 
+void
+GenerativeModelManager::set_swap_allowance_bytes(std::size_t bytes)
+{
+  const std::size_t was = _swap_allowance.exchange(bytes, memory_order_relaxed);
+  if (session() == nullptr || was == bytes) { return; }
+  if (bytes == 0) {
+    session()->info(fmt(
+        "GenerativeModelManager: swap allowance removed -- a forward is now "
+        "sized against reclaimable RAM alone, which excludes anonymous pages "
+        "that would need swap"));
+  } else {
+    session()->info(fmt(
+        "GenerativeModelManager: swap allowance {} MB (how much a forward "
+        "may plan to push into the compressor or swap on top of what the OS "
+        "reports reclaimable; nothing is reserved)", bytes >> 20));
+  }
+}
+
+std::size_t
+GenerativeModelManager::swap_allowance_bytes() const
+{
+  return _swap_allowance.load(memory_order_relaxed);
+}
+
+GenerativeModelManager::SwapSupply
+GenerativeModelManager::swap_supply()
+{
+  SwapSupply s;
+  vm_statistics64_data_t vm;
+  mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+  if (::host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm), &n)
+      != KERN_SUCCESS) {
+    return s;
+  }
+  vm_size_t page = 0;
+  if (::host_page_size(mach_host_self(), &page) != KERN_SUCCESS) {
+    page = 16384;
+  }
+  // vm_statistics64 counts PAGES; task_vm_info reports BYTES. Multiply
+  // before the two are ever compared.
+  //
+  // `internal_page_count` is documented as "pages that are anonymous"
+  // and `external_page_count` as "pages that are file-backed", so the
+  // two partition memory by BACKING STORE. `wire_count` cuts across
+  // both, which is why subtracting it whole errs low: it removes the
+  // file-backed wired pages from a pool that never contained them.
+  s.anon      = (std::size_t)vm.internal_page_count * (std::size_t)page;
+  s.purgeable = (std::size_t)vm.purgeable_count * (std::size_t)page;
+  s.wired     = (std::size_t)vm.wire_count * (std::size_t)page;
+
+  // OUR OWN anonymous bytes. `ti.internal` is this task's internal
+  // (anonymous) footprint, so it is exactly the term to remove: driving
+  // vpipe's own pages to swap to make room for vpipe's next forward is
+  // the thrash this gate exists to avoid. Self-WIRED bytes are NOT
+  // removed again -- they are unswappable and already inside `wired`.
+  task_vm_info_data_t ti;
+  mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+  if (::task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&ti), &c) == KERN_SUCCESS) {
+    s.self_anon = (std::size_t)ti.internal;
+  }
+  const std::size_t out = s.purgeable + s.wired + s.self_anon;
+  s.spare = s.anon > out ? s.anon - out : 0;
+  return s;
+}
+
+std::size_t
+GenerativeModelManager::swappable_other_bytes()
+{
+  return swap_supply().spare;
+}
+
 std::size_t
 GenerativeModelManager::active_bytes() const
 {

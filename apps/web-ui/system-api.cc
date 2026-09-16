@@ -136,6 +136,54 @@ SystemApi::any_running_() const
 }
 
 HttpResponse
+SystemApi::h_swap_allowance_get_(const HttpRequest&)
+{
+  lock_guard<mutex> lk(_ctx.mu);
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  const std::size_t mb =
+      _ctx.session != nullptr ? _ctx.session->swap_allowance_mb() : 0;
+  oo.insert("mb", FlexData::make_int((long long)mb));
+  // What the box could ACTUALLY give up right now, so the browser can
+  // say whether the allowance is the binding term or merely a ceiling
+  // over memory that is not there. The allowance is a limit on how much
+  // of this a preflight may spend, never a promise that it exists.
+  std::size_t swappable = 0;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  swappable = genai::GenerativeModelManager::swappable_other_bytes() >> 20;
+#endif
+  oo.insert("swappable_mb", FlexData::make_int((long long)swappable));
+  return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
+SystemApi::h_swap_allowance_set_(const HttpRequest& req)
+{
+  auto body = parse_json_body(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "expected object {mb: N}");
+  }
+  auto bo = body->as_object();
+  if (!bo.contains("mb")) { return HttpResponse::error(400, "missing 'mb'"); }
+  const long long mb = bo.at("mb").as_int(-1);
+  if (mb < 0) {
+    return HttpResponse::error(400, "'mb' must be 0 or more (0 sizes a "
+                                    "forward against reclaimable RAM alone)");
+  }
+  if (_ctx.session == nullptr) {
+    return HttpResponse::error(404, "session not available");
+  }
+  // No 409 counterpart to the wired pool's: this reserves nothing, so a
+  // lower figure takes nothing back from a running pipeline.
+  const Status st = _ctx.session->set_swap_allowance_mb((std::size_t)mb);
+  if (st.code != 0) {
+    return HttpResponse::error(400, "the swap allowance is not available in "
+                                    "this build");
+  }
+  return h_swap_allowance_get_(req);
+}
+
+HttpResponse
 SystemApi::h_wired_pool_get_(const HttpRequest&)
 {
   lock_guard<mutex> lk(_ctx.mu);
@@ -303,6 +351,10 @@ SystemApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_wired_pool_get_(r); });
   s.route("PUT", "/api/system/wired-pool",
           [this](const HttpRequest& r) { return h_wired_pool_set_(r); });
+  s.route("GET", "/api/system/swap-allowance",
+          [this](const HttpRequest& r) { return h_swap_allowance_get_(r); });
+  s.route("PUT", "/api/system/swap-allowance",
+          [this](const HttpRequest& r) { return h_swap_allowance_set_(r); });
   s.route("GET", "/api/hls/streams",
           [this](const HttpRequest& r) { return h_hls_streams_(r); });
 }

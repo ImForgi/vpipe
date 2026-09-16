@@ -73,6 +73,9 @@ public:
   Status set_wired_pool_mb(std::size_t mb) override;
   std::size_t wired_pool_mb() const override;
 
+  Status set_swap_allowance_mb(std::size_t mb) override;
+  std::size_t swap_allowance_mb() const override;
+
   Status enable_profiling(unsigned max_events_per_stage) override;
   Status disable_profiling() override;
   Status dump_profiling(std::string_view path) override;

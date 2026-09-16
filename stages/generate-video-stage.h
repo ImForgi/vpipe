@@ -395,6 +395,10 @@ private:
   // graph makes one clip per beat, and the wiring cannot change between
   // them, so repeating it per request would bury every other line.
   bool _kf_on_ref2va_said = false;
+  // Said-once guard for the memory-gate arithmetic (allowance, supply,
+  // margin). A denoise consults the gate on every block, and the figures
+  // are a property of the box rather than of the forward.
+  bool _swap_room_said = false;
   std::string _root;
 
   // Load expert `which`, dropping whichever is resident first. The drop

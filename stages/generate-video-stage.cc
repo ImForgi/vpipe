@@ -35,8 +35,26 @@
 #include <vector>
 
 namespace vpipe {
-
 namespace {
+
+// The margin kept on reclaimable RAM. The WORKING-SET margin is
+// deliberately NOT here: over-allocating wired Metal memory is the failure
+// that takes the machine down rather than slowing it, so that cushion stays
+// where it is.
+//
+// How much memory the clip may plan to displace into swap is the session's
+// `swap_allowance_mb`, read from the manager at the gate -- a setting an
+// operator can change from the CLI or the Settings panel, not a file-static
+// here. See GenerativeModelManager::set_swap_allowance_bytes.
+double video_phys_margin_()
+{
+  static const double v = [] {
+    const char* e = std::getenv("VPIPE_VIDEO_PHYS_MARGIN_PCT");
+    const double pct = e != nullptr ? std::atof(e) : 5.0;
+    return pct >= 0.0 && pct < 50.0 ? pct / 100.0 : 0.05;
+  }();
+  return v;
+}
 
 // How many MiniMax-H3 runtime-LoRA slots this stage carries beats for.
 // Must not exceed MetalMiniMaxH3Transformer::kMaxLoraSlots, which is the
@@ -2269,7 +2287,64 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // this process has already allocated, the physical budget about what
   // the machine has left.
   constexpr double kWorkingSetMargin = 0.05;
-  constexpr double kPhysicalMargin   = 0.10;
+  // Reclaimable RAM keeps a smaller cushion than it used to (5%, was 10%) and
+  // may spend a bounded amount of other processes' resident anonymous
+  // pages -- the session's `swap_allowance_mb` against what the box
+  // actually has, below. The WORKING SET keeps its 5% untouched: that is
+  // the wired ceiling, and over-allocating there takes the machine down.
+  const double kPhysicalMargin = video_phys_margin_();
+  // PERMISSION and AVAILABILITY are different questions, so the gate may
+  // spend only the smaller: what the operator allows this session to push
+  // into swap, and what other processes are actually holding in resident
+  // anonymous pages right now.
+  const std::size_t swap_room = [this]() -> std::size_t {
+    auto* gm = session()->services()->generative_model_manager();
+    if (gm == nullptr) { return 0; }
+    return std::min(gm->swap_allowance_bytes(),
+                    genai::GenerativeModelManager::swappable_other_bytes());
+  }();
+  // SAY THE ARITHMETIC ONCE, on the first forward that consults it.
+  //
+  // Without this the allowance is only ever reported when it FAILS to be
+  // enough (the refusal and the ANE-fallback warning below both name
+  // it), so a clip that runs because of it looks exactly like a clip
+  // that never needed it -- and the one question an operator has after
+  // changing the setting is which of those just happened. Once per
+  // stage, not per forward: it is a property of the box, and a denoise
+  // calls this on every block.
+  if (!_swap_room_said) {
+    _swap_room_said = true;
+    if (auto* gm = session()->services()->generative_model_manager()) {
+      const std::size_t allow = gm->swap_allowance_bytes();
+      // ONE sample, so the terms printed below are the ones behind the
+      // figure rather than a second reading of a moving machine.
+      const auto supply = genai::GenerativeModelManager::swap_supply();
+      const std::size_t have = supply.spare;
+      // The SUPPLY is reported beside the allowance, and when it is zero
+      // the reason is reported too. A zero reads two ways that call for
+      // opposite responses -- an idle box that has no other-process
+      // anonymous memory to give (correct, and the allowance is simply
+      // not needed), or a box whose wired total already exceeds its
+      // anonymous pages (the subtraction being pessimistic). MEASURED on
+      // an idle 24 GB M5 Pro: 2.27 GB anonymous against 2.26 GB wired,
+      // so the supply clamped to 0 while 18456 MB of reclaimable RAM
+      // carried the clip on its own. Without the terms that is
+      // indistinguishable from a bug.
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): reclaimable RAM ~{} MB + up to {} MB "
+          "the OS can swap ({} MB allowed by swap_allowance_mb, {} MB other "
+          "processes are actually holding{}); {:.0f}% margin",
+          this->id(), mb.available_physical >> 20, swap_room >> 20,
+          allow >> 20, have >> 20,
+          have == 0 ? fmt(" -- nothing to spend: {} MB anonymous, less {} "
+                          "MB purgeable, {} MB wired system-wide and {} MB "
+                          "this process's own",
+                          supply.anon >> 20, supply.purgeable >> 20,
+                          supply.wired >> 20, supply.self_anon >> 20)()
+                    : std::string(),
+          100.0 * kPhysicalMargin));
+    }
+  }
   auto grossed_up = [](std::size_t n, double margin) -> std::size_t {
     return (std::size_t)((double)n / (1.0 - margin));
   };
@@ -2280,8 +2355,8 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // margin for a ~1.1 GB module and ran a clip without it.
   const std::size_t need_phys = grossed_up(gpu_need, kPhysicalMargin) + ane;
   auto fits_phys = [&](const auto& b, std::size_t extra) {
-    return b.available_physical >= grossed_up(gpu_need, kPhysicalMargin) +
-                                       extra;
+    return b.available_physical + swap_room >=
+           grossed_up(gpu_need, kPhysicalMargin) + extra;
   };
 
   // Tell the DiT how much room to leave clear when it decides whether to
@@ -2330,7 +2405,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // THE ANE IS THE OPTIONAL PART. When the clip fits without its modules,
   // run the GPU alone -- a slower clip -- instead of refusing the clip.
   if (ane > 0 && mb.fits(gpu_need, kWorkingSetMargin) &&
-      mb.fits_physical(gpu_need, kPhysicalMargin)) {
+      fits_phys(mb, 0)) {
     if (_h3_dit) {
       _h3_dit->disable_ane();
       _h3_dit->set_residency_reserve(gpu_need + (1ull << 30));
@@ -2342,11 +2417,14 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     }
     session()->warn(fmt(
         "GenerateVideoStage('{}'): the {}-row forward fits only without the "
-        "ANE modules' ~{} MB (reclaimable RAM ~{} MB against ~{} MB wanted "
+        "ANE modules' ~{} MB (reclaimable RAM ~{} MB{} against ~{} MB wanted "
         "with them; GPU working set ~{} MB against ~{} MB) -- running the "
         "GPU alone for this clip", this->id(), seq, ane >> 20,
-        mb.available_physical >> 20, need_phys >> 20, mb.headroom >> 20,
-        need_ws >> 20));
+        mb.available_physical >> 20,
+        swap_room > 0 ? fmt(" + {} MB other apps' pages the OS can swap",
+                            swap_room >> 20)()
+                      : std::string(),
+        need_phys >> 20, mb.headroom >> 20, need_ws >> 20));
     return true;
   }
   const bool ws_ok = mb.fits(gpu_need, kWorkingSetMargin);
@@ -2363,7 +2441,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
       "GenerateVideoStage('{}'): not enough memory for a {}-row forward. "
       "It wants ~{} MB of scratch{}, which with the safety margins the "
       "budget keeps ({:.0f}% of the working set, {:.0f}% of reclaimable "
-      "RAM) means: {}; {}{}. Refusing rather than thrashing: wired Metal "
+      "RAM{}) means: {}; {}{}. Refusing rather than thrashing: wired Metal "
       "buffers cannot be paged out, so overcommitting here takes the "
       "whole machine down rather than failing this stage. Use a smaller "
       "height/width/frames, or free another model first",
@@ -2378,8 +2456,13 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
                         "would not free any of this)")
           : std::string(),
       100.0 * kWorkingSetMargin, 100.0 * kPhysicalMargin,
+      swap_room > 0
+          ? fmt(", which counts {} MB of other apps' anonymous pages the OS "
+                "can compress or swap", swap_room >> 20)()
+          : std::string(),
       gate("GPU working set", ws_ok, need_ws, mb.headroom),
-      gate("reclaimable RAM", ph_ok, need_phys, mb.available_physical),
+      gate("reclaimable RAM", ph_ok, need_phys,
+           mb.available_physical + swap_room),
       parked > 0 ? fmt(" (after parking ~{} MB)", parked >> 20)()
                  : std::string()));
   return false;

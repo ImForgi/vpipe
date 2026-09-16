@@ -2299,6 +2299,301 @@ TEST(minimax_h3_blocks, attn_nax_matches_steel)
 // asserted: attention is 23% of a step and quadratic in the sequence, so
 // what matters is the ratio at REAL lengths, and a bar on it would flake on
 // this box's power-budget clock.
+// MLX #3842's head-dim SPLIT NAX attention against the plain NAX kernel, at
+// head_dim 256 and a causal Qwen3.5-like prefill (24 q heads, 4 kv). The split
+// kernel halves each simdgroup's accumulator set by giving each of WN = 2
+// simdgroups one half of D; it must agree with the plain kernel before its rate
+// means anything. VPIPE_H3_BLOCKS=1 (full: + 16384).
+TEST(minimax_h3_blocks, attn_nax_d256_split)
+{
+  if (!bench_on_()) { return; }
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  Kernels kn;
+  kn.load(mc);
+  if (!mc->supports_matrix_cores() || !kn.lib_attn_nax.valid()) { return; }
+  struct P {
+    int B, H, D, qL, kL, gqa_factor;
+    float scale;
+    int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+    std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+  };
+  const int NH = 24, NKV = 4, HD = 256;
+  std::vector<int> seqs = bench_full_()
+      ? std::vector<int>{1024, 2048, 4096, 8192, 16384}
+      : std::vector<int>{1024, 4096, 8192};
+  for (int seq : seqs) {
+    const std::size_t nq = (std::size_t)NH * seq * HD;
+    const std::size_t nk = (std::size_t)NKV * seq * HD;
+    SharedBuffer q = make_act_(mc, nq, 3u);
+    SharedBuffer k = make_act_(mc, nk, 5u);
+    SharedBuffer v = make_act_(mc, nk, 9u);
+    SharedBuffer o[2] = {mc->make_shared_buffer(nq * 2),
+                         mc->make_shared_buffer(nq * 2)};
+    SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
+    if (q.empty() || k.empty() || o[0].empty() || o[1].empty() ||
+        pb.empty()) {
+      continue;
+    }
+    const int BQ = 64, BK = 32;
+    auto* p = static_cast<P*>(pb.contents());
+    p->B = 1; p->H = NH; p->D = HD;
+    p->qL = seq; p->kL = seq;
+    p->gqa_factor = NH / NKV;
+    p->scale = 1.0f / std::sqrt((float)HD);
+    p->NQ = (seq + BQ - 1) / BQ; p->NK = (seq + BK - 1) / BK;
+    p->NQ_aligned = seq / BQ; p->NK_aligned = seq / BK;
+    p->qL_rem = seq - p->NQ_aligned * BQ;
+    p->kL_rem = seq - p->NK_aligned * BK;
+    p->qL_off = 0;
+    p->Q_strides[0] = (std::int64_t)NH * seq * HD;
+    p->Q_strides[1] = (std::int64_t)seq * HD;
+    p->Q_strides[2] = HD;
+    p->K_strides[0] = (std::int64_t)NKV * seq * HD;
+    p->K_strides[1] = (std::int64_t)seq * HD;
+    p->K_strides[2] = HD;
+    for (int i = 0; i < 3; ++i) {
+      p->V_strides[i] = p->K_strides[i];
+      p->O_strides[i] = p->Q_strides[i];
+    }
+    FunctionConstants fc;
+    fc.set_bool(200, (seq % BQ) == 0).set_bool(201, (seq % BK) == 0)
+        .set_bool(300, false).set_bool(301, true).set_bool(302, false);
+    ComputeFunction fn[2] = {
+        kn.lib_attn_nax.function("attn_steel_nax_h_bd256_bf16", fc),
+        kn.lib_attn_nax.function("attn_steel_nax_dsplit_h_bd256_bf16", fc)};
+    ASSERT_TRUE(fn[0].valid() && fn[1].valid());
+    if (!fn[0].valid() || !fn[1].valid()) { return; }
+    const double flops = 4.0 * (double)seq * seq * HD * NH / 2.0;  // causal
+    const int iters = std::min(20, std::max(1, (int)(3.0e11 / flops)));
+    auto once = [&](int arm, int it) {
+      const unsigned wn = arm == 1 ? 2u : 1u;
+      const auto t0 = std::chrono::steady_clock::now();
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        for (int i = 0; i < it; ++i) {
+          e.set_function(fn[arm]);
+          e.set_buffer(0, q); e.set_buffer(1, k);
+          e.set_buffer(2, v); e.set_buffer(3, o[arm]);
+          e.set_buffer(4, pb);
+          e.dispatch({32 * (unsigned)p->NQ, 4 * (unsigned)NH, wn},
+                     {32, 4, wn});
+        }
+      }
+      st.commit().wait();
+      const auto t1 = std::chrono::steady_clock::now();
+      return flops * it / 1e9 / secs_(t0, t1);
+    };
+    once(0, 1); once(1, 1);
+    // Agreement first: the two kernels over the same inputs.
+    double num = 0.0, den = 0.0;
+    {
+      const auto* a = static_cast<const std::uint16_t*>(o[0].contents());
+      const auto* b = static_cast<const std::uint16_t*>(o[1].contents());
+      for (std::size_t i = 0; i < nq; ++i) {
+        const double x = from_bf16_(a[i]), y = from_bf16_(b[i]);
+        num += (x - y) * (x - y);
+        den += x * x;
+      }
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    EXPECT_TRUE(rel < 1e-3);
+    std::vector<double> a, b;
+    for (int r = 0; r < 5; ++r) {
+      a.push_back(once(0, iters));
+      b.push_back(once(1, iters));
+    }
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    const double ga = a[a.size() / 2], gb = b[b.size() / 2];
+    std::printf("[h3_blocks] attn d256 causal seq=%5d | nax %6.0f GF/s | "
+                "dsplit %6.0f GF/s | %.2fx | rel-L2 %.2e\n", seq, ga, gb,
+                ga > 0.0 ? gb / ga : 0.0, rel);
+  }
+}
+
+// THE QUERY TILE against the long-sequence wall. The NAX attention keeps a BQ
+// query tile in registers and streams the WHOLE K/V once per tile, so its
+// arithmetic intensity is ~BQ flops per byte whatever the length. BQ = WM * 16
+// with TQ == 1, so BQ 128 / 256 are instantiations of the SAME kernel with 8 /
+// 16 simdgroups per threadgroup -- more query rows per K/V pass, fewer
+// threadgroups in flight.
+//
+// THE WINNER IS MACHINE AND SHAPE DEPENDENT, which is why this sweeps both.
+// MEASURED at H3's 56x128: an M5 Pro is memory-bound by 19k rows (BQ 64 at
+// 362 GB/s) and BQ 128 wins everywhere (1.14x at 19k, 1.21x at 100k, holding
+// 24 TFLOP/s); a 10-core base M5 is occupancy-bound instead (11 TFLOP/s at
+// 175 GB/s) and BQ 64 wins below ~19k (BQ 128 0.92x at 4.3k).
+//
+// Arms are interleaved ROUND BY ROUND, not run back to back: on a fanless box
+// the last arm would otherwise carry the thermal drift of the ones before it.
+// VPIPE_H3_BLOCKS=1, rows via VPIPE_H3_SPLIT_SEQS, rounds via
+// VPIPE_H3_QTILE_REPS (default 3).
+TEST(minimax_h3_blocks, attn_nax_qtile_sweep)
+{
+  if (!bench_on_()) { return; }
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  Kernels kn;
+  kn.load(mc);
+  if (!mc->supports_matrix_cores() || !kn.lib_attn_nax.valid()) { return; }
+  struct P {
+    int B, H, D, qL, kL, gqa_factor;
+    float scale;
+    int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+    std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+  };
+  struct Arm { const char* name; int bq, wm; };
+  const Arm arms[] = {{"bq64", 64, 4}, {"bq128", 128, 8}, {"bq256", 256, 16}};
+  constexpr int kArms = 3;
+  struct Shape { const char* tag; int hq, hkv; };
+  const Shape shapes[] = {{"h3", 56, 56}, {"flux2-9b", 32, 32},
+                          {"krea2", 48, 12}};
+  std::vector<int> seqs;
+  {
+    const char* e = std::getenv("VPIPE_H3_SPLIT_SEQS");
+    std::string csv = e != nullptr ? e : "19008,38016,76032,99840";
+    std::size_t p0 = 0;
+    while (p0 < csv.size()) {
+      const std::size_t q0 = csv.find(',', p0);
+      seqs.push_back(std::atoi(csv.substr(p0, q0 - p0).c_str()));
+      if (q0 == std::string::npos) { break; }
+      p0 = q0 + 1;
+    }
+  }
+  int reps = 3;
+  if (const char* e = std::getenv("VPIPE_H3_QTILE_REPS")) {
+    reps = std::max(1, std::atoi(e));
+  }
+  const int HD = kHeadDim;
+  for (const Shape& sh : shapes) {
+    for (int seq : seqs) {
+      const std::size_t nq = (std::size_t)sh.hq * seq * HD;
+      const std::size_t nk = (std::size_t)sh.hkv * seq * HD;
+      SharedBuffer q = make_act_(mc, nq, 3u);
+      SharedBuffer k = make_act_(mc, nk, 5u);
+      SharedBuffer v = make_act_(mc, nk, 9u);
+      SharedBuffer o[kArms], pb[kArms];
+      bool ok_alloc = !q.empty() && !k.empty() && !v.empty();
+      for (int a = 0; a < kArms; ++a) {
+        o[a] = mc->make_shared_buffer(nq * 2);
+        pb[a] = mc->make_shared_buffer(sizeof(P));
+        ok_alloc = ok_alloc && !o[a].empty() && !pb[a].empty();
+      }
+      if (!ok_alloc) {
+        std::printf("[h3_blocks] qtile %s seq=%d: allocation failed\n", sh.tag,
+                    seq);
+        continue;
+      }
+      ComputeFunction fn[kArms];
+      for (int a = 0; a < kArms; ++a) {
+        const int BQ = arms[a].bq, BK = 32;
+        auto* p = static_cast<P*>(pb[a].contents());
+        p->B = 1; p->H = sh.hq; p->D = HD;
+        p->qL = seq; p->kL = seq;
+        p->gqa_factor = sh.hq / sh.hkv;
+        p->scale = 1.0f / std::sqrt((float)HD);
+        p->NQ = (seq + BQ - 1) / BQ; p->NK = (seq + BK - 1) / BK;
+        p->NQ_aligned = seq / BQ; p->NK_aligned = seq / BK;
+        p->qL_rem = seq - p->NQ_aligned * BQ;
+        p->kL_rem = seq - p->NK_aligned * BK;
+        p->qL_off = 0;
+        p->Q_strides[0] = (std::int64_t)sh.hq * seq * HD;
+        p->Q_strides[1] = (std::int64_t)seq * HD;
+        p->Q_strides[2] = HD;
+        p->K_strides[0] = (std::int64_t)sh.hkv * seq * HD;
+        p->K_strides[1] = (std::int64_t)seq * HD;
+        p->K_strides[2] = HD;
+        for (int i = 0; i < 3; ++i) {
+          p->V_strides[i] = p->K_strides[i];
+          p->O_strides[i] = p->Q_strides[i];
+        }
+        FunctionConstants fc;
+        fc.set_bool(200, (seq % BQ) == 0).set_bool(201, (seq % BK) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+        fn[a] = arms[a].bq == 64
+            ? kn.lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+            : kn.lib_attn_nax.function(
+                  std::string("attn_steel_nax_h_bd128_bq") +
+                      std::to_string(arms[a].bq) + "_bf16", fc);
+      }
+      auto once = [&](int a) {
+        const auto* p = static_cast<const P*>(pb[a].contents());
+        const auto t0 = std::chrono::steady_clock::now();
+        CommandStream st = mc->make_command_stream();
+        {
+          ComputeEncoder e = st.begin_compute();
+          e.set_function(fn[a]);
+          e.set_buffer(0, q); e.set_buffer(1, k);
+          e.set_buffer(2, v); e.set_buffer(3, o[a]);
+          e.set_buffer(4, pb[a]);
+          e.dispatch({32 * (unsigned)p->NQ,
+                      (unsigned)arms[a].wm * (unsigned)sh.hq, 1},
+                     {32, (unsigned)arms[a].wm, 1});
+        }
+        std::string err;
+        const bool good = st.commit().wait_ok(&err);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!good) {
+          std::printf("[h3_blocks] qtile %s %s seq=%d: GPU error %s\n", sh.tag,
+                      arms[a].name, seq, err.c_str());
+          return 0.0;
+        }
+        return secs_(t0, t1);
+      };
+      bool armed = true;
+      for (int a = 0; a < kArms; ++a) {
+        if (!fn[a].valid() || once(a) <= 0.0) {
+          std::printf("[h3_blocks] qtile %s %s seq=%d: unavailable\n", sh.tag,
+                      arms[a].name, seq);
+          armed = false;
+        }
+      }
+      if (!armed) { continue; }
+      // Interleaved: one timed call per arm per round.
+      std::vector<std::vector<double>> t((std::size_t)kArms);
+      for (int r = 0; r < reps; ++r) {
+        for (int a = 0; a < kArms; ++a) { t[(std::size_t)a].push_back(once(a)); }
+      }
+      double base = 0.0;
+      for (int a = 0; a < kArms; ++a) {
+        auto& ta = t[(std::size_t)a];
+        std::sort(ta.begin(), ta.end());
+        const double sec = ta[ta.size() / 2];
+        if (sec <= 0.0) { continue; }
+        const double flops = 4.0 * (double)seq * seq * HD * sh.hq;
+        const double gf = flops / 1e9 / sec;
+        const auto* p = static_cast<const P*>(pb[a].contents());
+        const double kv_gb = (double)p->NQ * (double)seq * HD * 2.0 * 2.0
+                             * sh.hkv / 1e9;
+        double rel = 0.0;
+        if (a != 0) {
+          const auto* x = static_cast<const std::uint16_t*>(o[0].contents());
+          const auto* y = static_cast<const std::uint16_t*>(o[a].contents());
+          double num = 0.0, den = 0.0;
+          for (std::size_t i = 0; i < nq; i += 13) {
+            const double xa = from_bf16_(x[i]), ya = from_bf16_(y[i]);
+            num += (xa - ya) * (xa - ya);
+            den += xa * xa;
+          }
+          rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+          EXPECT_TRUE(rel < 1e-3);
+        } else {
+          base = gf;
+        }
+        std::printf("[h3_blocks] qtile %-8s %2dq/%2dkv %-6s seq=%6d | %6.0f "
+                    "GF/s (%.2fx bq64) | %.2f s | K/V %7.1f GB -> %5.0f GB/s | "
+                    "rel-L2 %.1e\n", sh.tag, sh.hq, sh.hkv, arms[a].name, seq,
+                    gf, base > 0.0 ? gf / base : 0.0, sec, kv_gb, kv_gb / sec,
+                    rel);
+      }
+    }
+  }
+}
+
 TEST(minimax_h3_blocks, attn_nax_rate)
 {
   if (!bench_on_()) { return; }
@@ -2332,7 +2627,7 @@ TEST(minimax_h3_blocks, attn_nax_rate)
     if (q.empty() || o.empty() || pb[0].empty() || pb[1].empty()) { continue; }
     const float scale = 1.0f / std::sqrt((float)HD);
     ComputeFunction fn[2];
-    for (int arm = 0; arm < 3; ++arm) {
+    for (int arm = 0; arm < 2; ++arm) {
       const bool nax = (arm == 1);
       const int BQ = nax ? 64 : 32, BK = nax ? 32 : 16;
       auto* p = static_cast<P*>(pb[arm].contents());

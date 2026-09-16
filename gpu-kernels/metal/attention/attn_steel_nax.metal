@@ -133,6 +133,86 @@ template [[host_name("attn_steel_nax_h_bd128_bf16")]] [[kernel]] decltype(attent
                                                                      float>)
 attention_nax<bfloat, 64, 32, 128, 4, 1, bfloat, float>;
 
+// THE SURVIVING LONG-SEQUENCE VARIANT at bd 128. MEASURED on an M5 Pro and a
+// 10-core M5 Air, 56x128 / 32x128 / 48q-12kv x128, 9k-100k rows, every arm
+// bit-identical: BQ 256 lost on every machine, shape and length (0.85-1.11x),
+// and the head-dim split (#3842) reached only 1.02-1.08x over BQ 64 where this
+// tile reaches 1.21x -- dominated, so neither is built. The split stays at bd
+// 256, where it wins and this tile is not the lever.
+//
+// WIDER QUERY TILE at bd 128, bf16 (BQ 128 = WM 8 x kU 16, TQ still 1). Each
+// simdgroup reads K/V straight from device, so a threadgroup covering 128
+// query rows walks one K strip with 8 simdgroups at once -- the K/V re-read
+// per query tile is what caps long-sequence attention (51 MB of K/V per head at
+// 100k rows, streamed once per tile). Instantiated to be measured against
+// BQ 64; nothing binds it.
+template [[host_name("attn_steel_nax_h_bd128_bq128_bf16")]] [[kernel]] decltype(attention_nax<
+                                                                     bfloat,
+                                                                     128,
+                                                                     32,
+                                                                     128,
+                                                                     8,
+                                                                     1,
+                                                                     bfloat,
+                                                                     float>)
+attention_nax<bfloat, 128, 32, 128, 8, 1, bfloat, float>;
+
+
+// head_dim 256, bf16: the plain kernel and MLX's head-dim SPLIT variant
+// (#3842), which halves each simdgroup's accumulator set by splitting D across
+// WN = 2 simdgroups. bd 256 ONLY, on measurement: on the M5 Pro, bidirectional
+// bf16, the split was 0.78-1.02x the plain kernel at bd 128 (H3 DiT 56x128,
+// FLUX.2-9B 32x128, Krea-2 48q/12kv x128, 2.3k-19k rows) and 0.67-0.76x at bd 64
+// (H3 video VAE 32x64) -- the accumulator set is already small there. Instantiated to be measured against each other at
+// Qwen3.5 / Gemma-4 prefill shapes -- nothing binds them yet.
+template [[host_name("attn_steel_nax_h_bd256_bf16")]] [[kernel]] decltype(attention_nax<
+                                                                     bfloat,
+                                                                     64,
+                                                                     32,
+                                                                     256,
+                                                                     4,
+                                                                     1,
+                                                                     bfloat,
+                                                                     float>)
+attention_nax<bfloat, 64, 32, 256, 4, 1, bfloat, float>;
+
+template [[host_name("attn_steel_nax_dsplit_h_bd256_bf16")]] [[kernel]] decltype(attention_nax_dsplit<
+                                                                     bfloat,
+                                                                     64,
+                                                                     32,
+                                                                     256,
+                                                                     4,
+                                                                     2,
+                                                                     bfloat,
+                                                                     float>)
+attention_nax_dsplit<bfloat, 64, 32, 256, 4, 2, bfloat, float>;
+
+// f16 twins, for the f16 LLM prefill (Qwen3.5 full-attention layers).
+template [[host_name("attn_steel_nax_h_bd256")]] [[kernel]] decltype(attention_nax<
+                                                                half,
+                                                                64,
+                                                                32,
+                                                                256,
+                                                                4,
+                                                                1,
+                                                                half,
+                                                                float>)
+attention_nax<half, 64, 32, 256, 4, 1, half, float>;
+
+template [[host_name("attn_steel_nax_dsplit_h_bd256")]] [[kernel]] decltype(attention_nax_dsplit<
+                                                                half,
+                                                                64,
+                                                                32,
+                                                                256,
+                                                                4,
+                                                                2,
+                                                                half,
+                                                                float>)
+attention_nax_dsplit<half, 64, 32, 256, 4, 2, half, float>;
+
+
+
+
 #else
 // Tensor ops unavailable for this target: a stub so the metallib still builds.
 // The loader never binds this on a non-tensor (pre-M5) GPU.
@@ -148,4 +228,19 @@ kernel void attn_steel_nax_h_bd128(device half* O [[buffer(3)]],
 kernel void attn_steel_nax_h_bd128_bf16(device bfloat* O [[buffer(3)]],
                                         uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (bfloat)0; } }
+kernel void attn_steel_nax_h_bd128_bq128_bf16(device bfloat* O [[buffer(3)]],
+                                              uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
+kernel void attn_steel_nax_h_bd256_bf16(device bfloat* O [[buffer(3)]],
+                                        uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
+kernel void attn_steel_nax_dsplit_h_bd256_bf16(device bfloat* O [[buffer(3)]],
+                                               uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
+kernel void attn_steel_nax_h_bd256(device half* O [[buffer(3)]],
+                                   uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_dsplit_h_bd256(device half* O [[buffer(3)]],
+                                          uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (half)0; } }
 #endif

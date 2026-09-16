@@ -11,6 +11,9 @@
 #include "generative-models/quantize/model-quantizer.h"
 #include "stages/model-eval-stage.h"
 
+#include <random>
+#include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -525,4 +528,137 @@ TEST(model_eval_stage, moss_tts_local_layerdump)
   genai::LoadedLanguageModel::Context ctx = lm->make_context();
   const std::int32_t pred = lm->prefill(ctx, ids);
   EXPECT_TRUE(pred >= 0);
+}
+
+// END TO END: Qwen3.5 prefill with the prefill set pinned to each attention
+// member (VPIPE_QWEN_PREFILL_ATTN), against the FIRST member listed -- by
+// default mma, what an M5 picked for a bf16 checkpoint before the NAX members
+// existed (steel is the f16-only equivalent; list it first for an f16 pack). Same random-id prompt per length; compares
+// the last-position logits (rel-L2, KL, argmax) and times the prefill.
+// "auto" leaves the set to its tuner. Long prompts cross the model's prefill
+// chunk, so later chunks are mid-context prefill through the same members.
+// Env: VPIPE_QWEN35_TEST_MODEL_PATH, VPIPE_QWEN_NAX_E2E=1 (lengths via
+// VPIPE_QWEN_NAX_E2E_LENS, default "2048,16384"; members via
+// VPIPE_QWEN_NAX_E2E_MEMBERS, default "mma,flash,nax,nax-split,auto"). A
+// member the model cannot run is reported by the set on stderr.
+TEST(model_eval_stage, qwen_prefill_nax_matches_steel)
+{
+  const char* m = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (m == nullptr || *m == '\0' || std::getenv("VPIPE_QWEN_NAX_E2E") == nullptr) {
+    return;
+  }
+  if (!std::filesystem::exists(std::filesystem::path(m) / "config.json")) {
+    return;
+  }
+  auto split_csv = [](const char* env, const char* dflt) {
+    const char* e = std::getenv(env);
+    std::string csv = e != nullptr ? e : dflt;
+    std::vector<std::string> out;
+    std::size_t p = 0;
+    while (p < csv.size()) {
+      const std::size_t q = csv.find(',', p);
+      out.push_back(csv.substr(p, q == std::string::npos ? q : q - p));
+      if (q == std::string::npos) { break; }
+      p = q + 1;
+    }
+    return out;
+  };
+  std::vector<int> lens;
+  for (const std::string& t : split_csv("VPIPE_QWEN_NAX_E2E_LENS",
+                                        "2048,16384")) {
+    lens.push_back(std::atoi(t.c_str()));
+  }
+  const std::vector<std::string> members = split_csv(
+      "VPIPE_QWEN_NAX_E2E_MEMBERS", "mma,flash,nax,nax-split,auto");
+  ASSERT_TRUE(!members.empty() && !lens.empty());
+  if (members.empty() || lens.empty()) { return; }
+  struct Run {
+    std::string member;
+    std::vector<std::vector<float>> logits;   // per length
+    std::vector<std::int32_t> first;
+    std::vector<double> tok_s;
+  };
+  std::vector<Run> runs;
+  for (const std::string& member : members) {
+    if (member == "auto") {
+      ::unsetenv("VPIPE_QWEN_PREFILL_ATTN");
+    } else {
+      ::setenv("VPIPE_QWEN_PREFILL_ATTN", member.c_str(), 1);
+    }
+    Run r;
+    r.member = member;
+    {
+      Session sess;
+      CerrSilencer hush;
+      if (sess.metal_compute() == nullptr) { return; }
+      genai::GenerativeModelManager mgr(&sess);
+      genai::LoadSpec spec;
+      spec.hf_dir = m;
+      std::shared_ptr<genai::LoadedLanguageModel> lm = mgr.load(spec);
+      ASSERT_TRUE(lm != nullptr && lm->valid());
+      if (lm == nullptr || !lm->valid()) { break; }
+      const int vocab = lm->config().vocab_size;
+      for (int n : lens) {
+        std::mt19937 rng(1234u + (unsigned)n);
+        std::uniform_int_distribution<int> tok(100, std::max(101, vocab / 2));
+        std::vector<std::int32_t> prompt((std::size_t)n);
+        for (auto& t : prompt) { t = tok(rng); }
+        {   // warm: kernels, pipelines, scratch
+          auto w = lm->make_context();
+          std::vector<std::int32_t> head(prompt.begin(),
+                                         prompt.begin() + std::min(n, 1024));
+          (void)lm->prefill(w, head);
+        }
+        auto ctx = lm->make_context();
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::int32_t next = lm->prefill(ctx, prompt);
+        const double s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        r.first.push_back(next);
+        r.tok_s.push_back(s > 0.0 ? n / s : 0.0);
+        r.logits.push_back(lm->last_logits_host());
+      }
+    }
+    runs.push_back(std::move(r));
+  }
+  ::unsetenv("VPIPE_QWEN_PREFILL_ATTN");
+  ASSERT_TRUE(runs.size() == members.size());
+  if (runs.size() != members.size()) { return; }
+  const Run& ref = runs[0];
+  for (std::size_t li = 0; li < lens.size(); ++li) {
+    for (const Run& r : runs) {
+      const auto& a = ref.logits[li];
+      const auto& b = r.logits[li];
+      double rel = 0.0, kl = 0.0;
+      if (!a.empty() && a.size() == b.size()) {
+        double num = 0.0, den = 0.0;
+        double ma = -1e30, mb = -1e30;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          num += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+          den += (double)a[i] * a[i];
+          ma = std::max(ma, (double)a[i]);
+          mb = std::max(mb, (double)b[i]);
+        }
+        rel = std::sqrt(num / std::max(den, 1e-30));
+        double za = 0.0, zb = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          za += std::exp((double)a[i] - ma);
+          zb += std::exp((double)b[i] - mb);
+        }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          const double la = (double)a[i] - ma - std::log(za);
+          const double lb = (double)b[i] - mb - std::log(zb);
+          kl += std::exp(la) * (la - lb);
+        }
+      }
+      std::printf("[qwen_nax_e2e] n=%6d %-9s prefill %8.1f tok/s (%.2fx %s)"
+                  " | first id %s | logits rel-L2 %.2e KL %.2e\n",
+                  lens[li], r.member.c_str(), r.tok_s[li],
+                  ref.tok_s[li] > 0.0 ? r.tok_s[li] / ref.tok_s[li] : 0.0,
+                  ref.member.c_str(),
+                  r.first[li] == ref.first[li] ? "same" : "DIFFERS", rel, kl);
+      EXPECT_TRUE(r.first[li] == ref.first[li]);
+      EXPECT_TRUE(kl < 1e-2);
+    }
+  }
 }

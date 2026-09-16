@@ -1717,6 +1717,47 @@ parking for its memory story must not assume the cap is set.
 Mapped weights and K/V cannot be parked, so the cap is a target on the
 dominant term, not a process-wide guarantee.
 
+### The swap allowance — the opposite knob to the wired pool
+
+`set_swap_allowance_bytes(bytes)` — config key `swap_allowance_mb`,
+`VPIPE_SWAP_ALLOWANCE_MB`, or `--swap-allowance-mb N` on `vpipe` /
+`vpipe-web-ui`, and editable at run time from the web UI's Settings
+panel. **Default 4096 MB.**
+
+A preflight sizes itself against `available_physical` — free + purgeable
++ file-backed pages. Dirty anonymous memory is excluded *by design*,
+because reclaiming it costs swap. That exclusion is right for a decision
+held for a whole run and too strict for a single clip: it refuses work
+the box can do, merely slower. The allowance is how much of that
+anonymous memory one forward may plan to displace.
+
+The two knobs are opposites and are set independently:
+
+| | wired pool | swap allowance |
+|---|---|---|
+| bounds | what the process makes **unswappable** | what a run may push **out** |
+| failure if wrong | the machine goes down | the box gets slower |
+| reserves anything? | yes — the bytes are mlock'd | no |
+| lower it mid-run? | **refused** (409) | accepted, both directions |
+
+That asymmetry is the whole design. Wired bytes cannot be given back
+without unwiring buffers a model is still reading, so the pool keeps its
+cushion and refuses a shrink while a pipeline runs. The allowance holds
+nothing, so it can move freely — it only widens the arithmetic of the
+next gate.
+
+`GenerativeModelManager::swappable_other_bytes()` reports the *supply*,
+and a caller spends `min(allowance, supply)`. It is deliberately
+under-counted: purgeable pages come off (already in
+`available_physical`), the whole system-wide wired figure comes off
+(including its file-backed part), and **this process's own anonymous
+bytes come off** — swapping vpipe to make room for vpipe buys nothing.
+Self-*wired* bytes are not subtracted again; they are unswappable and
+already inside the system wired figure.
+
+**Scope: the video preflight honours it. The image stage does not** — it
+still gates on the unwidened figure.
+
 ### K/V grows during the run
 
 K/V is the one large allocation that grows *while running*, so a

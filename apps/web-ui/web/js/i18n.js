@@ -224,6 +224,36 @@ const STRINGS = {
   'settings.wired_off':     ['wiring is off; nothing is protected from the '
       + 'compressor', '未启用锁定；没有内存受压缩器保护',
       '未啟用鎖定；沒有記憶體受壓縮器保護'],
+  'settings.swap_allowance': ['Swap allowance',
+      '可换出内存额度', '可換出記憶體額度'],
+  'settings.swap_allowance_desc': ['How much memory a video run may plan '
+      + 'to push OUT to the compressor or the swap file, on top of what '
+      + 'the system reports as reclaimable. The opposite of the wired '
+      + 'pool above: it reserves nothing and can be changed at any time, '
+      + 'and spending it costs speed rather than stability — the '
+      + 'pages displaced belong to other applications. Raise it if a '
+      + 'clip that used to run is refused for memory; 0 sizes a forward '
+      + 'against reclaimable memory alone.',
+      '视频任务在系统报告的可回收内存之外，还可以计划换出到压缩器或交换文件的'
+      + '内存额度。它与上面的锁定池相反：不预留任何内存，可随时修改；动用它'
+      + '损失的是速度而非稳定性——被换出的页面属于其他应用程序。如果原本'
+      + '可以运行的片段因内存被拒绝，可调高此值；填 0 则仅按可回收内存来'
+      + '衡量一次前向计算。',
+      '影片任務在系統回報的可回收記憶體之外，還可以計劃換出到壓縮器或交換檔的'
+      + '記憶體額度。它與上面的鎖定池相反：不預留任何記憶體，可隨時修改；'
+      + '動用它損失的是速度而非穩定性——被換出的頁面屬於其他應用程式。'
+      + '如果原本可以執行的片段因記憶體被拒絕，可調高此值；填 0 則僅按'
+      + '可回收記憶體來衡量一次前向計算。'],
+  'settings.swap_updated': ['Swap allowance updated', '可换出额度已更新',
+      '可換出額度已更新'],
+  'settings.swap_current': ['current {n} MB', '当前 {n} MB', '目前 {n} MB'],
+  'settings.swap_off':     ['no allowance; sized against reclaimable memory '
+      + 'alone', '未设置额度；仅按可回收内存衡量',
+      '未設定額度；僅按可回收記憶體衡量'],
+  // Beside the allowance, never instead of it: the allowance is a
+  // ceiling on spending this, not evidence that it exists.
+  'settings.swap_available': ['{n} MB could be freed right now',
+      '当前实际可释放 {n} MB', '目前實際可釋放 {n} MB'],
   'settings.limit_nonneg':  ['limit must be 0 or a positive integer',
       '上限必须为 0 或正整数', '上限必須為 0 或正整數'],
   'settings.no_endpoint':   ['server does not expose the limit endpoint',

@@ -11,13 +11,16 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
+#include "generative-models/shared/kernel-sets/prefill-gqa-attn-set.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace vpipe;
@@ -1140,6 +1143,307 @@ TEST(sdpa_mma, qwen_paged_flash_d256) {
                 cf.tag, n, n_pages, rel, ms_f, ms_q,
                 ms_q > 0 ? ms_q / ms_f : 0.0);
     EXPECT_TRUE(rel < 5e-2);
+  }
+}
+
+// Qwen3.5 full-attention PREFILL (16 q / 4 kv heads, head_dim 256, f16,
+// causal, fresh) -- our production kernels against MLX #3842's head-dim SPLIT
+// NAX attention and the plain NAX kernel at the same width. Our side is what
+// PrefillGqaAttnSet can pick (flash, steel, M5 mma), and the set itself is
+// tuned as the model tunes it so its per-n choice is printed. One KV page
+// (page_tokens = n rounded up to 64) makes the paged kernels and the NAX
+// kernels read the same bytes; every arm is checked against flash, which
+// qwen_paged_flash_d256 validates against a CPU oracle.
+// VPIPE_QWEN_ATTN_BENCH=1 (full: + 16384).
+TEST(sdpa_mma, qwen_prefill_d256_vs_nax_split) {
+  const char* gate = std::getenv("VPIPE_QWEN_ATTN_BENCH");
+  if (gate == nullptr) { return; }
+  const bool full = std::string(gate) == "full";
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  const bool m5 = mc->supports_matrix_cores();
+
+  const int D = 256, Hq = 16, Hkv = 4;
+  genai::PrefillGqaAttnSet set;
+  set.load(lib_sdpa, &lib_attn, &lib_mma, m5);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+
+  enum Arm { kFlash, kSteel, kMma, kNax, kSplit, kArms };
+  const char* name[kArms] = {"flash", "steel", "mma", "nax", "nax-split"};
+  std::vector<int> ns = full ? std::vector<int>{1024, 2048, 4096, 8192, 16384}
+                             : std::vector<int>{1024, 2048, 4096, 8192};
+  for (int n : ns) {
+    const int pt = (n + 63) / 64 * 64;
+    std::mt19937 rng(71 + n);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    SharedBuffer kb = mc->make_shared_buffer((size_t)Hkv * pt * D * 2);
+    SharedBuffer vb = mc->make_shared_buffer((size_t)Hkv * pt * D * 2);
+    SharedBuffer ptb = mc->make_shared_buffer(3 * 4);
+    std::vector<SharedBuffer> ob;
+    for (int a = 0; a < kArms; ++a) {
+      ob.push_back(mc->make_shared_buffer((size_t)Hq * n * D * 2));
+    }
+    if (qb.empty() || kb.empty() || vb.empty()) { continue; }
+    {
+      auto* q = static_cast<std::uint16_t*>(qb.contents());
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        q[i] = f32_to_h(d(rng) * 0.2f);
+      }
+      auto* k = static_cast<std::uint16_t*>(kb.contents());
+      auto* v = static_cast<std::uint16_t*>(vb.contents());
+      std::memset(k, 0, (size_t)Hkv * pt * D * 2);
+      std::memset(v, 0, (size_t)Hkv * pt * D * 2);
+      for (int h = 0; h < Hkv; ++h) {
+        for (int t = 0; t < n; ++t) {
+          for (int e = 0; e < D; ++e) {
+            const size_t i = ((size_t)h * pt + t) * D + e;
+            k[i] = f32_to_h(d(rng) * 0.2f);
+            v[i] = f32_to_h(d(rng) * 0.2f);
+          }
+        }
+      }
+      const int tab[3] = {0, n, 0};
+      std::memcpy(ptb.contents(), tab, sizeof(tab));
+    }
+    const float scale = 1.0f / std::sqrt((float)D);
+
+    // The NAX parameter block (steel attn AttnParams).
+    struct P {
+      int B, H, D, qL, kL, gqa_factor;
+      float scale;
+      int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+      std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+    };
+    SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
+    {
+      auto* p = static_cast<P*>(pb.contents());
+      const int BQ = 64, BK = 32;
+      p->B = 1; p->H = Hq; p->D = D; p->qL = n; p->kL = n;
+      p->gqa_factor = Hq / Hkv; p->scale = scale;
+      p->NQ = (n + BQ - 1) / BQ; p->NK = (n + BK - 1) / BK;
+      p->NQ_aligned = n / BQ; p->NK_aligned = n / BK;
+      p->qL_rem = n - p->NQ_aligned * BQ;
+      p->kL_rem = n - p->NK_aligned * BK;
+      p->qL_off = 0;
+      p->Q_strides[0] = (std::int64_t)Hq * n * D;
+      p->Q_strides[1] = (std::int64_t)n * D;
+      p->Q_strides[2] = D;
+      p->K_strides[0] = (std::int64_t)Hkv * pt * D;
+      p->K_strides[1] = (std::int64_t)pt * D;
+      p->K_strides[2] = D;
+      for (int i = 0; i < 3; ++i) {
+        p->V_strides[i] = p->K_strides[i];
+        p->O_strides[i] = p->Q_strides[i];
+      }
+    }
+    FunctionConstants fc;
+    fc.set_bool(200, (n % 64) == 0).set_bool(201, (n % 32) == 0)
+        .set_bool(300, false).set_bool(301, true).set_bool(302, false);
+    ComputeFunction fn[kArms] = {
+        lib_sdpa.function("sdpa_paged_flash_f16"),
+        lib_attn.valid() ? lib_attn.function("attn_steel_paged_bd256")
+                         : ComputeFunction(),
+        (m5 && lib_mma.valid()) ? lib_mma.function("sdpa_mma_f16")
+                                : ComputeFunction(),
+        (m5 && lib_nax.valid()) ? lib_nax.function("attn_steel_nax_h_bd256", fc)
+                                : ComputeFunction(),
+        (m5 && lib_nax.valid())
+            ? lib_nax.function("attn_steel_nax_dsplit_h_bd256", fc)
+            : ComputeFunction()};
+    if (!fn[kFlash].valid()) { continue; }
+
+    auto encode = [&](ComputeEncoder& enc, int a) {
+      enc.set_function(fn[a]);
+      enc.set_buffer(0, qb); enc.set_buffer(1, kb); enc.set_buffer(2, vb);
+      enc.set_buffer(3, ob[(size_t)a]);
+      const unsigned nu = (unsigned)n, H = (unsigned)Hq;
+      if (a == kNax || a == kSplit) {
+        enc.set_buffer(4, pb);
+        const unsigned wn = a == kSplit ? 2u : 1u;
+        enc.dispatch({32 * ((nu + 63) / 64), 4 * H, wn}, {32, 4, wn});
+        return;
+      }
+      enc.set_constant(4, scale); enc.set_constant(5, D);
+      enc.set_constant(6, Hq); enc.set_constant(7, Hkv);
+      enc.set_constant(8, n); enc.set_constant(9, 0);
+      enc.set_constant(10, pt); enc.set_constant(11, 1);
+      enc.set_buffer(12, ptb);
+      switch (a) {
+        case kSteel:
+          enc.dispatch({32 * ((nu + 31) / 32), 4 * H, 1}, {32, 4, 1});
+          break;
+        case kMma:
+          enc.dispatch({128, H, (nu + 15) / 16}, {128, 1, 1});
+          break;
+        default:
+          enc.dispatch({256, H, (nu + 7) / 8}, {256, 1, 1});
+          break;
+      }
+    };
+    auto once = [&](int a) {
+      const auto t0 = std::chrono::steady_clock::now();
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute(); encode(enc, a); }
+      st.commit().wait();
+      return secs_(t0, std::chrono::steady_clock::now()) * 1e3;
+    };
+    for (int a = 0; a < kArms; ++a) {
+      if (fn[a].valid()) { once(a); once(a); }
+    }
+    // Agreement against flash.
+    double rel[kArms] = {0.0};
+    const auto* ref = static_cast<const std::uint16_t*>(ob[kFlash].contents());
+    for (int a = 1; a < kArms; ++a) {
+      if (!fn[a].valid()) { continue; }
+      const auto* o = static_cast<const std::uint16_t*>(ob[(size_t)a].contents());
+      double num = 0.0, den = 0.0;
+      for (size_t i = 0; i < (size_t)Hq * n * D; i += 7) {
+        const double x = h_to_f32(ref[i]), y = h_to_f32(o[i]);
+        num += (x - y) * (x - y); den += x * x;
+      }
+      rel[a] = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      EXPECT_TRUE(rel[a] < 5e-2);
+    }
+    std::vector<double> ms[kArms];
+    for (int r = 0; r < 5; ++r) {
+      for (int a = 0; a < kArms; ++a) {
+        if (fn[a].valid()) { ms[a].push_back(once(a)); }
+      }
+    }
+    std::printf("[qwen_d256] n=%5d  set picks %-5s |", n, set.kernel_name(n));
+    double best_ours = 1e30;
+    for (int a = 0; a < kArms; ++a) {
+      if (ms[a].empty()) { continue; }
+      std::sort(ms[a].begin(), ms[a].end());
+      const double med = ms[a][ms[a].size() / 2];
+      if (a <= kMma) { best_ours = std::min(best_ours, med); }
+      std::printf(" %s %.1fms", name[a], med);
+      if (a > 0) { std::printf(" (%.0e)", rel[a]); }
+      std::printf(" |");
+    }
+    if (!ms[kSplit].empty()) {
+      const double sp = ms[kSplit][ms[kSplit].size() / 2];
+      std::printf(" split vs best ours %.2fx", best_ours / sp);
+    }
+    std::printf("\n");
+  }
+}
+
+// PrefillGqaAttnSet's NAX members against its flash member over a real PAGED
+// pool: 192-token pages with a partial last page, lengths off the 64 grid, and
+// MID-CONTEXT prefill (q_offset > 0, so the gather copies the prefix too and
+// the kernel's causal offset is live). The benchmark above uses one page and a
+// fresh prompt; this is the contract the model actually drives. On a GPU
+// without the NAX members they are simply refused.
+TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  const bool m5 = mc->supports_matrix_cores();
+  const int D = 256, Hq = 16, Hkv = 4, page_tokens = 192;
+
+  ::setenv("VPIPE_QWEN_PREFILL_AUTOTUNE", "0", 1);
+  genai::PrefillGqaAttnSet set;
+  set.load(lib_sdpa, &lib_attn, &lib_mma, m5, &lib_nax, false);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+  ::unsetenv("VPIPE_QWEN_PREFILL_AUTOTUNE");
+  ASSERT_TRUE(set.ready());
+  if (!set.ready()) { return; }
+
+  struct Case { int n, q_offset; };
+  const Case cases[] = {{300, 0}, {700, 0}, {1500, 0}, {2085, 0},
+                        {1000, 900}, {37, 2000}, {1024, 1024}};
+  for (const Case& cs : cases) {
+    const int n = cs.n, qoff = cs.q_offset, kL = qoff + n;
+    const int n_pages = (kL + page_tokens - 1) / page_tokens;
+    std::mt19937 rng(91 + n + 7 * qoff);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    // Pages allocated out of order (page ids reversed), so the gather has to
+    // follow the table rather than assume pid == page index.
+    const size_t pool = (size_t)n_pages * Hkv * page_tokens * D * 2;
+    SharedBuffer kb = mc->make_shared_buffer(pool);
+    SharedBuffer vb = mc->make_shared_buffer(pool);
+    SharedBuffer ptb = mc->make_shared_buffer((size_t)n_pages * 3 * 4);
+    if (qb.empty() || kb.empty() || vb.empty() || ptb.empty()) { continue; }
+    {
+      auto* q = static_cast<std::uint16_t*>(qb.contents());
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        q[i] = f32_to_h(d(rng) * 0.2f);
+      }
+      std::memset(kb.contents(), 0, pool);
+      std::memset(vb.contents(), 0, pool);
+      auto* k = static_cast<std::uint16_t*>(kb.contents());
+      auto* v = static_cast<std::uint16_t*>(vb.contents());
+      auto* pt = static_cast<std::int32_t*>(ptb.contents());
+      for (int p = 0; p < n_pages; ++p) {
+        const int pid = n_pages - 1 - p;
+        const int gstart = p * page_tokens;
+        const int nvalid = std::min(page_tokens, kL - gstart);
+        pt[p * 3] = pid; pt[p * 3 + 1] = nvalid; pt[p * 3 + 2] = gstart;
+        for (int h = 0; h < Hkv; ++h) {
+          for (int sl = 0; sl < nvalid; ++sl) {
+            for (int e = 0; e < D; ++e) {
+              const size_t i = (((size_t)pid * Hkv + h) * page_tokens + sl) * D
+                               + e;
+              k[i] = f32_to_h(d(rng) * 0.2f);
+              v[i] = f32_to_h(d(rng) * 0.2f);
+            }
+          }
+        }
+      }
+    }
+    genai::PrefillGqaAttnSet::Attn a;
+    a.qt = &qb; a.kpool = &kb; a.vpool = &vb; a.page_table = &ptb;
+    a.n = n; a.q_offset = qoff; a.page_tokens = page_tokens;
+    a.n_pages = n_pages; a.scale = 1.0f / std::sqrt((float)D);
+
+    auto run = [&](const char* member, SharedBuffer& out) {
+      a.out = &out;
+      bool ok = false;
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        ok = set.dispatch_member(enc, a, member); }
+      st.commit().wait();
+      return ok;
+    };
+    SharedBuffer ref = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    ASSERT_TRUE(run("flash", ref));
+    const auto* r = static_cast<const std::uint16_t*>(ref.contents());
+    for (const char* member : {"steel", "nax", "nax-split"}) {
+      SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+      const bool ran = run(member, out);
+      const bool expect = std::string(member) == "steel" ? lib_attn.valid()
+                                                         : m5;
+      if (!expect) {
+        if (std::string(member) != "steel") { EXPECT_FALSE(ran); }
+        continue;
+      }
+      ASSERT_TRUE(ran);
+      if (!ran) { continue; }
+      const auto* o = static_cast<const std::uint16_t*>(out.contents());
+      double num = 0.0, den = 0.0;
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        const double x = h_to_f32(r[i]), y = h_to_f32(o[i]);
+        num += (x - y) * (x - y); den += x * x;
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[qwen_set] n=%4d q_offset=%4d pages=%2d %-9s vs flash "
+                  "rel-L2 %.2e\n", n, qoff, n_pages, member, rel);
+      EXPECT_TRUE(rel < 5e-3);
+    }
   }
 }
 

@@ -198,6 +198,32 @@ public:
   // any ceiling the box turned out to grant. 0 when wiring is off.
   virtual std::size_t wired_pool_mb() const = 0;
 
+  // ---- The swap allowance --------------------------------------
+  //
+  // The OPPOSITE question to the wired pool: how much memory a run may
+  // plan to push OUT to the compressor or the swap file, in megabytes,
+  // on top of what the OS reports as reclaimable.
+  //
+  // A preflight otherwise sizes itself against free + purgeable +
+  // file-backed pages, which excludes dirty anonymous memory that would
+  // need swap. That is the right exclusion for a decision held for a
+  // whole run and too strict for one clip, so this allows a bounded
+  // amount of it to count -- bounded because the pages displaced belong
+  // to other processes, and spending them without limit is how a box
+  // starts thrashing.
+  //
+  // MUTABLE AT ANY TIME, in both directions, running or not: nothing is
+  // reserved or held, so there is nothing to give back and no
+  // shrink-while-running refusal. 0 is a real setting (gate on
+  // reclaimable RAM alone), not "use the default".
+  //
+  // Status{2} when there is no model manager (a non-Apple build).
+  virtual Status set_swap_allowance_mb(std::size_t mb) = 0;
+
+  // The allowance in megabytes. Honoured by the video preflight; the
+  // image stage still gates on the unwidened figure.
+  virtual std::size_t swap_allowance_mb() const = 0;
+
   // ---- Performance profiling -----------------------------------
   //
   // A low-overhead per-stage event tracer. When enabled, each

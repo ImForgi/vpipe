@@ -10,6 +10,11 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/generative-model-manager.h"
+#include <sys/sysctl.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -302,6 +307,112 @@ TEST(session, wired_pool_shrinks_only_while_idle) {
 
   filesystem::current_path(saved_cwd, ec);
 }
+
+// The swap allowance moves in BOTH directions at any time, and the
+// contrast with the wired pool above is the point of the test rather
+// than an incidental difference.
+//
+// The pool refuses a shrink mid-run because its bytes are already
+// mlock'd: making a lower limit true means unwiring buffers a model is
+// still reading. The allowance reserves nothing -- it only widens the
+// arithmetic of the next preflight -- so there is nothing to give back
+// and no state a lower figure could invalidate. A Status{3} here would
+// mean someone had copied the pool's rule without its reason.
+TEST(session, swap_allowance_moves_both_ways_while_running) {
+  SessionTempDir dir;
+  error_code ec;
+  filesystem::path saved_cwd = filesystem::current_path(ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  filesystem::current_path(dir.path, ec);
+
+  vpipe::Session sess;
+  if (sess.generative_model_manager() == nullptr) {
+    filesystem::current_path(saved_cwd, ec);
+    return;                       // no manager in this build
+  }
+  // The SHIPPED default, asserted so a change to it is a deliberate
+  // edit to this line rather than a silent drift.
+  EXPECT_TRUE(sess.swap_allowance_mb() == 4096u);
+
+  auto handle = sess.create_pipeline("swap");
+  auto* pl    = vpipe::HandleAccess::impl(handle)->pipeline();
+  pl->insert_stage(std::make_unique<NoopSourceStage>(
+      &sess, "src", std::vector<vpipe::InEdge>{}));
+  EXPECT_TRUE(sess.launch_pipeline(handle).code == 0u);
+
+  // DOWN while running -- accepted, where the wired pool returns 3.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(1024).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 1024u);
+  // ...and up again.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(8192).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 8192u);
+
+  // 0 is a REAL setting -- size a forward against reclaimable RAM alone
+  // -- and not a request for the default. A getter reporting 4096 here
+  // would mean the sentinel had leaked into the value.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(0).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 0u);
+
+  EXPECT_TRUE(sess.stop_pipeline(handle).code == 0u);
+  EXPECT_TRUE(sess.unload_pipeline(handle).code == 0u);
+
+  filesystem::current_path(saved_cwd, ec);
+}
+
+// THE CONFIG PATH, which the setter test above does not touch: a
+// figure typed into a session config (or forwarded from --swap-
+// allowance-mb through the environment) has to reach the manager at
+// construction, and an UNSET key has to leave the shipped default
+// alone rather than overwriting it with zero.
+//
+// That last case is the one worth a test. The parser uses a sentinel to
+// tell "not configured" from an explicit 0, because 0 is a real setting
+// meaning "size against reclaimable RAM alone" -- collapsing the two
+// would silently disable the allowance for every session that never
+// mentions it.
+TEST(session, swap_allowance_comes_from_config) {
+  {
+    vpipe::Session sess(R"({"swap_allowance_mb": 1234})");
+    if (sess.generative_model_manager() == nullptr) { return; }
+    EXPECT_TRUE(sess.swap_allowance_mb() == 1234u);
+  }
+  // An explicit 0 is honoured, not read as "unset".
+  {
+    vpipe::Session sess(R"({"swap_allowance_mb": 0})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 0u);
+  }
+  // No key at all -> the manager's own default stands.
+  {
+    vpipe::Session sess(R"({"log_level": "info"})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 4096u);
+  }
+  // The environment overrides the config, the way the other memory
+  // knobs do -- this is how both apps forward their flag.
+  {
+    ::setenv("VPIPE_SWAP_ALLOWANCE_MB", "2048", 1);
+    vpipe::Session sess(R"({"swap_allowance_mb": 1234})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 2048u);
+    ::unsetenv("VPIPE_SWAP_ALLOWANCE_MB");
+  }
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// The supply side. Deliberately a WEAK assertion: this reads the live
+// machine, so the only thing true on every box is that the figure is
+// sane -- it cannot exceed physical RAM, and it must not come back as a
+// wrapped-around huge number when the subtractions overshoot (which is
+// the arithmetic bug worth catching, since every term is unsigned).
+TEST(session, swappable_other_bytes_is_bounded) {
+  const size_t spare =
+      vpipe::genai::GenerativeModelManager::swappable_other_bytes();
+  size_t ram = 0;
+  uint64_t mem = 0; size_t len = sizeof(mem);
+  if (::sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
+    ram = (size_t)mem;
+  }
+  if (ram > 0) { EXPECT_TRUE(spare < ram); }
+}
+#endif
 
 TEST(session, lmdb_env_defaults_to_cwd_without_db_path) {
   // No db.path in config => lmdb_env() opens "." (the process

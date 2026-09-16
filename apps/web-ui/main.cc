@@ -3,6 +3,7 @@
 // Usage:
 //   vpipe-web-ui [--bind ADDR] [--port N] [--config CFG]
 //                [--memory-cap-mb N] [--wired-pool-mb N]
+//                [--swap-allowance-mb N]
 //
 //   --bind      interface to listen on (default: this machine's LAN
 //               address, i.e. en0's IPv4, so the UI is reachable from
@@ -176,6 +177,14 @@ print_usage_(const char* prog)
     "                 RAM (default 75 percent), 0 = no wiring. Also\n"
     "                 editable at run time from the Settings panel --\n"
     "                 raisable while a pipeline runs, not lowerable.\n"
+    "  --swap-allowance-mb N\n"
+    "                 How much memory a run may plan to push OUT to the\n"
+    "                 compressor or swap, on top of what the OS reports\n"
+    "                 reclaimable. The opposite knob to --wired-pool-mb:\n"
+    "                 it reserves nothing, so it is editable in both\n"
+    "                 directions at any time, including from the\n"
+    "                 Settings panel. Unset = 4096, 0 = size against\n"
+    "                 reclaimable RAM alone.\n"
     "  --plugin PATH  Load a plugin .dylib at startup (adds stages /\n"
     "                 shaders / models). Repeatable. See docs/PLUGINS.md.\n"
     "  --tls          Serve over HTTPS with a cached self-signed cert\n"
@@ -343,6 +352,10 @@ main(int argc, char** argv)
   // SessionIntf::set_wired_pool_mb for what a running pipeline allows.
   const string wired = arg_value_(argc, argv, "--wired-pool-mb", "");
   if (!wired.empty()) { ::setenv("VPIPE_WIRED_POOL_MB", wired.c_str(), 1); }
+  // The swap allowance -- also editable from the Settings panel, and in
+  // both directions at any time, because it reserves nothing.
+  const string swap = arg_value_(argc, argv, "--swap-allowance-mb", "");
+  if (!swap.empty()) { ::setenv("VPIPE_SWAP_ALLOWANCE_MB", swap.c_str(), 1); }
   string cfg       = arg_value_(argc, argv, "--config", "");
   int    port      = static_cast<int>(strtol(port_str.c_str(), nullptr, 10));
 

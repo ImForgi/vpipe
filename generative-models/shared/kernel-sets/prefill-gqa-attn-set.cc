@@ -19,15 +19,37 @@ namespace {
 // n-regime lower bounds + the n each is probed at (around the steel/flash
 // crossover ~2k). The long regime is probed at a modest n (the O(n^2) probe +
 // its qt[Hq,n,D] buffer stay cheap; the steel>=flash verdict holds above it).
-const int kRegimeLo[]  = {0, 1536, 3072};
-const int kRegimeN[]   = {768, 2048, 3072};   // long probe capped (O(n^2) cost)
-const char* kName[5] = {"scalar", "qtile", "flash", "mma", "steel"};
+const int kRegimeLo[]  = {0, 1536, 3072, 6144};
+const int kRegimeN[]   = {768, 2048, 3072, 6144};
+// The VERY LONG regime exists for the NAX members: MLX's head-dim split pulls
+// ahead of the plain kernel only with length -- MEASURED on the M5 Pro at
+// Qwen3.5-4B, a 5.65 / 5.66 ms tie at 3072 but 1.28x vs 1.24x (8k) and 1.53x vs
+// 1.45x (16k) end to end -- so a probe capped at 3072 picked the wrong one; at
+// kernel level they separate by 4096. It is probed only when a NAX member
+// exists, and only among the long-n members; elsewhere it inherits the long
+// regime's choice unprobed and allocates nothing for it.
+constexpr int kVeryLong = 3;
+const char* kName[7] = {"scalar", "qtile", "flash", "mma", "steel", "nax",
+                        "nax-split"};
+
+// The steel attention parameter block (mlx steel/attn/params.h AttnParams),
+// which the NAX kernels read at buffer 4.
+struct NaxAttnParams {
+  int B, H, D, qL, kL, gqa_factor;
+  float scale;
+  int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+  std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+};
+
+constexpr int kNaxBQ = 64;
+constexpr int kNaxBK = 32;
 }  // namespace
 
 bool
 PrefillGqaAttnSet::load(metal_compute::ComputeLibrary& lib_sdpa,
                         metal_compute::ComputeLibrary* lib_attn,
-                        metal_compute::ComputeLibrary* lib_mma, bool use_mma) {
+                        metal_compute::ComputeLibrary* lib_mma, bool use_mma,
+                        metal_compute::ComputeLibrary* lib_nax, bool bf16) {
   _fn[kScalar] = lib_sdpa.function("sdpa_paged_causal_f16");
   _fn[kQtile] = lib_sdpa.function("sdpa_paged_qtile_f16");
   _fn[kFlash] = lib_sdpa.function("sdpa_paged_flash_f16");
@@ -42,6 +64,16 @@ PrefillGqaAttnSet::load(metal_compute::ComputeLibrary& lib_sdpa,
   _have[kFlash] = _fn[kFlash].valid();
   _have[kMma] = use_mma && _fn[kMma].valid();
   _have[kSteel] = _fn[kSteel].valid();
+  // The NAX members: matrix-core GPUs only (use_mma), and only when the pool
+  // gather and both kernels are present. A probe pipeline per kernel proves
+  // the entry points exist before the set offers them.
+  _lib_nax = (lib_nax != nullptr && lib_nax->valid()) ? lib_nax : nullptr;
+  _nax_bf16 = bf16;
+  _fn_gather = lib_sdpa.function("kv_gather_paged_f16");
+  if (use_mma && _lib_nax != nullptr && _fn_gather.valid()) {
+    _have[kNax] = nax_fn(false, true, true).valid();
+    _have[kNaxSplit] = nax_fn(true, true, true).valid();
+  }
   return _have[kFlash] || _have[kQtile];        // need a usable non-scalar member
 }
 
@@ -59,9 +91,87 @@ PrefillGqaAttnSet::kernel_name(int n) const {
   return kName[_member[regime_of(n)]];
 }
 
+const metal_compute::ComputeFunction&
+PrefillGqaAttnSet::nax_fn(bool split, bool align_q, bool align_k) const {
+  metal_compute::ComputeFunction& f =
+      _nax_fn[split ? 1 : 0][align_q ? 1 : 0][align_k ? 1 : 0];
+  if (!f.valid() && _lib_nax != nullptr) {
+    metal_compute::FunctionConstants fc;
+    fc.set_bool(200, align_q).set_bool(201, align_k)
+        .set_bool(300, false).set_bool(301, true).set_bool(302, false);
+    std::string name = split ? "attn_steel_nax_dsplit_h_bd256"
+                             : "attn_steel_nax_h_bd256";
+    if (_nax_bf16) { name += "_bf16"; }
+    f = _lib_nax->function(name, fc);
+  }
+  return f;
+}
+
+void
+PrefillGqaAttnSet::encode_nax(metal_compute::ComputeEncoder& enc,
+                              const Attn& a, bool split) const {
+  const int D = _dims.D, Hq = _dims.Hq, Hkv = _dims.Hkv;
+  const int n = a.n;
+  const int kL = a.q_offset + a.n;
+  // Strided K/V: the whole prefix plus this chunk, gathered from the pool.
+  const std::size_t need = (std::size_t)Hkv * (std::size_t)kL * D * 2;
+  if (_mc != nullptr && (_kc.byte_size() < need || _vc.byte_size() < need)) {
+    _kc = _mc->make_shared_buffer(need);
+    _vc = _mc->make_shared_buffer(need);
+  }
+  if (_kc.byte_size() < need || _vc.byte_size() < need) { return; }
+  enc.set_function(_fn_gather);
+  enc.set_buffer(0, *a.kpool);
+  enc.set_buffer(1, *a.vpool);
+  enc.set_buffer(2, _kc);
+  enc.set_buffer(3, _vc);
+  enc.set_constant(4, Hkv);
+  enc.set_constant(5, D);
+  enc.set_constant(6, a.page_tokens);
+  enc.set_constant(7, kL);
+  enc.set_buffer(8, *a.page_table);
+  enc.dispatch({(unsigned)a.page_tokens, (unsigned)Hkv, (unsigned)a.n_pages},
+               {32, 1, 1});
+
+  NaxAttnParams p{};
+  p.B = 1; p.H = Hq; p.D = D;
+  p.qL = n; p.kL = kL;
+  p.gqa_factor = Hq / Hkv;
+  p.scale = a.scale;
+  p.NQ = (n + kNaxBQ - 1) / kNaxBQ;
+  p.NK = (kL + kNaxBK - 1) / kNaxBK;
+  p.NQ_aligned = n / kNaxBQ;
+  p.NK_aligned = kL / kNaxBK;
+  p.qL_rem = n - p.NQ_aligned * kNaxBQ;
+  p.kL_rem = kL - p.NK_aligned * kNaxBK;
+  p.qL_off = kL - n;
+  p.Q_strides[0] = (std::int64_t)Hq * n * D;
+  p.Q_strides[1] = (std::int64_t)n * D;
+  p.Q_strides[2] = D;
+  p.K_strides[0] = (std::int64_t)Hkv * kL * D;
+  p.K_strides[1] = (std::int64_t)kL * D;
+  p.K_strides[2] = D;
+  for (int i = 0; i < 3; ++i) {
+    p.V_strides[i] = p.K_strides[i];
+    p.O_strides[i] = p.Q_strides[i];
+  }
+  enc.set_function(nax_fn(split, n % kNaxBQ == 0, kL % kNaxBK == 0));
+  enc.set_buffer(0, *a.qt);
+  enc.set_buffer(1, _kc);
+  enc.set_buffer(2, _vc);
+  enc.set_buffer(3, *a.out);
+  enc.set_constant(4, p);
+  const unsigned wn = split ? 2u : 1u;
+  enc.dispatch({32u * (unsigned)p.NQ, 4u * (unsigned)Hq, wn}, {32u, 4u, wn});
+}
+
 void
 PrefillGqaAttnSet::encode_member(metal_compute::ComputeEncoder& enc,
                                  const Attn& a, int member) const {
+  if (member == kNax || member == kNaxSplit) {
+    encode_nax(enc, a, member == kNaxSplit);
+    return;
+  }
   const int D = _dims.D, Hq = _dims.Hq, Hkv = _dims.Hkv;
   enc.set_function(_fn[member]);
   enc.set_buffer(0, *a.qt);
@@ -105,10 +215,25 @@ PrefillGqaAttnSet::dispatch(metal_compute::ComputeEncoder& enc,
   encode_member(enc, a, _member[regime_of(a.n)]);
 }
 
+bool
+PrefillGqaAttnSet::dispatch_member(metal_compute::ComputeEncoder& enc,
+                                   const Attn& a,
+                                   std::string_view member) const {
+  if (!_ready) { return false; }
+  for (int m = 0; m < kMembers; ++m) {
+    if (member == kName[m] && _have[m]) {
+      encode_member(enc, a, m);
+      return true;
+    }
+  }
+  return false;
+}
+
 void
 PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
                            TuningReport& rep) {
   _dims = dims;
+  _mc = mc;
   for (int i = 0; i < kRegimes; ++i) {
     _member[i] = _have[kFlash] ? kFlash : kQtile;
   }
@@ -125,6 +250,27 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     if (steel_ok && _have[kSteel]) { _member[i] = kSteel; }
     else if (_have[kMma]) { _member[i] = kMma; }
   }
+  // A pinned member wins over both the defaults and the probe.
+  auto pin = [&]() {
+    const char* e = std::getenv("VPIPE_QWEN_PREFILL_ATTN");
+    if (e == nullptr || *e == '\0') { return false; }
+    for (int m = 0; m < kMembers; ++m) {
+      if (std::string_view(e) == kName[m] && _have[m]) {
+        for (int i = 0; i < kRegimes; ++i) { _member[i] = m; }
+        rep.add("prefill-attn", 0.0, std::string("pinned ") + kName[m]);
+        return true;
+      }
+    }
+    // SAID, not a silent fallback: an A/B that pins a member this model or
+    // GPU does not have would otherwise measure the tuner's pick under the
+    // pinned member's name.
+    std::fprintf(stderr,
+                 "[prefill-attn] VPIPE_QWEN_PREFILL_ATTN=%s is not available "
+                 "here; tuning instead\n", e);
+    rep.add("prefill-attn", 0.0, std::string("pin unavailable: ") + e);
+    return false;
+  };
+  if (pin()) { return; }
   if (std::getenv("VPIPE_QWEN_STEEL_MIN")) { return; }
   if (const char* e = std::getenv("VPIPE_QWEN_PREFILL_AUTOTUNE")) {
     if (std::atoi(e) == 0) { return; }
@@ -133,8 +279,13 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
   const int page_tokens = 512;
   const float scale = 1.0f / std::sqrt((float)D);
 
+  // Probe buffers sized by the regimes actually probed: qt/out are
+  // Hq * n * D, ~250 MB each at the very-long probe, which a GPU without the
+  // NAX members never runs.
+  const bool probe_very_long = _have[kNax] || _have[kNaxSplit];
   int max_n = 0;
   for (int i = 0; i < kRegimes; ++i) {
+    if (i == kVeryLong && !probe_very_long) { continue; }
     if (kRegimeN[i] > max_n) { max_n = kRegimeN[i]; }
   }
   const int max_pages = (max_n + page_tokens - 1) / page_tokens;
@@ -172,17 +323,25 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
       pt[i * 3 + 1] = page_tokens;
       pt[i * 3 + 2] = i * page_tokens;
     }
-    // Candidates: short regime -> {scalar?, qtile, flash}; mid/long -> {flash,
-    // steel, mma}. Only the present members.
+    // Candidates: short regime -> {qtile, flash}; mid/long -> {flash, steel,
+    // mma}; the NAX members in every regime (their probe includes the pool
+    // gather they need). Only the present members.
+    const bool nax = _have[kNax] || _have[kNaxSplit];
+    if (ri == kVeryLong && !nax) {
+      _member[ri] = _member[ri - 1];
+      continue;
+    }
     std::vector<int> cand;
     if (ri == 0) {
       if (_have[kQtile]) { cand.push_back(kQtile); }
       if (_have[kFlash]) { cand.push_back(kFlash); }
     } else {
-      if (_have[kFlash]) { cand.push_back(kFlash); }
+      if (_have[kFlash] && ri != kVeryLong) { cand.push_back(kFlash); }
       if (steel_ok && _have[kSteel]) { cand.push_back(kSteel); }
       if (_have[kMma]) { cand.push_back(kMma); }
     }
+    if (_have[kNax]) { cand.push_back(kNax); }
+    if (_have[kNaxSplit]) { cand.push_back(kNaxSplit); }
     if (cand.size() < 2) { continue; }           // nothing to choose
     // O(n^2) prefill attention -> few reps suffice (the per-dispatch signal is
     // large); keep the probe wall-time bounded.

@@ -42,7 +42,7 @@ using namespace metal;
 // but must parse), so complex64_t needs to be in scope first. MLX's
 // complex.h references their bfloat16_t wrapper for an unused ctor;
 // alias it to the native type (we never touch bf16 or complex).
-typedef bfloat16 bfloat16_t;
+typedef bfloat bfloat16_t;
 #include "mlx/backend/metal/kernels/complex.h"
 #include "mlx/backend/metal/kernels/steel/gemm/mma.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"

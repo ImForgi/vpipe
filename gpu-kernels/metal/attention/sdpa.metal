@@ -4976,3 +4976,41 @@ kernel void sdpa_spans_f16(
     }
   }
 }
+
+// Copy a PAGED K/V pool [n_alloc_pages, Hkv, page_tokens, D] into contiguous
+// per-head planes [Hkv, kL, D] -- the layout a strided (non-paged) attention
+// kernel reads, e.g. the M5 NAX attention in PrefillGqaAttnSet. Keys and
+// values in one pass. Page table: {page_id, n_valid, global_start} per page,
+// ascending position order; a page may be partly filled, and only positions
+// below kL are copied (mid-context prefill copies the whole prefix + chunk).
+//   0:kpool 1:vpool 2:kout 3:vout 4:Hkv 5:D 6:page_tokens 7:kL 8:page_table
+// grid (page_tokens, Hkv, n_pages).
+kernel void kv_gather_paged_f16(
+    const device VPIPE_ELT* kpool      [[buffer(0)]],
+    const device VPIPE_ELT* vpool      [[buffer(1)]],
+    device VPIPE_ELT*       kout       [[buffer(2)]],
+    device VPIPE_ELT*       vout       [[buffer(3)]],
+    constant int&           Hkv        [[buffer(4)]],
+    constant int&           D          [[buffer(5)]],
+    constant int&           page_tokens[[buffer(6)]],
+    constant int&           kL         [[buffer(7)]],
+    const device int*       page_table [[buffer(8)]],
+    uint3                   gid        [[thread_position_in_grid]])
+{
+  const int s  = (int)gid.x;
+  const int h  = (int)gid.y;
+  const int pg = (int)gid.z;
+  const int pid    = page_table[pg * 3 + 0];
+  const int nvalid = page_table[pg * 3 + 1];
+  const int gstart = page_table[pg * 3 + 2];
+  if (s >= nvalid) { return; }
+  const int t = gstart + s;
+  if (t >= kL) { return; }
+  const ulong src = (((ulong)pid * (ulong)Hkv + (ulong)h) * (ulong)page_tokens
+                     + (ulong)s) * (ulong)D;
+  const ulong dst = ((ulong)h * (ulong)kL + (ulong)t) * (ulong)D;
+  for (int d = 0; d < D; ++d) {
+    kout[dst + (ulong)d] = kpool[src + (ulong)d];
+    vout[dst + (ulong)d] = vpool[src + (ulong)d];
+  }
+}

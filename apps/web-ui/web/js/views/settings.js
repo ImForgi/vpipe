@@ -1,5 +1,5 @@
 // Settings view. Language + color theme + console/log history caps
-// + the wired-pool ceiling.
+// + the wired-pool ceiling + the swap allowance.
 
 import { el, clear, toast } from '../dom.js';
 import { THEMES, getTheme, applyTheme } from '../theme.js';
@@ -23,6 +23,7 @@ export function mountSettings(container) {
   body.append(consoleLimitSetting());
   body.append(logLimitSetting());
   body.append(wiredPoolSetting());
+  body.append(swapAllowanceSetting());
   wrap.append(body);
   container.append(wrap);
 }
@@ -182,6 +183,65 @@ function logLimitSetting() {
 // unswappable (mlock'd): model weights, a streaming model's resident
 // blocks, activation scratch.
 //
+// The swap allowance: how much memory a run may plan to push OUT.
+//
+// Editable in BOTH directions at any time, which is the difference from
+// the wired pool above and the reason there is no 409 path here: this
+// setting reserves nothing, so lowering it takes nothing back from a
+// running pipeline -- it only narrows what the next preflight believes
+// it may spend.
+function swapAllowanceSetting() {
+  const input = el('input', { type: 'number',
+    min: '0', max: '1048576', step: '512', value: '0', placeholder: '0' });
+  const status = el('span', { class: 'setting-status' });
+
+  const render = (r) => {
+    input.value = String(r.mb || 0);
+    const bits = [];
+    bits.push(r.mb ? t('settings.swap_current', { n: r.mb })
+                   : t('settings.swap_off'));
+    // What the box could actually give up, beside what we allow. The
+    // allowance is a ceiling on spending this, not evidence it exists,
+    // and the two numbers together are what an operator needs to tell a
+    // generous setting from an effective one.
+    bits.push(t('settings.swap_available', { n: r.swappable_mb || 0 }));
+    status.textContent = bits.join(' · ');
+  };
+
+  const saveBtn = el('button', { class: 'btn',
+    onclick: async () => {
+      const n = parseInt(input.value, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        toast(t('settings.limit_nonneg'), 'error');
+        return;
+      }
+      try {
+        render(await api.swapAllowanceSet(n));
+        toast(t('settings.swap_updated'), 'ok');
+      } catch (e) {
+        toast(t('settings.save_failed', { msg: e.message }), 'error');
+        try { render(await api.swapAllowanceGet()); } catch (e2) { /* keep */ }
+      }
+    } }, t('common.save'));
+
+  (async () => {
+    try {
+      render(await api.swapAllowanceGet());
+    } catch (e) {
+      status.textContent = t('settings.no_endpoint');
+    }
+  })();
+
+  return el('div', { class: 'setting' },
+    el('div', { class: 'setting-label' }, t('settings.swap_allowance')),
+    el('div', { class: 'setting-desc' }, t('settings.swap_allowance_desc')),
+    el('div', { class: 'setting-row' },
+      input,
+      el('span', { class: 'setting-unit' }, t('settings.mb')),
+      saveBtn),
+    status);
+}
+
 // Editable WHILE A PIPELINE RUNS, and only upwards. The server is what
 // enforces that (409), not this field: a browser check would be a race
 // against a run that starts between the poll and the save, and the

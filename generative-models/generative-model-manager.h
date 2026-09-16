@@ -703,6 +703,86 @@ public:
   void        set_memory_cap(std::size_t bytes);
   std::size_t memory_cap() const;
 
+  // THE SWAP ALLOWANCE: how much memory a preflight may plan to displace
+  // into the compressor or the swap file, on top of what the OS reports
+  // as reclaimable.
+  //
+  // It is the OPPOSITE KNOB to the wired pool, and the two are set
+  // independently on purpose. The pool bounds what this process makes
+  // unswappable -- over-allocating there takes the machine down, so it
+  // keeps its cushion. This bounds what a run may push OUT, which costs
+  // throughput and nothing else: the pages that go are other processes'
+  // resident anonymous ones, and the failure mode is a slower box, not a
+  // dead one.
+  //
+  // It exists because `available_physical` counts free + purgeable +
+  // file-backed pages and deliberately excludes dirty anonymous memory
+  // that would need swap. That exclusion is right for a durable
+  // decision, and too strict for a single clip: macOS 27 keeps less in
+  // the file cache and pushes less to the compressor unasked than 26
+  // did, so a pipeline that ran before the upgrade reads as short by a
+  // couple of GB while the memory is still there -- it is merely
+  // somebody else's anonymous pages rather than cache.
+  //
+  // WHAT IT DOES NOT GRANT. Nothing is reserved, held or promised. The
+  // figure only widens the arithmetic of a preflight gate, so it can be
+  // raised or lowered at any moment -- including mid-run -- with nothing
+  // to give back. That is why, unlike the wired pool, there is no
+  // shrink-while-running refusal.
+  //
+  // Honoured by the video preflight (GenerateVideoStage). The image
+  // stage still gates on the unwidened figure.
+  void        set_swap_allowance_bytes(std::size_t bytes);
+  std::size_t swap_allowance_bytes() const;
+
+  // WHAT THE BOX COULD ACTUALLY GIVE UP: resident anonymous memory
+  // belonging to OTHER processes, which the OS can compress or swap but
+  // which `available_physical` excludes by design.
+  //
+  // The allowance above is a ceiling on spending this; this is the
+  // supply. A caller wants min() of the two -- permission and
+  // availability are different questions, and on a box whose memory is
+  // mostly wired or already compressed this returns little or nothing,
+  // so the gate stays strict without the allowance having to change.
+  //
+  // DELIBERATELY UNDER-COUNTED, three ways. Purgeable pages come off
+  // because available_physical already counts them. The WHOLE
+  // system-wide wired figure comes off, including its file-backed part,
+  // which errs low. And THIS PROCESS'S OWN anonymous bytes come off:
+  // swapping vpipe to make room for vpipe buys nothing and thrashes the
+  // forward we are sizing. Self-WIRED bytes are deliberately NOT
+  // subtracted -- they are unswappable and already counted in the
+  // system wired figure, so removing them again would double-count.
+  //
+  // A system query, not manager state: static, and 0 when the kernel
+  // will not answer.
+  static std::size_t swappable_other_bytes();
+
+  // The same query with its TERMS, for a caller that has to explain the
+  // answer rather than only use it.
+  //
+  // A zero `spare` reads two ways that call for opposite responses: an
+  // idle box with no other-process anonymous memory to give (correct --
+  // the allowance is simply not needed), or a box whose wired total
+  // already exceeds its anonymous pages, which is the subtraction being
+  // pessimistic. MEASURED on an idle 24 GB M5 Pro: 2.27 GB anonymous
+  // against 2.26 GB wired, so `spare` clamped to 0 while 18456 MB of
+  // reclaimable RAM carried the clip unaided. Without the terms those
+  // two are indistinguishable from each other and from a bug.
+  //
+  // ONE SAMPLE, which is why this is a struct rather than an accessor
+  // per term: four separate queries would read the machine at four
+  // instants and print terms that do not add up to the figure the gate
+  // actually used.
+  struct SwapSupply {
+    std::size_t anon      = 0;  // internal_page_count, bytes
+    std::size_t purgeable = 0;
+    std::size_t wired     = 0;  // system-wide, subtracted in full
+    std::size_t self_anon = 0;  // this task's own anonymous bytes
+    std::size_t spare     = 0;  // what swappable_other_bytes() returns
+  };
+  static SwapSupply swap_supply();
+
   // Weights currently held UNPARKED, plus KV. This is the number the cap
   // is compared against; resident_bytes() counts parked sets too.
   std::size_t active_bytes() const;
@@ -876,6 +956,11 @@ private:
   std::unordered_map<std::string, ScratchClaim>               _scratch;
   WeightRegistry                                              _weights;
   std::atomic<std::size_t>                                    _memory_cap{0};
+  // The swap allowance, in bytes. 4 GB by default -- see
+  // set_swap_allowance_bytes for why a default above zero is the honest
+  // setting and why it carries no shrink-while-running rule.
+  std::atomic<std::size_t>                                    _swap_allowance{
+      4ull << 30};
   // The wired pool. `_pool_pct` is what was asked for; `_pool_granted`
   // is the ceiling after the box refused, 0 meaning "not refused yet".
   std::atomic<int>                                            _pool_pct{0};

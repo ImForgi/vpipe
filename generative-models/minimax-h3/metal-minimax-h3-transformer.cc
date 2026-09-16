@@ -2728,6 +2728,98 @@ route_tune_rows_(H3Route r, int ceiling)
 
 }  // namespace
 
+// THE ATTENTION QUERY TILE, measured ON THE REAL WORKLOAD.
+//
+// The NAX attention holds a BQ-row query tile in registers and streams the
+// whole K/V once per tile, so intensity is ~BQ flops per byte at any length.
+// BQ = WM * 16 with TQ == 1, so BQ 128 is the same kernel with 8 simdgroups
+// instead of 4: half the K/V re-read, half as many threadgroups in flight.
+// Which way that trades is a property of the MACHINE and the SHAPE -- MEASURED
+// bit-identical either way, an M5 Pro gains 1.13x at 19k rows and 1.22x at
+// 100k, a 10-core M5 Air loses 5% at 9.4k and gains 8-13% at 19k-38k, and a
+// 48q/12kv GQA shape gains nothing on either.
+//
+// So it is MEASURED HERE, on this model's own blocks, the way the ANE tier
+// measures its split: the streamed path already commits and waits per block,
+// so a block's wall time is there for the taking. Warm two blocks on the
+// incumbent, alternate whole blocks three-and-three, keep the median winner.
+// No synthetic dispatch, no truncated stand-in shape, and the samples are the
+// real sequence at the real head count.
+//
+// The RESIDENT path has no per-block boundary -- the whole forward is one
+// deferred stream -- so it cannot sample and keeps BQ 64.
+void
+MetalMiniMaxH3Transformer::tune_attn_tile_(int seq, bool dense)
+{
+  if (_attn_tile_latched || !_attn_nax) { return; }
+  // Nothing to choose: too short for the wide tile to pay, or a forward whose
+  // spans / Sol / Sage blocks are built for one tile size.
+  if (!dense || seq < kAttnBqMinRows) { return; }
+  if (const char* e = std::getenv("VPIPE_H3_ATTN_BQ")) {
+    const int v = std::atoi(e);
+    if (v == 64 || v == 128) {              // pinned (A/B)
+      _attn_bq = v;
+      _attn_tile_latched = true;
+      return;
+    }
+  }
+  if (std::getenv("VPIPE_H3_NO_ATTN_TILE_AUTOTUNE") != nullptr) {
+    _attn_tile_latched = true;              // BQ 64 stands, unmeasured
+  }
+}
+
+// The tile the NEXT main block runs. Advances the probe only when a sample
+// can actually come back (a streamed block, whose commit is waited for), so a
+// plan and a note stay one to one.
+int
+MetalMiniMaxH3Transformer::plan_attn_tile_(bool wide_available, bool streaming)
+{
+  _attn_tile_probing = -1;
+  if (!wide_available) { return 64; }
+  if (_attn_tile_latched || !streaming) { return _attn_bq; }
+  const int n = _attn_tile_blocks++;
+  if (n < kTileWarmBlocks) { return 64; }   // clocks and caches settle first
+  const int k = n - kTileWarmBlocks;
+  if (k < kTileProbeBlocks) {
+    const int tile = (k % 2 == 0) ? 64 : 128;
+    _attn_tile_probing = (tile == 128) ? 1 : 0;
+    return tile;
+  }
+  return _attn_bq;
+}
+
+// One block's wall time, charged to whichever tile it ran. Latches as soon as
+// both rings are full: three samples each is what the alternation produces.
+void
+MetalMiniMaxH3Transformer::note_attn_tile_(double block_ms)
+{
+  const int a = _attn_tile_probing;
+  _attn_tile_probing = -1;
+  if (a < 0 || a > 1 || block_ms <= 0.0) { return; }
+  _attn_tile_ms[a][_attn_tile_n[a] % kTileRing] = block_ms;
+  ++_attn_tile_n[a];
+  if (_attn_tile_n[0] < kTileRing || _attn_tile_n[1] < kTileRing) { return; }
+  auto median = [&](int i) {
+    double t[kTileRing];
+    for (int j = 0; j < kTileRing; ++j) { t[j] = _attn_tile_ms[i][j]; }
+    for (int x = 0; x < kTileRing; ++x) {
+      for (int y = x + 1; y < kTileRing; ++y) {
+        if (t[y] < t[x]) { const double s = t[x]; t[x] = t[y]; t[y] = s; }
+      }
+    }
+    return t[kTileRing / 2];
+  };
+  const double m64 = median(0), m128 = median(1);
+  _attn_bq = (m128 > 0.0 && m128 < m64) ? 128 : 64;
+  _attn_tile_latched = true;
+  if (_mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_normal(fmt(
+        "MetalMiniMaxH3Transformer: attention query tile -> BQ {} (per-block "
+        "median: BQ 64 {:.1f} ms, BQ 128 {:.1f} ms over {} probe blocks)",
+        _attn_bq, m64, m128, kTileProbeBlocks));
+  }
+}
+
 void
 MetalMiniMaxH3Transformer::tune_qmm_(int M)
 {
@@ -4795,6 +4887,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // the point the functions are built rather than assumed here.
   const bool sage_want = (bool)_sage && c.sage.enabled &&
                          c.sage.dense_layers < c.n_layers;
+  // THE QUERY TILE, once the three specialisations that own the tile size are
+  // known. DENSE-ONLY: the spans block list, Sage's int8 scale arrays and
+  // Sol's blocks are each built for one query tile, so a forward using any of
+  // them stays at BQ 64. The probe itself runs at most once per model, on the
+  // first forward long enough for the wide tile to matter.
+  const bool tile_dense = !vdn_on && !sol_on && !sage_want;
+  tune_attn_tile_(seq, tile_dense);
+  // BUILT whenever the wide tile may run: latched to 128, or still probing,
+  // which alternates whole blocks between the two and so needs both pairs.
+  const bool wide_tile = _attn_nax && tile_dense && seq >= kAttnBqMinRows &&
+                         (_attn_bq == 128 || !_attn_tile_latched);
   if (sol_on) {
     // LEND SOL THE TWO BUFFERS THAT ARE DEAD WHILE IT RUNS, and it
     // stops allocating a second attention's worth of scratch.
@@ -4899,7 +5002,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const bool sage_on = sage_want && _attn_nax;
   const bool attn_dirty = _attn_seq != seq || _attn_text != n_text
                           || _attn_nax_built != (_attn_nax ? 1 : 0)
-                          || _attn_sage_built != (sage_on ? 1 : 0);
+                          || _attn_sage_built != (sage_on ? 1 : 0)
+                          // ...AND the query tile, which is NOT a function of
+                          // the sequence: a spans / Sol / Sage forward at some
+                          // length leaves the wide pair unbuilt, and a later
+                          // DENSE forward at that same length would otherwise
+                          // find `_attn_bq128_seq` stale and quietly stay at
+                          // BQ 64 for the rest of the run.
+                          || _attn_wide_built != (wide_tile ? 1 : 0);
   if (use_steel && (attn_dirty || _attn_fused != fused_attn)) {
     // C++ mirror of mlx::steel::AttnParams, as in the sibling DiTs. Two
     // shapes only, and both are SQUARE: this model has no
@@ -4911,14 +5021,18 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
       std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
     };
+    // The tile `fill` writes for. A_BQ for the dense/text/spans block; set
+    // to 128 around the wide pair's fill below.
+    int A_BQ_used = A_BQ;
     auto fill = [&](SharedBuffer& pb, int qL) {
       auto* p = static_cast<P*>(pb.contents());
       p->B = 1; p->H = NH; p->D = HD;
       p->qL = qL; p->kL = qL;
       p->gqa_factor = 1; p->scale = scale;
-      p->NQ = (qL + A_BQ - 1) / A_BQ; p->NK = (qL + A_BK - 1) / A_BK;
-      p->NQ_aligned = qL / A_BQ; p->NK_aligned = qL / A_BK;
-      p->qL_rem = qL - p->NQ_aligned * A_BQ;
+      p->NQ = (qL + A_BQ_used - 1) / A_BQ_used;
+      p->NK = (qL + A_BK - 1) / A_BK;
+      p->NQ_aligned = qL / A_BQ_used; p->NK_aligned = qL / A_BK;
+      p->qL_rem = qL - p->NQ_aligned * A_BQ_used;
       p->kL_rem = qL - p->NK_aligned * A_BK;
       p->qL_off = 0;
       // Head-major [H, qL, D], the layout the transposes produce.
@@ -4975,6 +5089,33 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // prompt, not a video sequence), so it is built dense only.
       _fn_attn_main = build(seq, false, false);
       _fn_attn_text = build(n_text, false, false);
+      // THE WIDE TILE'S OWN PAIR. Its NQ / NQ_aligned / qL_rem differ from
+      // the BQ 64 block, and the text and spans paths read that one, so it
+      // gets a parameter buffer of its own rather than a shared one edited
+      // per dispatch.
+      if (wide_tile) {
+        if (_attn_p_main_bq128.empty()) {
+          _attn_p_main_bq128 = _mc->make_shared_buffer(sizeof(P));
+        }
+        if (!_attn_p_main_bq128.empty()) {
+          const int save_bq = A_BQ_used;
+          A_BQ_used = 128;
+          fill(_attn_p_main_bq128, seq);
+          A_BQ_used = save_bq;
+          metal_compute::FunctionConstants fc128;
+          fc128.set_bool(200, (seq % 128) == 0)
+              .set_bool(201, (seq % A_BK) == 0)
+              .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+              .set_bool(303, false)
+              .set_bool(sage::kQkInt8Constant, false);
+          _fn_attn_main_bq128 = _lib_attn_nax.function(
+              "attn_steel_nax_h_bd128_bq128_bf16", fc128);
+          _attn_bq128_seq = _fn_attn_main_bq128.valid() ? seq : -1;
+        }
+      } else {
+        _fn_attn_main_bq128 = metal_compute::ComputeFunction{};
+        _attn_bq128_seq = -1;
+      }
       _fn_attn_main_i8 =
           sage_on ? build(seq, false, true) : metal_compute::ComputeFunction{};
       // The same fallback as at load, for a sequence the matrix-core entry
@@ -4992,6 +5133,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       _attn_text = n_text;
       _attn_nax_built = _attn_nax ? 1 : 0;
       _attn_sage_built = sage_on ? 1 : 0;
+      _attn_wide_built = wide_tile ? 1 : 0;
     }
   }
   // The SAME entry point as the dense pair, specialised on has_spans --
@@ -5416,8 +5558,24 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             sol_err = "sage_attn: " + gerr;
           }
         }
-        enc.set_function(i8_ok ? _fn_attn_main_i8
-                               : (main ? _fn_attn_main : _fn_attn_text));
+        // THE WIDE QUERY TILE, dense main path only: 8 simdgroups covering
+        // 128 query rows per threadgroup, so the whole-K/V re-read happens
+        // half as often. Its own pipeline and parameter block; everything
+        // else (text rows, spans, Sage's int8 twin) stays at BQ 64.
+        const bool wide_avail = wide_tile && main && !i8_ok &&
+                                _attn_bq128_seq == rows &&
+                                _fn_attn_main_bq128.valid() &&
+                                !_attn_p_main_bq128.empty();
+        // The probe runs HERE, one verdict per block, and the block's own
+        // wall time comes back at the streamed commit below.
+        const bool use_wide =
+            plan_attn_tile_(wide_avail, _stream_blocks) == 128;
+        if (use_wide) {
+          enc.set_function(_fn_attn_main_bq128);
+        } else {
+          enc.set_function(i8_ok ? _fn_attn_main_i8
+                                 : (main ? _fn_attn_main : _fn_attn_text));
+        }
         if (fused_qkv) {
           enc.set_buffer(0, s.qkv, (std::size_t)Q_OFF * 2);
           enc.set_buffer(1, s.qkv, (std::size_t)K_OFF * 2);
@@ -5427,10 +5585,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           enc.set_buffer(2, s.vh);
         }
         enc.set_buffer(3, fused_out ? s.ob : s.oh);
-        enc.set_buffer(4, main ? _attn_p_main : _attn_p_text);
+        enc.set_buffer(4, use_wide ? _attn_p_main_bq128
+                                   : (main ? _attn_p_main : _attn_p_text));
         if (i8_ok) { _sage->bind(enc); }
-        enc.dispatch({32 * (unsigned)((rows + A_BQ - 1) / A_BQ),
-                      4 * (unsigned)NH, 1}, {32, 4, 1});
+        const unsigned bq = use_wide ? 128u : (unsigned)A_BQ;
+        const unsigned wm = use_wide ? 8u : 4u;
+        enc.dispatch({32 * (unsigned)(((unsigned)rows + bq - 1) / bq),
+                      wm * (unsigned)NH, 1}, {32, wm, 1});
         return;
       }
       enc.set_function(_fn_sdpa);
@@ -6330,8 +6491,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (streaming) {
         enc.end();
         std::string blk_err;
-        const auto gp0 = sprof ? std::chrono::steady_clock::now()
-                               : std::chrono::steady_clock::time_point{};
+        // Taken unconditionally: the query-tile probe charges this block's
+        // wall time to whichever tile it ran, and one clock read per block is
+        // nothing beside the block.
+        const auto gp0 = std::chrono::steady_clock::now();
         metal_compute::CommandStream::Fence fence = stream.commit();
         // Between the commit and the wait is the whole opportunity: the
         // GPU is busy with block Lx and this thread has nothing to do.
@@ -6348,10 +6511,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           return fail("streamed block " + std::to_string(Lx) + ": " +
                       (blk_err.empty() ? std::string("GPU error") : blk_err));
         }
-        if (sprof) {
-          sp_gpu_ms += std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - gp0).count();
-        }
+        const double blk_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - gp0).count();
+        if (sprof) { sp_gpu_ms += blk_ms; }
+        note_attn_tile_(blk_ms);
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();

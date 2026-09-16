@@ -69,6 +69,19 @@ private:
   // SessionIntf::set_wired_pool_mb.
   HttpResponse h_wired_pool_get_(const HttpRequest&);
   HttpResponse h_wired_pool_set_(const HttpRequest&);
+
+  // The SWAP ALLOWANCE -- how much memory a run may plan to push out to
+  // the compressor or swap, on top of what the OS reports reclaimable.
+  // GET returns {mb, swappable_mb}; PUT {mb} sets it and returns the
+  // same document.
+  //
+  // NO 409 HERE, deliberately, and the asymmetry with the wired pool
+  // above is the point: that one refuses a shrink mid-run because the
+  // bytes are already wired and giving them back means unwiring buffers
+  // a model is reading. This reserves nothing, so both directions are
+  // accepted at any time.
+  HttpResponse h_swap_allowance_get_(const HttpRequest&);
+  HttpResponse h_swap_allowance_set_(const HttpRequest&);
   // True while any pipeline is not "stopped".
   bool any_running_() const;
 

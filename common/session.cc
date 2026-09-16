@@ -325,6 +325,40 @@ parse_wired_pool_mb_config(const FlexData& config)
   return mb_to_bytes(mb);
 }
 
+// THE SWAP ALLOWANCE, in megabytes. Config key `swap_allowance_mb`;
+// VPIPE_SWAP_ALLOWANCE_MB overrides it, and both apps forward their
+// --swap-allowance-mb flag through it, for the reason the two knobs
+// above do: the manager is not reachable through the public SessionIntf
+// at construction time.
+//
+// The DEFAULT is stated in the manager rather than here (unlike the
+// wired pool's percentage) because it is not a share of anything -- it
+// is an absolute number of megabytes a clip may push out, and the same
+// 4 GB is the right answer on a 16 GB box and a 64 GB one. A sentinel
+// distinguishes "not configured" from an explicit 0, which is a real
+// setting: gate on reclaimable RAM alone.
+constexpr long long kSwapAllowanceUnset = -1;
+
+long long
+parse_swap_allowance_mb_config(const FlexData& config)
+{
+  auto clamp = [](long long mb) -> long long {
+    return mb < 0 ? 0 : mb;
+  };
+  if (const char* e = std::getenv("VPIPE_SWAP_ALLOWANCE_MB")) {
+    return clamp(std::atoll(e));
+  }
+  if (!config.is_object()) { return kSwapAllowanceUnset; }
+  auto root = config.as_object();
+  if (!root.contains("swap_allowance_mb")) { return kSwapAllowanceUnset; }
+  FlexData v = root.at("swap_allowance_mb");
+  if (v.is_int()) { return clamp(v.as_int(0)); }
+  if (v.is_string()) {
+    return clamp(std::atoll(std::string(v.get_string()).c_str()));
+  }
+  return kSwapAllowanceUnset;
+}
+
 std::size_t
 parse_memory_cap_config(const FlexData& config)
 {
@@ -654,6 +688,13 @@ Session::generative_model_manager() const
     const std::size_t wired = parse_wired_pool_mb_config(_config);
     if (wired > 0) { _llm_mgr->set_wired_pool_bytes(wired); }
     _llm_mgr->set_wired_pool_enforced(parse_wired_pool_enforce_config(_config));
+    // Only when configured: the manager's own default is the shipped
+    // figure, and applying an unset sentinel would overwrite it with 0
+    // -- which is a real setting meaning something else entirely.
+    const long long swap = parse_swap_allowance_mb_config(_config);
+    if (swap != kSwapAllowanceUnset) {
+      _llm_mgr->set_swap_allowance_bytes((std::size_t)swap << 20);
+    }
   });
   return _llm_mgr.get();
 #else
@@ -1234,6 +1275,39 @@ Session::set_wired_pool_mb(std::size_t mb)
 #else
   (void)mb;
   return Status{2};
+#endif
+}
+
+Status
+Session::set_swap_allowance_mb(std::size_t mb)
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mgr = generative_model_manager();
+  if (mgr == nullptr) {
+    warn(fmt("swap_allowance_mb: rejected -- no model manager in this build"));
+    return Status{2};
+  }
+  // No shrink rule and no clamp. The figure reserves nothing, so a
+  // lowered allowance costs a future preflight room and takes nothing
+  // back from a running one -- unlike the wired pool, where the bytes
+  // are already mlock'd and giving them back means unwiring buffers a
+  // model is still reading.
+  mgr->set_swap_allowance_bytes(mb << 20);
+  return Status{0};
+#else
+  (void)mb;
+  return Status{2};
+#endif
+}
+
+std::size_t
+Session::swap_allowance_mb() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mgr = const_cast<Session*>(this)->generative_model_manager();
+  return mgr != nullptr ? mgr->swap_allowance_bytes() >> 20 : 0;
+#else
+  return 0;
 #endif
 }
 

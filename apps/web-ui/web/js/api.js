@@ -334,6 +334,13 @@ export const api = {
   wiredPoolGet:  ()        => req('GET',  '/api/system/wired-pool'),
   wiredPoolSet:  (mb)      => req('PUT',  '/api/system/wired-pool', { mb }),
 
+  // The swap allowance: how much memory a run may plan to push OUT to
+  // the compressor or swap. {mb, swappable_mb}. No 409 -- it reserves
+  // nothing, so it moves in both directions while a pipeline runs.
+  swapAllowanceGet: ()     => req('GET',  '/api/system/swap-allowance'),
+  swapAllowanceSet: (mb)   => req('PUT',  '/api/system/swap-allowance',
+                                  { mb }),
+
   // Startup permission self-test report, shown in a dialog on connect.
   // {ready, has_warnings, checks:[{name,status,detail,hints:[...]}]}.
   startupChecks: ()        => req('GET',  '/api/startup-checks'),

@@ -1032,8 +1032,14 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   }
   // The prefill GQA attention set loads its members now that mma/use_mma are
   // resolved (it's tuned later in ensure_decode_scratch_).
+  // The M5 NAX attentions (plain + MLX's head-dim split) for the head_dim-256
+  // full-attention layers: strided K/V the set gathers from the pool, so they
+  // serve fresh and mid-context prefill alike. Matrix-core GPUs only.
+  if (m->_use_mma && cfg.head_dim == 256) {
+    m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+  }
   m->_prefill_set.load(m->_lib_sdpa, &m->_lib_attn, &m->_lib_sdpa_mma,
-                       m->_use_mma);
+                       m->_use_mma, &m->_lib_attn_nax, cfg.use_bf16);
   // Pipelined-decode kernels (validated lazily in decode_pipelined, not
   // here, so non-pipelined model loads never depend on them).
   m->_fn_embed = m->_lib_elt.function(

@@ -1697,6 +1697,22 @@ TEST(minimax_h3_dit, forward_is_deterministic_at_video_heights)
     // EXCLUDES the file cache -- which is what makes it the right number
     // here. available_physical counts clean file pages as room, and on a
     // box already deep in swap that reads as space which does not exist.
+    //
+    // A RUN IS A DURABLE ALLOCATION, which is why this stays conservative:
+    // the scratch and the blocks it keeps are held for the whole run, so
+    // they convert pages the OS reclaims for free into pages it can only
+    // reclaim through the compressor. See MemoryBudget::free_physical, which
+    // documents the same trade with the numbers behind it. A box whose cache
+    // is genuinely cold sets VPIPE_RESIDENCY_CACHE_PCT rather than changing
+    // the rule.
+    // AVAILABLE, not free. Clean file pages are room this run may have: the
+    // streamed weight reads are pread with F_NOCACHE and what the model
+    // actually holds is its WIRED resident set, so the page cache -- much of
+    // it populated by the preload path's own mmap+memcpy -- yields to an
+    // allocation rather than competing with one. (BlockResidency is right to
+    // grow against measured residency instead: there the cache is the
+    // model's own streaming read, and growth is a commitment it cannot take
+    // back. This is a one-shot fits-or-not check, which is the other case.)
     const std::size_t idle = b.free_physical != 0 ? b.free_physical
                                                   : b.available_physical;
     const std::size_t margin = (std::size_t)3 << 30;

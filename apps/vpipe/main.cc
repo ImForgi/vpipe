@@ -8,7 +8,7 @@
 //
 // Usage:
 //   vpipe [--config CFG] [--memory-cap-mb N] [--wired-pool-mb N]
-//         LAUNCH ...
+//         [--swap-allowance-mb N] LAUNCH ...
 //
 //   LAUNCH is one of:
 //     --launch <spec>              spec is a path to a pipeline JSON/binary
@@ -144,6 +144,14 @@ const char* const kUsage =
   "                              wired_pool_mb; unset = the wired_pool_pct\n"
   "                              share of RAM (default 75%), 0 = no\n"
   "                              wiring at all.\n"
+  "  --swap-allowance-mb N       how much memory a run may plan to push\n"
+  "                              OUT to the compressor or swap, on top of\n"
+  "                              what the OS reports reclaimable. The\n"
+  "                              opposite knob to --wired-pool-mb: it\n"
+  "                              reserves nothing, so it costs throughput\n"
+  "                              rather than stability. Same as session\n"
+  "                              config swap_allowance_mb; unset = 4096,\n"
+  "                              0 = size against reclaimable RAM alone.\n"
   "  --plugin PATH               load a plugin .dylib at startup "
   "(repeatable).\n"
   "  --version                   print the version and build identity\n"
@@ -621,6 +629,12 @@ run(int argc, char** argv)
       // the process makes UNSWAPPABLE, that one bounds what it insists
       // on holding at all.
       ::setenv("VPIPE_WIRED_POOL_MB", argv[i], 1);
+    } else if (a == "--swap-allowance-mb") {
+      if (++i >= argc) { return arg_err("--swap-allowance-mb needs a value"); }
+      // Forwarded like the two above. This one is the OPPOSITE question
+      // to --wired-pool-mb: that bounds what the process makes
+      // unswappable, this bounds what a run may plan to push out.
+      ::setenv("VPIPE_SWAP_ALLOWANCE_MB", argv[i], 1);
     } else if (a == "--plugin") {
       if (++i >= argc) { return arg_err("--plugin needs a path"); }
       plugins.push_back(argv[i]);

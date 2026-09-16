@@ -67,7 +67,7 @@ using namespace metal;
 // parse), so complex64_t has to be in scope first; MLX's complex.h in turn
 // names their bfloat16_t wrapper in an unused ctor. Same two lines
 // affine_qmm_steel.metal needs.
-typedef bfloat16 bfloat16_t;
+typedef bfloat bfloat16_t;
 #include "mlx/backend/metal/kernels/complex.h"
 #include "mlx/backend/metal/kernels/steel/gemm/mma.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"

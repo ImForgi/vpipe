@@ -1185,6 +1185,14 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
   };
 
+  // Choose the attention query tile for this model, ONCE, on the first
+  // forward long enough for the wide tile to matter and dense enough to
+  // use it (no spans / sage / Sol: those build block lists and int8
+  // scales for one tile size). Times both tiles over a truncated window
+  // -- the ranking is stable above the crossover, and probing at a real
+  // 100k-row sequence would itself cost ~25 s.
+  void tune_attn_tile_(int seq, bool dense);   // arms the probe; see above
+
   bool ensure_scratch_(int seq, int n_text, int n_t,
                        std::size_t arena_floor);
   Scratch _s;
@@ -1598,6 +1606,45 @@ class MetalMiniMaxH3Transformer {
   // one, because `sage.dense_layers` leaves the leading blocks on the
   // f16 kernel and the two must coexist within one forward.
   metal_compute::ComputeFunction _fn_attn_main_i8;
+  // THE WIDE QUERY TILE (BQ 128 = WM 8), and the probe that chooses it.
+  // The NAX attention streams the whole K/V once per query tile, so a
+  // wider tile halves that re-read -- which pays only once the K/V no
+  // longer fits in cache, and only on a GPU that is memory-bound rather
+  // than occupancy-bound there. MEASURED bd128 bf16, bit-identical
+  // output: an M5 Pro gains 1.13x at 19k rows and 1.22x at 100k (holding
+  // ~24 TFLOP/s where BQ 64 decays to 20); a 10-core M5 Air LOSES 5% at
+  // 9.4k and gains 8-13% at 19k-38k; a 48q/12kv GQA shape gains nothing
+  // on either, its K/V being 4x smaller. So it is probed, not assumed.
+  // Rows at or above which the wide tile is worth probing and using. Both
+  // machines measured crossed near 19k; the probe times the two tiles over
+  // the same window, which is all the ranking needs.
+  static constexpr int kAttnBqMinRows   = 16384;
+  static constexpr int kAttnBqProbeRows = 16384;
+  metal_compute::ComputeFunction _fn_attn_main_bq128;
+  metal_compute::SharedBuffer _attn_p_main_bq128;
+  int  _attn_bq        = 64;     // the tile in force (64 or 128)
+  int  _attn_bq128_seq = -1;     // sequence the BQ 128 pair was built for
+  int  _attn_wide_built = -1;    // whether the built pair is the wide one
+  // THE REAL-WORKLOAD PROBE, on the ANE tier's pattern (plan_block /
+  // note_probe): the streamed path already commits and waits per block, so a
+  // block's wall time is there for the taking. Warm on the incumbent, then
+  // alternate whole blocks between the two tiles and keep the median winner
+  // -- the real shape at the real length, no synthetic dispatch and no
+  // truncation. `_attn_tile_blocks` counts main blocks seen; the medians are
+  // small rings, one per tile.
+  static constexpr int kTileWarmBlocks  = 2;   // settle clocks/caches first
+  static constexpr int kTileProbeBlocks = 6;   // 3 per tile, alternating
+  static constexpr int kTileRing        = 3;
+  int    _attn_tile_blocks = 0;
+  int    _attn_tile_n[2]   = {0, 0};
+  double _attn_tile_ms[2][kTileRing] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+  bool   _attn_tile_latched = false;
+  int    _attn_tile_probing = -1;  // tile this block is measuring, -1 = none
+
+  // The tile the NEXT main block should run, and the block's measured wall
+  // time coming back. `probing` says whether that time is a probe sample.
+  int  plan_attn_tile_(bool wide_available, bool streaming);
+  void note_attn_tile_(double block_ms);
   // Rows the GEMM tuner measures at, and therefore the row count a tuned
   // answer is filed under -- see tune_row_key(). Fixed at load from
   // VPIPE_H3_TUNE_ROWS.
