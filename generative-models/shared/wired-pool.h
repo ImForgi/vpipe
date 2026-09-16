@@ -1,78 +1,79 @@
 #ifndef VPIPE_GENERATIVE_MODELS_SHARED_WIRED_POOL_H
 #define VPIPE_GENERATIVE_MODELS_SHARED_WIRED_POOL_H
 
-// A streamed DiT's side of the manager's WIRED POOL: how much of what it
-// decided to keep resident it is allowed to mlock, what happens when the
-// box refuses, and when to ask again.
+// A model's side of the manager's WIRED POOL: how much of what it decided
+// to keep resident it is allowed to mlock, what happens when the box
+// refuses, and when to ask again. In-tree DiTs and plugins use the same
+// class.
+//
+// WHAT IS FROZEN -- changing any of it is a VPIPE_PLUGIN_ABI_VERSION bump:
+//   * WiredPool's layout, which is ONE POINTER: every method is out of
+//     line, so nothing about the policy's state is compiled into a caller;
+//   * the signatures of the methods below.
+// WHAT GROWS FREELY -- never a bump:
+//   * open() option keys and info() fields. Added, never renamed; an
+//     absent key is its documented default;
+//   * new methods, which a plugin built against an older header never
+//     calls (one built against a newer header fails to LOAD on an older
+//     host, by symbol, rather than misbehaving);
+//   * the policy itself: when to refuse, when to reopen, what to log.
 //
 // WHY A KEPT BLOCK WANTS TO BE WIRED. BlockResidency grows a resident set
 // into free RAM and then MEASURES whether those pages are still there,
 // shedding one block and ratcheting whenever they are not. That
-// measurement is honest but it is also purely reactive: a resident block
-// is the coldest memory in the process -- read once per step, never
-// written -- so it is the first thing the compressor takes, and the run
-// then spends the rest of the schedule in a cycle of admit, compress,
-// measure, shed, re-admit. Wiring is what breaks the cycle: mlock'd pages
-// cannot be compressed or swapped, so a block that was admitted stays
-// worth its RAM.
+// measurement is honest but purely reactive: a resident block is the
+// coldest memory in the process -- read once per step, never written --
+// so it is the first thing the compressor takes, and the run then spends
+// the schedule in a cycle of admit, compress, measure, shed, re-admit.
+// mlock'd pages cannot be compressed or swapped, so a block that was
+// admitted stays worth its RAM.
 //
-// WHY THERE IS A BUDGET AT ALL, rather than each model wiring what it
-// likes. Wired memory is the one allocation the kernel cannot reclaim, so
-// over-committing it does not degrade the box, it PANICS it. The manager
-// owns one process-wide pool with a ceiling derived from the device's
-// recommendedMaxWorkingSetSize, and this class is a model's window onto
-// it -- it never wires anything itself, it only decides whether to ask
-// and books what the manager granted.
+// WHY THERE IS A BUDGET AT ALL. Wired memory is the one allocation the
+// kernel cannot reclaim, so over-committing it does not degrade the box,
+// it PANICS it. The manager owns one process-wide pool with a ceiling
+// derived from the device's recommendedMaxWorkingSetSize, and this class
+// is a model's window onto it. The pool is READ LIVE, never snapshotted:
+// it is shared by every model and ANE tier in the process, so a figure
+// taken at load is stale the moment a peer loads, frees or meets a
+// refusal.
 //
-// THE ORDER THAT MATTERS. Ask for the FIXED costs first -- any persistent
-// activation scratch, then the trunk (the non-block weights every block of
-// every forward reads) -- and the shed-able blocks last. A pool that runs
-// out then runs out on the half a forward can proceed without. MEASURED on
-// MiniMax-H3 when this was inverted and the blocks were wired at load:
-// 4315 MB of blocks wired, the pool collapsed on the first refusal, and
-// NOTHING was left for the trunk or the scratch -- against ~17 GB wired
-// and both protected when the forward does it in this order.
+// THE ORDER THAT MATTERS. Wire the FIXED costs first -- any persistent
+// activation scratch, then the trunk -- and the shed-able blocks last. A
+// pool that runs out then runs out on the half a forward can proceed
+// without. MEASURED on MiniMax-H3 when this was inverted: 4315 MB of
+// blocks wired, the pool collapsed on the first refusal, and NOTHING was
+// left for the trunk or the scratch -- against ~17 GB wired and both
+// protected in this order.
 //
-// PER-FORWARD scratch is not wired and cannot usefully be. The image DiTs
-// allocate their activations as locals inside the forward, so wiring them
-// would be an mlock and a munlock per buffer per step against memory the
-// allocator is about to recycle anyway -- and a buffer replaced while
-// wired leaks its bytes from the pool's counter, since only
-// unwire_from_pool() decrements it. Wire what the model HOLDS across
-// forwards; a buffer that is reallocated must be unwired BEFORE the
-// assignment that drops it.
+// A buffer that is REPLACED must be unwired before the assignment that
+// drops it: freeing a wired buffer unwires its pages in the kernel but
+// only the pool decrements its counter, so the bytes would stay charged
+// for the rest of the process.
 //
-// USAGE, per model:
+// USAGE:
 //   at load           _wire.open(mc);
 //                     ... and read weights Copied when _wire.on(), since
-//                     mapped pages cannot be wired (see kept_residency).
+//                     mapped pages cannot be wired (weights_may_be_mapped).
+//   per run           _wire.new_run();          (where the schedule is set)
 //   top of forward    if (_wire.on()) {
 //                       if (_wire.retry(mc, block_bytes)) {
 //                         _resid.note_landscape_changed();
 //                       }
-//                       wire_fixed_(true);        // scratch, then trunk
+//                       _wire.wire_set(fixed_buffers, true);
 //                     }
 //   per block         if (_wire.wirable(nb) && _resid.admit(mc, nb)) {
 //                       ... keep it, finish every write to it ...
-//                       _wire.note_wired(mc, wire_block_(b, true), nb);
+//                       _wire.note_wired(mc, _wire.wire_set(bufs, true), nb);
 //                       _resid.note_admitted(nb);
 //                     }
-//   on eviction       _wire.note_unwired(wire_block_(b, false));
-//   on destruction    unwire everything -- freeing a wired buffer unwires
-//                     it in the kernel but does NOT decrement the pool's
-//                     counter, so a DiT destroyed per clip would leak its
-//                     whole share of the budget per clip.
-//
-// WHERE THIS CAME FROM, and the one place that does not use it yet. The
-// policy was written inline in MetalMiniMaxH3Transformer, which is where
-// every measurement quoted here was taken, and extracted when the image
-// DiTs (FLUX.2, Krea-2, Qwen-Image-Edit / Mage-Flow, Boogu-Image) needed
-// the same thing. H3 still carries its own copy: it is the version that
-// has run in anger, and rewriting it was not worth the risk in the same
-// change that gave five other models the behaviour for the first time.
-// A change to the policy has to touch both until that is folded in.
+//   on eviction       _wire.note_unwired(_wire.wire_set(bufs, false));
+//   on destruction    unwire everything the model wired.
+
+#include "common/flex-data.h"
 
 #include <cstddef>
+#include <span>
+#include <string_view>
 
 namespace vpipe::metal_compute {
 class MetalCompute;
@@ -81,6 +82,32 @@ class SharedBuffer;
 
 namespace vpipe::genai {
 
+// ---- the vocabulary: open() options and info() fields -----------------
+//
+// Options (all optional):
+//   "tag"          text  -- names this model in the pool's log lines.
+//   "enabled"      flag  -- false keeps the pool closed for this model
+//                           even when the manager's pool is on. Default:
+//                           on whenever the manager's pool is.
+namespace wired_pool {
+inline constexpr std::string_view kTag     = "tag";
+inline constexpr std::string_view kEnabled = "enabled";
+
+// info() fields:
+inline constexpr std::string_view kInfoOn          = "on";
+inline constexpr std::string_view kInfoWiredBytes  = "wired_bytes";
+inline constexpr std::string_view kInfoBudget      = "budget";
+inline constexpr std::string_view kInfoPoolUsed    = "pool_used";
+inline constexpr std::string_view kInfoPoolLimit   = "pool_limit";
+inline constexpr std::string_view kInfoPoolAsk     = "pool_ask";
+inline constexpr std::string_view kInfoRetryArmed  = "retry_armed";
+inline constexpr std::string_view kInfoRefusals    = "refusals";
+inline constexpr std::string_view kInfoReopens     = "reopens";
+// Bytes the last wire_set(..., true) left unwired because the pool
+// refused, including the buffer it stopped on.
+inline constexpr std::string_view kInfoLastRefused = "last_refused_bytes";
+}  // namespace wired_pool
+
 // WHETHER A KEPT WEIGHT MAY BE A MAPPED VIEW.
 //
 // Mapped is zero-copy and reads as the obvious win, and it is the wrong
@@ -88,23 +115,14 @@ namespace vpipe::genai {
 // weight set's shard mmap, which means it can be neither WIRED (mlock on
 // file-backed pages is refused well before the pool's ceiling -- MEASURED
 // at ~4 GB on MiniMax-H3) nor PARKED (mark_inactive refuses on a handle
-// that does not own its allocation). Both of those are the whole point of
-// keeping the block.
+// that does not own its allocation).
 //
-// So: Copied whenever the model streams, or whenever the pool is on --
-// which is what a FALSE from this says.
+// So: Copied whenever the model streams, or whenever the pool is on.
 //
 // MEASURED, MiniMax-H3 at 960x544x21 / 4 steps on the M4 Pro with arms
-// INTERLEAVED (copied, mapped, copied, mapped) so thermal drift could not
-// be read as a result: 186 / 174 s wired against 198 / 238 s mapped --
-// 1.21x, and the mapped arm's 40 s spread against the wired arm's 12 s is
-// the page cache being unpredictable in exactly the way wiring removes.
-// The box got HEALTHIER, not tighter: compression fell from 2060 to 991
-// MB across the run and swap fell with it, while 35 GB sat wired.
-//
-// A shard the file cannot map falls back to a copy regardless, so this is
-// never worse than Copied -- but the LOG, not this rule, is what says
-// whether a preload actually mapped.
+// INTERLEAVED: 186 / 174 s wired against 198 / 238 s mapped -- 1.21x, and
+// the mapped arm's 40 s spread against the wired arm's 12 s is the page
+// cache being unpredictable in exactly the way wiring removes.
 inline bool
 weights_may_be_mapped(bool stream_blocks, bool wire_resident)
 {
@@ -113,103 +131,87 @@ weights_may_be_mapped(bool stream_blocks, bool wire_resident)
 
 class WiredPool {
  public:
-  // Ask the manager whether this model wires at all, and how much of the
-  // pool is still unspent. Call once, at load.
-  //
-  // From the MANAGER rather than from a per-model percentage. The old
-  // form asked what share of RAM one DiT could wire, which is the
-  // per-model budget the pool exists to replace: a ceiling each model
-  // guesses separately never adds up to the box.
-  //
-  // `_budget` is what is still UNUSED, because every question asked of
-  // this class is "can ONE MORE block be wired", not "how large is the
-  // pool".
+  WiredPool();
+  ~WiredPool();
+  WiredPool(WiredPool&& o) noexcept;
+  WiredPool& operator=(WiredPool&& o) noexcept;
+  WiredPool(const WiredPool&)            = delete;
+  WiredPool& operator=(const WiredPool&) = delete;
+
+  // Ask the manager whether this model wires at all. Call at load; calling
+  // again (a new run, a new geometry) re-reads the switch and keeps what
+  // is already booked.
   void open(metal_compute::MetalCompute* mc);
+  void open(metal_compute::MetalCompute* mc, const FlexData& options);
 
-  bool        on() const { return _on; }
-  std::size_t wired_bytes() const { return _wired; }
-  std::size_t budget() const { return _budget; }
+  bool        on() const;
+  // What this model has booked as wired through note_wired().
+  std::size_t wired_bytes() const;
+  // Its booked bytes plus the pool's unused room, now. For reporting;
+  // wirable() is the gate.
+  std::size_t budget() const;
 
-  // May a block of `nb` bytes be KEPT?
-  //
-  // Past the budget there is nothing to gain: the block would be held
-  // unprotected, the compressor would take it (it is the coldest memory
-  // in the process), and the next residency walk would shed a block and
-  // ratchet the ceiling over the whole resident set. Better not to hold
-  // it at all -- which is why this gates ADMISSION and not just wiring.
-  bool wirable(std::size_t nb) const
-  {
-    return !_on || _wired + nb <= _budget;
-  }
+  // May a block of `nb` bytes be KEPT? Asked of the pool AS IT IS NOW.
+  // Always true with the pool closed. Past the pool there is nothing to
+  // gain: the block would be held unprotected and the compressor would
+  // take it -- which is why this gates ADMISSION and not just wiring.
+  bool wirable(std::size_t nb) const;
 
-  // Wire or unwire ONE buffer through the pool. Returns the bytes the
-  // pool actually took (wiring) or gave back (unwiring); 0 when the
-  // buffer was empty, already in that state, or the pool refused.
+  // Wire or unwire ONE buffer. Returns the bytes the pool took (wiring) or
+  // gave back (unwiring); 0 when the buffer was empty, already in that
+  // state, below the pool's minimum, or refused.
   std::size_t wire_one(metal_compute::MetalCompute* mc,
                        metal_compute::SharedBuffer& b, bool on);
 
-  // After wire_one() returned 0 for `b`: did the POOL say no? True only
-  // when `b` is a buffer the pool wires (GenerativeModelManager::
-  // pool_wirable) and the pool can no longer take it -- full, or capped by
-  // a real shortage. False for a small buffer the pool never wires or one
-  // that would not wire for a reason of its own, and a per-block wire loop
-  // that stopped on those left the rest of the block unwired.
+  // After wire_one() returned 0 for `b`: did the POOL say no -- full, or
+  // capped by a real shortage? False for a buffer too small to be a pool
+  // question or one that would not wire for a reason of its own.
   bool refused(metal_compute::MetalCompute* mc,
                const metal_compute::SharedBuffer& b) const;
 
-  // Book what a whole block's wiring returned against what was asked.
-  //
-  // A partial grant means the box has said no. The percentage was an
-  // UP-TO, not a reservation: another process holds wired memory, or the
-  // system limit is nearer than the pool implied. So the budget becomes
-  // what was actually granted and growth stops here rather than
-  // continuing to admit blocks nothing can protect.
-  //
-  // HELD ONLY FOR THIS FORWARD. The refusal may have been another
-  // process spiking, and a run that never asks again holds a small
-  // resident set for the whole schedule on the strength of one syscall.
-  // MEASURED: a 9 GB pool that granted 5857 MB sat at 16 of 50 blocks
-  // for the rest of the run. retry() is what asks again.
+  // Wire or unwire a SET of buffers -- a block, a trunk, a scratch -- in
+  // the order given. Null and empty entries are skipped. Wiring STOPS at
+  // the first buffer the pool refuses, keeping what is already wired (a
+  // partly protected block beats an unprotected one, and giving it back
+  // means competing for it again against a pool that just said no), and
+  // arms the retry. Buffers that fail for a reason of their own are
+  // skipped. Returns the bytes wired or unwired; does NOT book them --
+  // note_wired / note_unwired decide whether they are this model's blocks.
+  std::size_t wire_set(std::span<metal_compute::SharedBuffer* const> bufs,
+                       bool on);
+
+  // Book what a whole block's wiring returned against what was asked. A
+  // SHORTFALL IS NOT ALWAYS A REFUSAL: buffers below the pool's minimum are
+  // never wired and every block carries some. Only a pool that cannot take
+  // the missing bytes has said no, and then the retry is armed.
   void note_wired(metal_compute::MetalCompute* mc, std::size_t got,
                   std::size_t want);
+  // Give booked bytes back where a block is dropped. Never underflows.
+  void note_unwired(std::size_t n);
 
-  // Give bytes back. Called where a block is dropped, so the counter
-  // stays honest without having to infer it from destructors.
-  void note_unwired(std::size_t n)
-  {
-    _wired -= (n > _wired) ? _wired : n;
-  }
+  // A new run is starting: a collapsed ceiling this model did not cause
+  // may be asked about again, once.
+  void new_run();
 
-  // Top-of-forward retry. Returns TRUE when the budget actually rose, in
-  // which case the caller must tell BlockResidency the landscape changed
-  // -- it stopped growing when the budget ran out and cannot see that the
-  // budget moved.
+  // Top-of-forward retry of a COLLAPSED pool ceiling. TRUE when the
+  // ceiling rose, in which case the caller tells BlockResidency the
+  // landscape changed and re-wires what it holds.
   //
-  // GATED on the box having demonstrably freed a block's worth since the
-  // refusal, so a genuinely full box is never asked: reopening the
-  // ceiling makes the pool's own check pass, and the mlock behind it
-  // would then fail and leave that block resident but UNWIRED -- one per
-  // forward, exactly the state wirable() exists to avoid. A peer holding
-  // wired memory shows up in this reading, since its pages are
-  // unavailable while it holds them and return when it lets go.
-  //
-  // A forward is the granularity because it is where the resident set is
-  // reconsidered anyway, and the check costs one budget read when the
-  // flag is clear.
+  // After THIS model's refusal: once the box has freed `block_bytes` since
+  // -- a genuinely full box is never asked, because reopening would let
+  // the mlock behind it fail and leave a block held but unwired. A ceiling
+  // SOMEONE ELSE collapsed: once per run, since this model has no reading
+  // from that refusal and the box may well have room; a box that really
+  // is full refuses again, which makes it this model's own refusal.
   bool retry(metal_compute::MetalCompute* mc, std::size_t block_bytes);
 
+  // What the pool and this model's window onto it look like now. Fields
+  // in wired_pool:: above.
+  FlexData info() const;
+
  private:
-  bool        _on       = false;
-  std::size_t _wired    = 0;
-  std::size_t _budget   = 0;
-  // Set when mlock refused, cleared when a retry actually raises the
-  // budget -- so a box busy at forward 2 is still asked again at forward
-  // 5. A single attempt would have spent itself against the same spike
-  // that caused the refusal.
-  bool        _retry    = false;
-  // The available-physical reading at the refusal. The retry is gated on
-  // the box having freed a block's worth SINCE, not on time passing.
-  std::size_t _retry_at = 0;
+  struct Impl;
+  Impl* _p = nullptr;
 };
 
 }  // namespace vpipe::genai

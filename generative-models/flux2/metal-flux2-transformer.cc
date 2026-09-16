@@ -1769,6 +1769,9 @@ void
 MetalFlux2Transformer::set_residency_schedule(int steps)
 {
   if (!_ws) { return; }
+  // A new run: a pool ceiling some earlier model collapsed may be asked
+  // about again. See WiredPool::retry.
+  _wire.new_run();
   const MetalLlamaWeights& src = _ws->src();
   const std::size_t blk = widest_block_bytes(
       src.tensor_names(),
@@ -1808,6 +1811,287 @@ MetalFlux2Transformer::release_resident_blocks(std::size_t bytes)
         "({} left)", freed >> 20, _resid.count()));
   }
   return freed;
+}
+
+// ---- the ANE tiers ------------------------------------------------------
+
+namespace {
+
+// One projection as the ANE stages it: dense bf16 or affine 4/8-bit, read
+// row `offset + r * stride` for slot row r. An adapter's B is laid out like
+// the weight it rides, so the source row that indexes the weight indexes B.
+template <typename Q>
+AneFfnSource
+ane_src_(const Q& q, std::size_t stride, std::size_t offset,
+         const lora::Stack& st)
+{
+  AneFfnSource s;
+  s.w         = &q.w;
+  s.codes     = &q.codes;
+  s.scales    = &q.scales;
+  s.qbias     = &q.qbias;
+  s.quantized = q.quantized;
+  s.bits      = q.bits;
+  s.stride    = stride;
+  s.offset    = offset;
+  for (int i = 0; i < st.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
+    AneFfnSource::Delta& d = s.delta[s.deltas++];
+    d.a        = &st.s[i].f->a;
+    d.b        = &st.s[i].f->b;
+    d.rank     = st.s[i].f->rank;
+    d.scale    = st.s[i].scale;
+    d.b_stride = stride;
+    d.b_offset = offset;
+  }
+  return s;
+}
+
+}  // namespace
+
+bool
+MetalFlux2Transformer::read_dims(const std::string& model_dir, Config* cfg)
+{
+  if (cfg == nullptr) { return false; }
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(model_dir) / "config.json");
+  if (!in) { return false; }
+  try {
+    FlexData j = FlexData::from_json(in);
+    if (!j.is_object()) { return false; }
+    auto obj = j.as_object();
+    auto geti = [&](const char* k, int cur) -> int {
+      return obj.contains(k) ? (int)obj.at(k).as_int(cur) : cur;
+    };
+    auto getf = [&](const char* k, float cur) -> float {
+      return obj.contains(k) ? (float)obj.at(k).as_real(cur) : cur;
+    };
+    // The same keys load() reads, and only the ones that size the model.
+    cfg->n_heads   = geti("num_attention_heads", cfg->n_heads);
+    cfg->head_dim  = geti("attention_head_dim", cfg->head_dim);
+    cfg->hidden    = cfg->n_heads * cfg->head_dim;
+    cfg->n_double  = geti("num_layers", cfg->n_double);
+    cfg->n_single  = geti("num_single_layers", cfg->n_single);
+    cfg->mlp_ratio = getf("mlp_ratio", cfg->mlp_ratio);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return true;
+}
+
+int
+MetalFlux2Transformer::ane_chunk_rows() noexcept
+{
+  return AneFeedForward::chunk_rows("VPIPE_FLUX2_ANE_CHUNK");
+}
+
+int
+MetalFlux2Transformer::ane_chunk_cap() noexcept
+{
+  if (const char* e = std::getenv("VPIPE_FLUX2_ANE_CHUNK_MAX")) {
+    const int v = std::atoi(e);
+    if (v >= 256 && v <= 16384) { return v; }
+  }
+  return kAneChunkCap;
+}
+
+int
+MetalFlux2Transformer::ane_chunk_for_(int rows, float ane_rows) noexcept
+{
+  if (rows <= 0 || ane_rows > 0.0f ||
+      std::getenv("VPIPE_FLUX2_ANE_CHUNK") != nullptr) {
+    return ane_chunk_rows();
+  }
+  // THE CAP, 3072 rows (VPIPE_FLUX2_ANE_CHUNK_MAX overrides): above it a tier
+  // takes several chunks. It bounds the host rows -- what memory planning is
+  // told -- and the module shapes a run can compile. MEASURED on klein-9B
+  // (M4 Pro): at 1536^2 caps of 2048/3072/4096 ran the forward in 20.2 /
+  // 19.4 / 21.3 s, at 2048^2 in 44.4 / 44.8 / 46.1 s; an uncapped 10240-row
+  // chunk compiled for 29 s. 4096 is too coarse for the balancer; 3072 keeps
+  // 1024^2's single 2560-row chunk, which a 2048 cap costs ~5%.
+  return std::clamp((rows * 5 / 8 + 255) / 256 * 256, 256, ane_chunk_cap());
+}
+
+std::size_t
+MetalFlux2Transformer::ane_runtime_bytes(const Config& cfg,
+                                         int image_rows) noexcept
+{
+  const int H = cfg.hidden;
+  if (H <= 0) { return 0; }
+  // Before load the derived widths are 0; the checkpoint builds both from
+  // mlp_ratio (Flux2FeedForward / Flux2SingleTransformerBlock), so that is
+  // the same number.
+  const int ratio_w = (int)((float)H * cfg.mlp_ratio);
+  const int inner = cfg.double_ff_hidden > 0 ? cfg.double_ff_hidden / 2
+                                             : ratio_w;
+  const int smlp = cfg.single_mlp_in > 0 ? cfg.single_mlp_in : ratio_w;
+  // Clip size unknown: book the CAP, the most host rows a tier can hold.
+  const int ch = image_rows > 0 ? ane_chunk_for_(image_rows, cfg.ane_rows)
+                 : cfg.ane_rows > 0.0f ? ane_chunk_rows()
+                                       : ane_chunk_cap();
+  std::size_t n = 0;
+  if (cfg.n_double > 0) {
+    n += AneFeedForward::runtime_bytes(H, inner, 0, ch);
+    if (cfg.ane_qkv || std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr) {
+      n += AneFeedForward::matmul_runtime_bytes(H, 3 * H, 0, ch);
+    }
+  }
+  if (cfg.n_single > 0) {
+    n += AneFeedForward::matmul_runtime_bytes(H, 3 * H + 2 * smlp, 0, ch);
+  }
+  return n;
+}
+
+void
+MetalFlux2Transformer::ane_setup_(int image_rows, int joint_rows)
+{
+  if (_ane_tried) { return; }
+  _ane_tried = true;
+  if (_cfg.session == nullptr) { return; }
+  const int H = _cfg.hidden;
+  const bool prof = std::getenv("VPIPE_FLUX2_ANE_PROFILE") != nullptr;
+  auto make = [&](const char* tag, int in, int out, int rows, bool matmul) {
+    AneFeedForward::Options o;
+    o.session = _cfg.session;
+    o.mc      = _mc;
+    o.tag     = tag;
+    o.hidden  = in;
+    o.ffn     = out;
+    o.seq     = rows;
+    o.rows    = _cfg.ane_rows;
+    o.chunk   = ane_chunk_for_(rows, _cfg.ane_rows);
+    o.matmul  = matmul;
+    o.profile = prof;
+    return AneFeedForward::create(o);
+  };
+  if (_cfg.n_double > 0 && _cfg.double_ff_hidden > 0) {
+    _ane_dff = make("flux2-ff", H, _cfg.double_ff_hidden / 2, image_rows,
+                    /*matmul=*/false);
+    if (_cfg.ane_qkv || std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr) {
+      _ane_dqkv = make("flux2-qkv", H, 3 * H, image_rows, /*matmul=*/true);
+    }
+  }
+  if (_cfg.n_single > 0 && _cfg.single_mlp_in > 0) {
+    _ane_sproj = make("flux2-single", H, 3 * H + 2 * _cfg.single_mlp_in,
+                      joint_rows, /*matmul=*/true);
+  }
+}
+
+bool
+MetalFlux2Transformer::ane_layer_ok_(int flat) const noexcept
+{
+  return _cfg.ane_layers <= 0 || flat < _cfg.ane_layers;
+}
+
+bool
+MetalFlux2Transformer::ane_stageable_(const QWeight& q) noexcept
+{
+  if (q.empty()) { return false; }
+  if (!q.quantized) { return true; }
+  return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
+         !q.qbias.empty();
+}
+
+bool
+MetalFlux2Transformer::ane_dff_ok_(int L, const DoubleBlock& b)
+{
+  if (_ane_dff == nullptr || !ane_layer_ok_(L)) { return false; }
+  // The fused layout interleaves gate|up, and an adapter's B is not: load
+  // keeps an adapted linear_in unfused, but the pairing is refused here
+  // rather than assumed.
+  const bool ok = ane_stageable_(b.ff_in) && ane_stageable_(b.ff_out) &&
+                  !(_fuse_ff && !lora_at_(L, &DoubleLora::ff_in).empty());
+  if (!ok && !_ane_warned && _cfg.session != nullptr) {
+    _ane_warned = true;
+    _cfg.session->warn(fmt(
+        "flux2: double block {} has no stageable feed-forward, so it (and any "
+        "like it) keeps the GPU", L));
+  }
+  return ok;
+}
+
+bool
+MetalFlux2Transformer::ane_dqkv_ok_(const DoubleBlock& b) const noexcept
+{
+  return _ane_dqkv != nullptr && ane_stageable_(b.q) &&
+         ane_stageable_(b.k) && ane_stageable_(b.v);
+}
+
+bool
+MetalFlux2Transformer::ane_sproj_ok_(const SingleBlock& b) const noexcept
+{
+  if (_ane_sproj == nullptr) { return false; }
+  return _fuse_ff ? (ane_stageable_(b.qkv) && ane_stageable_(b.mlp_gu))
+                  : ane_stageable_(b.qkv_mlp);
+}
+
+void
+MetalFlux2Transformer::ane_stage_dff_(int L, const DoubleBlock& b)
+{
+  const std::size_t inner = (std::size_t)(_cfg.double_ff_hidden / 2);
+  const lora::Stack in  = lora_at_(L, &DoubleLora::ff_in);
+  const lora::Stack out = lora_at_(L, &DoubleLora::ff_out);
+  // ff.linear_in is [gate; up]: INTERLEAVED where the fused SwiGLU reads it
+  // (row 2g gate g, 2g+1 up g), concatenated otherwise.
+  _ane_dff->stage(L,
+                  _fuse_ff ? ane_src_(b.ff_in, 2, 0, in)
+                           : ane_src_(b.ff_in, 1, 0, in),
+                  _fuse_ff ? ane_src_(b.ff_in, 2, 1, in)
+                           : ane_src_(b.ff_in, 1, inner, in),
+                  ane_src_(b.ff_out, 1, 0, out), _quant_group);
+}
+
+void
+MetalFlux2Transformer::ane_stage_dqkv_(int L, const DoubleBlock& b)
+{
+  const std::size_t H = (std::size_t)_cfg.hidden;
+  // Stacked along the slot's rows in the order the split scatters them.
+  auto part = [&](const QWeight& q, std::size_t row0,
+                  lora::Factors DoubleLora::* which) {
+    AneFfnSource s = ane_src_(q, 1, 0, lora_at_(L, which));
+    s.slot     = 0;
+    s.slot_row = row0;
+    s.rows     = H;
+    return s;
+  };
+  _ane_dqkv->stage(L,
+                   std::vector<AneFfnSource>{
+                       part(b.q, 0, &DoubleLora::q),
+                       part(b.k, H, &DoubleLora::k),
+                       part(b.v, 2 * H, &DoubleLora::v)},
+                   _quant_group);
+}
+
+void
+MetalFlux2Transformer::ane_stage_sproj_(int L, const SingleBlock& b)
+{
+  const std::size_t H3 = 3 * (std::size_t)_cfg.hidden;
+  const std::size_t S  = (std::size_t)_cfg.single_mlp_in;
+  if (!_fuse_ff) {
+    // The raw projection is already [q|k|v|gate|up], the order the split
+    // scatters, and carries the block's adapter.
+    _ane_sproj->stage(L, ane_src_(b.qkv_mlp, 1, 0,
+                                  lora_at_(L, &SingleLora::qkv_mlp)),
+                      _quant_group);
+    return;
+  }
+  // The fused halves: q|k|v as sliced, then the interleaved gate|up (gate g
+  // at row 2g, up g at 2g+1). An adapter on to_qkv_mlp_proj keeps a block
+  // unfused, so these carry none.
+  const lora::Stack none{};
+  auto part = [&](const QWeight& q, std::size_t row0, std::size_t rows,
+                  std::size_t stride, std::size_t offset) {
+    AneFfnSource s = ane_src_(q, stride, offset, none);
+    s.slot     = 0;
+    s.slot_row = row0;
+    s.rows     = rows;
+    return s;
+  };
+  _ane_sproj->stage(L,
+                    std::vector<AneFfnSource>{
+                        part(b.qkv, 0, H3, 1, 0),
+                        part(b.mlp_gu, H3, S, 2, 0),
+                        part(b.mlp_gu, H3 + S, S, 2, 1)},
+                    _quant_group);
 }
 
 SharedBuffer
@@ -1935,6 +2219,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   };
   double t_dbl = 0, t_sgl_gemm = 0, t_sgl_attn = 0, t_sgl_cat = 0,
          t_sgl_out = 0, t_final = 0;
+  // The double stack's sections, when profiling: t_dbl then holds only what
+  // follows the last of them.
+  double t_embed = 0, t_d_qkv_img = 0, t_d_qkv_txt = 0, t_d_attn = 0,
+         t_d_oproj = 0, t_d_ff_img = 0, t_d_ff_txt = 0;
   auto tnow = [] { return std::chrono::steady_clock::now(); };
   auto ms_since = [](std::chrono::steady_clock::time_point m) {
     return std::chrono::duration<double, std::milli>(
@@ -2585,6 +2873,11 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // No-op once the shapes are settled.
   if (_i8) { _i8->tune_pending(_mc); }
 
+  // VPIPE_FLUX2_STACK_TIME: the double stack's wall time per forward, from
+  // its first block to its final wait -- no barriers, so the pipelining the
+  // stack really gets is what is timed, and the single stack's noise is not.
+  const bool stack_time = std::getenv("VPIPE_FLUX2_STACK_TIME") != nullptr;
+  std::chrono::steady_clock::time_point t_stack0{};
   // ===== stream 1: conditioning + embed + double blocks =====
   if (prof) { mk = tnow(); }
   {
@@ -2606,6 +2899,19 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op = make_ops(enc);
     };
     auto flush = [&]() { flush_with([] {}); };
+    // VPIPE_FLUX2_DIT_PROFILE: a barrier per double-block section, so each
+    // accumulates its own GPU time. It serialises the stack; the proportions
+    // are the signal, not the total.
+    auto dsplit = [&](double& acc) {
+      if (!prof) { return; }
+      enc.end();
+      stream.commit().wait();
+      acc += ms_since(mk);
+      stream = _mc->make_command_stream();
+      enc = stream.begin_compute();
+      op = make_ops(enc);
+      mk = tnow();
+    };
     // TimestepEmbedding: linear_1 -> SiLU -> linear_2.
     op.gemm(te_in, _t_emb1, te1, 0, 1, H, TD); op.bias(_t_emb1_b, te1, 1, H);
     op.elt(_fn_mulsig, te1, 0, te1, 0, te1, 0, H);       // SiLU
@@ -2708,6 +3014,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     // Enough in a row lifts the ratchet by a block, so a shed taken
     // during a momentary squeeze is not the last word on the run.
     if (!shortfall) { _resid.note_healthy_forward(); }
+    dsplit(t_embed);
+    if (stack_time) { t_stack0 = std::chrono::steady_clock::now(); }
     for (int L = 0; L < c.n_double; ++L) {
       // Pipeline stop -> abandon: checked EVERY block (not just the streamed
       // tail) so a slow high-res step responds within ~one block on the
@@ -2745,15 +3053,114 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       auto dl = [&](lora::Factors DoubleLora::* d) {
         return lora_at_(L, d);
       };
+      // ---- the ANE tiers on this block's IMAGE rows -------------------
+      //
+      // Planned before anything of the block is encoded, so a split's
+      // weights stage on the ANE worker under the norm and the text half.
+      // The text rows are too few for a chunk and stay on the GPU. A split
+      // commits and waits mid-block -- this stack otherwise commits once --
+      // so the encoder and `op` are rebuilt after each such fence.
+      if (_cfg.session != nullptr) { ane_setup_(IS, seq); }
+      using AnePlan = AneFeedForward::Plan;
+      const AnePlan dq_plan = ane_layer_ok_(L) && ane_dqkv_ok_(b)
+                                  ? _ane_dqkv->plan_block()
+                                  : AnePlan::kGpu;
+      const AnePlan df_plan =
+          ane_dff_ok_(L, b) ? _ane_dff->plan_block() : AnePlan::kGpu;
+      const bool dq_split = dq_plan == AnePlan::kSplit;
+      const bool dq_meas  = dq_split || dq_plan == AnePlan::kProbe;
+      const bool df_split = df_plan == AnePlan::kSplit;
+      const bool df_meas  = df_split || df_plan == AnePlan::kProbe;
+      auto reopen = [&]() {
+        stream = _mc->make_command_stream();
+        enc = stream.begin_compute();
+        op = make_ops(enc);
+      };
+      auto ane_ms = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+      };
+      // A streamed block issues its successor's read at its FIRST fence, so
+      // the read hides under the attention and both engines' work rather
+      // than under the gated add left at the block's end (a no-op there
+      // once issued).
+      auto ane_prefetch = [&]() {
+        if (!streaming) { return; }
+        int nxt = -1;
+        for (int n = L + 1; n < c.n_double; ++n) {
+          const bool h = n < (int)_double.size() &&
+                         !_double[(std::size_t)n].q.empty();
+          if (!h) { nxt = n; break; }
+        }
+        _double_slots.prefetch(nxt);
+      };
+      if ((dq_meas && (L == 0 || _ane_dqkv->needs_barrier())) ||
+          (df_meas && (L == 0 || _ane_dff->needs_barrier()))) {
+        // A measured block after unsplit work -- GPU-mode blocks, or the
+        // embedding ahead of block 0: drain it first, so the section times
+        // its own work. See AneFeedForward::needs_barrier.
+        enc.end();
+        stream.commit().wait();
+        reopen();
+      }
+      // One ANE worker serves both tiers: q|k|v stages first when it
+      // splits (needed first), and the feed-forward's weights follow its
+      // join.
+      if (dq_split) {
+        ane_stage_dqkv_(L, b);
+      } else if (df_split) {
+        ane_stage_dff_(L, b);
+      }
       // MSA: img (mod set 0) + txt.  mod layout [shift,scale,gate]*2 (each H).
       ln_mod_img(op, img, H, 0, nrm);
       op.tap("dbl_norm1_img", L, nrm, 0, IS, H);
-      op.gemm(nrm, b.q, jq, (std::size_t)TS * H, IS, H, H, 0,
+      // Image q/k/v, optionally split: the ANE's tail image rows land in the
+      // tails of jq/jk/jv -- the image region follows the text rows, hence
+      // the row offset -- and the GPU's head rows beside them.
+      int dq_rows = 0;
+      double dq_drain = 0.0;
+      if (dq_meas) {
+        const auto t_d0 = std::chrono::steady_clock::now();
+        enc.end();
+        CommandStream::Fence qf = stream.commit();
+        ane_prefetch();
+        const bool staged = dq_split && _ane_dqkv->join_stage(L);
+        qf.wait();
+        dq_drain = ane_ms(t_d0);
+        if (staged) {
+          const std::size_t tr = (std::size_t)TS;
+          dq_rows = _ane_dqkv->begin(
+              nrm,
+              std::vector<AneFeedForward::OutSeg>{
+                  {&jq, H, tr}, {&jk, H, tr}, {&jv, H, tr}},
+              IS);
+        } else if (dq_split && _cfg.session != nullptr) {
+          _cfg.session->warn(fmt("flux2: staging double block {}'s q/k/v for "
+                                 "the ANE failed; it keeps the GPU", L));
+        }
+        reopen();
+      }
+      const int dq_g = IS - dq_rows;
+      const auto dq_t0 = std::chrono::steady_clock::now();
+      op.gemm(nrm, b.q, jq, (std::size_t)TS * H, dq_g, H, H, 0,
               dl(&DoubleLora::q));
-      op.gemm(nrm, b.k, jk, (std::size_t)TS * H, IS, H, H, 0,
+      op.gemm(nrm, b.k, jk, (std::size_t)TS * H, dq_g, H, H, 0,
               dl(&DoubleLora::k));
-      op.gemm(nrm, b.v, jv, (std::size_t)TS * H, IS, H, H, 0,
+      op.gemm(nrm, b.v, jv, (std::size_t)TS * H, dq_g, H, H, 0,
               dl(&DoubleLora::v));
+      if (dq_meas) {
+        enc.end();
+        stream.commit().wait();
+        const double g_ms = ane_ms(dq_t0);
+        if (dq_rows > 0) {
+          (void)_ane_dqkv->finish(L, IS, g_ms, dq_drain);
+        } else {
+          _ane_dqkv->note_probe(dq_drain, g_ms);
+        }
+        reopen();
+      }
+      if (dq_split && df_split) { ane_stage_dff_(L, b); }
+      dsplit(t_d_qkv_img);
       op.ln_mod(txt, 0, mtxt, H, 0, nrm, 0, H, TS);
       op.tap("dbl_norm1_txt", L, nrm, 0, TS, H);
       op.gemm(nrm, b.aq, jq, 0, TS, H, H, 0, dl(&DoubleLora::aq));
@@ -2778,7 +3185,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.copy_rows(kv->v[(std::size_t)L], 0, jv, (std::size_t)seq * H,
                      IS_REF_ALL, H);
       }
+      dsplit(t_d_qkv_txt);
       attention(op, att, 0, L);                       // -> att (contiguous)
+      dsplit(t_d_attn);
       op.tap("dbl_attn_txt", L, att, 0, TS, H);            // to_add_out input
       op.gemm(att, b.ao, ob, 0, TS, H, H, 0,               // text att[0:TS]
               dl(&DoubleLora::ao));
@@ -2790,21 +3199,111 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       gated_img(op, img, 2 * H, ob);
       // FF (mod set 1: shift_mlp=3H, scale_mlp=4H, gate_mlp=5H). Flux2FeedForward
       // is SwiGLU: linear_in -> [gate|up] (2*INNER) -> silu(gate)*up -> linear_out.
+      dsplit(t_d_oproj);
       ln_mod_img(op, img, 4 * H, 3 * H, nrm);
       op.tap("dbl_norm2_img", L, nrm, 0, IS, H);
-      if (_fuse_ff) {
-        op.swiglu_ff(nrm, b.ff_in, smlp, IS, H, DFF);    // silu(gate)*up [IS,INNER]
-      } else {
-        op.gemm(nrm, b.ff_in, ff1, 0, IS, DFF, H, 0,     // [IS, 2*INNER]
-                dl(&DoubleLora::ff_in));
-        op.slice(ff1, sg, IS, DFF, INNER, 0);            // gate = first half
-        op.slice(ff1, su, IS, DFF, INNER, INNER);        // up = second half
-        op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, IS * INNER);
+      // The image feed-forward, optionally split: the ANE's tail rows of nrm
+      // into the tail of ob, the GPU's whole SwiGLU over the head rows. Rows
+      // are independent, so the split is exact up to the ANE's fp16, and the
+      // gated add below reads ob only once both halves are in it.
+      int df_rows = 0;
+      double df_drain = 0.0;
+      if (df_meas) {
+        const auto t_d0 = std::chrono::steady_clock::now();
+        enc.end();
+        CommandStream::Fence ff_fence = stream.commit();
+        ane_prefetch();
+        const bool staged = df_split && _ane_dff->join_stage(L);
+        ff_fence.wait();
+        df_drain = ane_ms(t_d0);
+        if (staged) {
+          df_rows = _ane_dff->begin(nrm, ob, IS);
+        } else if (df_split && _cfg.session != nullptr) {
+          _cfg.session->warn(fmt("flux2: staging double block {}'s "
+                                 "feed-forward for the ANE failed; it keeps "
+                                 "the GPU", L));
+        }
+        reopen();
       }
-      op.tap("dbl_ffact_img", L, smlp, 0, IS, INNER);
-      op.gemm(smlp, b.ff_out, ob, 0, IS, H, INNER, 0,
+      const int df_g = IS - df_rows;
+      const auto df_t0 = std::chrono::steady_clock::now();
+      if (_fuse_ff) {
+        op.swiglu_ff(nrm, b.ff_in, smlp, df_g, H, DFF);  // silu(gate)*up [,INNER]
+      } else {
+        op.gemm(nrm, b.ff_in, ff1, 0, df_g, DFF, H, 0,   // [rows, 2*INNER]
+                dl(&DoubleLora::ff_in));
+        op.slice(ff1, sg, df_g, DFF, INNER, 0);          // gate = first half
+        op.slice(ff1, su, df_g, DFF, INNER, INNER);      // up = second half
+        op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, df_g * INNER);
+      }
+      op.tap("dbl_ffact_img", L, smlp, 0, df_g, INNER);
+      op.gemm(smlp, b.ff_out, ob, 0, df_g, H, INNER, 0,
               dl(&DoubleLora::ff_out));
+      if (df_meas) {
+        enc.end();
+        stream.commit().wait();
+        const double g_ms = ane_ms(df_t0);
+        if (df_rows > 0) {
+          (void)_ane_dff->finish(L, IS, g_ms, df_drain);
+        } else {
+          _ane_dff->note_probe(df_drain, g_ms);
+        }
+        reopen();
+      }
+      // VPIPE_FLUX2_ANE_FF_PROBE: the ANE's rows against the GPU's own
+      // feed-forward over the SAME rows of the same input, block-local. Tells
+      // an ANE computing the wrong thing (~1e-1 and up) from fp16 round-off
+      // that later blocks amplify (~1e-3). Diagnostic only: a whole extra
+      // feed-forward and a host compare per split block.
+      static const bool kFfProbe =
+          std::getenv("VPIPE_FLUX2_ANE_FF_PROBE") != nullptr;
+      if (kFfProbe && df_rows > 0) {
+        SharedBuffer ref = _mc->make_shared_buffer((std::size_t)IS * H * 2);
+        if (_fuse_ff) {
+          op.swiglu_ff(nrm, b.ff_in, smlp, IS, H, DFF);
+        } else {
+          op.gemm(nrm, b.ff_in, ff1, 0, IS, DFF, H, 0,
+                  dl(&DoubleLora::ff_in));
+          op.slice(ff1, sg, IS, DFF, INNER, 0);
+          op.slice(ff1, su, IS, DFF, INNER, INNER);
+          op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, IS * INNER);
+        }
+        op.gemm(smlp, b.ff_out, ref, 0, IS, H, INNER, 0,
+                dl(&DoubleLora::ff_out));
+        enc.end();
+        stream.commit().wait();
+        reopen();
+        auto f32 = [](std::uint16_t v) {
+          const std::uint32_t bits = (std::uint32_t)v << 16;
+          float f = 0.0f;
+          std::memcpy(&f, &bits, sizeof(f));
+          return (double)f;
+        };
+        const auto* pa = static_cast<const std::uint16_t*>(ob.contents());
+        const auto* pr = static_cast<const std::uint16_t*>(ref.contents());
+        double num = 0.0, den = 0.0, hnum = 0.0;
+        for (int r = 0; r < IS; ++r) {
+          for (int j = 0; j < H; ++j) {
+            const std::size_t i = (std::size_t)r * H + j;
+            const double d = f32(pa[i]) - f32(pr[i]);
+            if (r >= df_g) {
+              num += d * d;
+              den += f32(pr[i]) * f32(pr[i]);
+            } else {
+              hnum += d * d;
+            }
+          }
+        }
+        if (_cfg.session != nullptr) {
+          _cfg.session->info(fmt(
+              "flux2: ANE FF probe block {}: ANE rows rel-L2 {:.3e} vs the "
+              "GPU over the same rows ({} rows); GPU rows abs diff {:.3e}",
+              L, den > 0.0 ? std::sqrt(num / den) : 0.0, df_rows,
+              std::sqrt(hnum)));
+        }
+      }
       gated_img(op, img, 5 * H, ob);
+      dsplit(t_d_ff_img);
       op.ln_mod(txt, 0, mtxt, 4 * H, 3 * H, nrm, 0, H, TS);
       op.tap("dbl_norm2_txt", L, nrm, 0, TS, H);
       if (_fuse_ff) {
@@ -2820,6 +3319,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.gemm(smlp, b.cff_out, ob, 0, TS, H, INNER, 0,
               dl(&DoubleLora::cff_out));
       op.gated(txt, 0, mtxt, 5 * H, ob, 0, H, TS * H);
+      dsplit(t_d_ff_txt);
       if (streaming) {
         const auto gp0 = sp_now();
         // Commit block L, issue the NEXT block's read into the free
@@ -2866,6 +3366,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     }
   }
   if (prof) { t_dbl += ms_since(mk); }
+  if (stack_time && _mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "FLUX.2 double stack: {:.1f} ms ({} blocks, img {} txt {})",
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_stack0).count(),
+        c.n_double, IS, TS));
+  }
   // Join streams: joint = [text; image].
   std::memcpy(joint.contents(), txt.contents(), (std::size_t)TS * H * 2);
   std::memcpy(static_cast<_Float16*>(joint.contents()) + (std::size_t)TS * H,
@@ -2890,6 +3397,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                          && _fn_qmm_swiglu8_bm64_rs.valid()))
                : _fn_swiglu_rs.valid();
   const bool ff_direct = _fn_transpose_rs.valid() && have_mlp_rs;
+  const auto t_sstack0 = std::chrono::steady_clock::now();
   for (int L = 0; L < c.n_single; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }   // pipeline stop, any mode
     // As above: resident once promoted, read into a slot until then.
@@ -2927,9 +3435,94 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     report_block(stream, _block_progress, c.n_double + L,
                  c.n_double + c.n_single);
     auto op = make_ops(enc);
+    // ---- the ANE tier on this block's joint rows: to_qkv_mlp_proj -----
+    //
+    // q|k|v and the MLP's gate|up as ONE scattered matmul: the ANE's tail
+    // rows land in the tails of jq/jk/jv/sg/su, the GPU's head rows beside
+    // them, and the SwiGLU of the ANE's rows then runs on the GPU. A split
+    // block takes the slice-and-concat path below, which reads sg/su -- the
+    // direct-write path would not see the ANE's gate|up at all.
+    if (_cfg.session != nullptr) { ane_setup_(IS, seq); }
+    const AneFeedForward::Plan sp_plan =
+        ane_layer_ok_(c.n_double + L) && ane_sproj_ok_(b)
+            ? _ane_sproj->plan_block()
+            : AneFeedForward::Plan::kGpu;
+    const bool sp_split = sp_plan == AneFeedForward::Plan::kSplit;
+    const bool sp_meas  = sp_split || sp_plan == AneFeedForward::Plan::kProbe;
+    if (sp_split) { ane_stage_sproj_(L, b); }
     ln_mod_joint(op, joint, H, 0, nrm);                    // (1+scale)*LN+shift
     op.tap("sgl_norm", L, nrm, 0, seq, H);
-    if (_fuse_ff) {
+    if (sp_meas) {
+      auto sreopen = [&]() {
+        stream = _mc->make_command_stream();
+        enc = stream.begin_compute();
+        op = make_ops(enc);
+      };
+      auto sms = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+      };
+      const auto t_d0 = std::chrono::steady_clock::now();
+      enc.end();
+      CommandStream::Fence sf = stream.commit();
+      if (streaming) {
+        // The successor's read, under this block's work from here on.
+        int nxt = -1;
+        for (int n = L + 1; n < c.n_single; ++n) {
+          const bool h = n < (int)_single.size() &&
+                         !_single[(std::size_t)n].o.empty();
+          if (!h) { nxt = n; break; }
+        }
+        _single_slots.prefetch(nxt);
+      }
+      const bool staged = sp_split && _ane_sproj->join_stage(L);
+      sf.wait();
+      const double sp_drain = sms(t_d0);
+      int sp_rows = 0;
+      if (staged) {
+        sp_rows = _ane_sproj->begin(
+            nrm,
+            std::vector<AneFeedForward::OutSeg>{
+                {&jq, H}, {&jk, H}, {&jv, H}, {&sg, SMLP}, {&su, SMLP}},
+            seq);
+      } else if (sp_split && _cfg.session != nullptr) {
+        _cfg.session->warn(fmt("flux2: staging single block {}'s projection "
+                               "for the ANE failed; it keeps the GPU", L));
+      }
+      sreopen();
+      const int sp_g = seq - sp_rows;
+      const auto sp_t0 = std::chrono::steady_clock::now();
+      if (_fuse_ff) {
+        op.gemm(nrm, b.qkv, sproj, 0, sp_g, 3 * H, H);
+        op.slice(sproj, jq, sp_g, 3 * H, H, 0);
+        op.slice(sproj, jk, sp_g, 3 * H, H, H);
+        op.slice(sproj, jv, sp_g, 3 * H, H, 2 * H);
+        op.swiglu_ff(nrm, b.mlp_gu, smlp, sp_g, H, 2 * SMLP);
+      } else {
+        op.gemm(nrm, b.qkv_mlp, sproj, 0, sp_g, PW, H, 0,
+                sl(&SingleLora::qkv_mlp));
+        op.slice(sproj, jq, sp_g, PW, H, 0);
+        op.slice(sproj, jk, sp_g, PW, H, H);
+        op.slice(sproj, jv, sp_g, PW, H, 2 * H);
+        op.slice(sproj, sg, sp_g, PW, SMLP, 3 * H);
+        op.slice(sproj, su, sp_g, PW, SMLP, 3 * H + SMLP);
+        op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, sp_g * SMLP);
+      }
+      enc.end();
+      stream.commit().wait();
+      const double g_ms = sms(sp_t0);
+      if (sp_rows > 0) {
+        (void)_ane_sproj->finish(L, seq, g_ms, sp_drain);
+      } else {
+        _ane_sproj->note_probe(sp_drain, g_ms);
+      }
+      sreopen();
+      if (sp_rows > 0) {
+        // The ANE's gate|up is in: its rows' SwiGLU, beside the GPU's.
+        const std::size_t e0 = (std::size_t)sp_g * (std::size_t)SMLP;
+        op.elt(_fn_swiglu, sg, e0, su, e0, smlp, e0, sp_rows * SMLP);
+      }
+    } else if (_fuse_ff) {
       // qkv-only proj [seq, 3H] + a fused-SwiGLU mlp GEMM writing smlp directly
       // (no [seq, 2*SMLP] gate|up intermediate + slice + swiglu).
       op.gemm(nrm, b.qkv, sproj, 0, seq, 3 * H, H);
@@ -2973,7 +3566,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       stream = _mc->make_command_stream(); enc = stream.begin_compute();
       op = make_ops(enc); mk = tnow();
     }
-    if (ff_direct) {
+    // A block the ANE measured has its MLP in smlp, not in scat: concat.
+    const bool direct = ff_direct && !sp_meas;
+    if (direct) {
       attention(op, scat, H + SMLP, L);  // att -> scat[:, :H] (mlp in [H:])
     } else {
       attention(op, att, 0, L);         // att -> att, concat below
@@ -2984,7 +3579,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op = make_ops(enc); mk = tnow();
     }
     // scat = [att | mlp]. Direct-write already placed both; else concat on GPU.
-    if (!ff_direct) { op.concat_cols(scat, att, smlp, seq, H, SMLP); }
+    if (!direct) { op.concat_cols(scat, att, smlp, seq, H, SMLP); }
     op.tap("sgl_cat", L, scat, 0, seq, H + SMLP);
     op.gemm(scat, b.o, ob, 0, seq, H, H + SMLP, 0,
             sl(&SingleLora::o));
@@ -3037,6 +3632,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (prof) { t_sgl_out += ms_since(mk); }
   }
 
+  if (stack_time && _mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "FLUX.2 single stack: {:.1f} ms ({} blocks, seq {})",
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_sstack0).count(),
+        c.n_single, seq));
+  }
   if (sprof && sp_blocks > 0 && _mc->session() != nullptr) {
     const double tot = sp_read_ms + sp_gpu_ms;
     const double sp_alloc_ms =
@@ -3088,6 +3690,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   }
   if (prof) {
     t_final += ms_since(mk);
+    if (_mc->session() != nullptr) {
+      _mc->session()->log_normal(fmt(
+          "FLUX.2 DiT profile, double stack ({} blocks, img {} txt {}): embed "
+          "{:.0f} ms | img q/k/v {:.0f} | txt q/k/v+norms {:.0f} | attention "
+          "{:.0f} | out proj {:.0f} | img FF {:.0f} | txt FF {:.0f} | rest "
+          "{:.0f}", c.n_double, IS, TS, t_embed, t_d_qkv_img, t_d_qkv_txt,
+          t_d_attn, t_d_oproj, t_d_ff_img, t_d_ff_txt, t_dbl));
+    }
     const double tot = t_dbl + t_sgl_gemm + t_sgl_attn + t_sgl_cat +
                        t_sgl_out + t_final;
     if (_mc->session() != nullptr) {

@@ -1419,6 +1419,9 @@ granted, and knows when to ask again:
 _wire.open(mc);
 const bool mapped = weights_may_be_mapped(stream_blocks, _wire.on());
 
+// where the run's schedule is set
+_wire.new_run();
+
 // top of each forward
 if (_wire.on()) {
   if (_wire.retry(mc, block_bytes)) { _resid.note_landscape_changed(); }
@@ -1436,11 +1439,41 @@ if (_wire.wirable(nb) && _resid.admit(mc, nb)) {
 _wire.note_unwired(wire_block_(b, false));
 ```
 
+`wire_block_` / `wire_fixed_` are the model's own enumerations of its
+buffers; hand them to `_wire.wire_set(buffers, on)`, which wires in the
+order given, skips buffers too small to be a pool question, and stops at
+the first real refusal (arming the retry) — the loop every model otherwise
+writes for itself. `_wire.info()` reports the pool and this model's window
+onto it (booked bytes, pool used / limit / configured ask, refusals,
+reopens, the bytes the last pass left unwired) for logging.
+
 **`wirable()` gates ADMISSION, not just wiring.** Past the budget there is
 nothing to gain from keeping the block: it would be held unprotected, the
 compressor would take it — it is the coldest memory in the process — and
 the next residency walk would shed a block and ratchet the ceiling over
 the whole resident set. Better not to hold it at all.
+
+**The gate reads the pool as it is now.** The pool is shared by every
+model and ANE tier in the process, so `wirable()` asks the manager on each
+call rather than trusting a figure taken at load: a peer that frees its
+share hands the room over at once, and one that arrives later takes it
+back.
+
+**A shortfall is not always a refusal.** Buffers below the pool's minimum
+(`GenerativeModelManager::kMinWiredBytes`) are never wired, and every block
+carries some, so a fully wired block reports less than its resident size.
+`note_wired()` treats the shortfall as a refusal only when the pool cannot
+take the missing bytes. A model that compares the two itself will stop
+growing after its first block.
+
+**A collapsed ceiling is asked about again — by whoever is running.** A
+refusal collapses the process-wide ceiling, and the model that met it
+retries once the box has freed a block's worth. A model that did NOT meet
+it — one loaded later, or one whose pool was collapsed by an ANE tier —
+has no reading from the moment of that refusal, so `retry()` reopens such
+a ceiling once per run (`new_run()`). If the box really is full the mlock
+refuses again, which makes it that model's own refusal and puts it on the
+gated path.
 
 **Mapping and wiring are one decision.** A mapped tensor aliases the
 weight set's shard `mmap`, so it can be neither wired (`mlock` on

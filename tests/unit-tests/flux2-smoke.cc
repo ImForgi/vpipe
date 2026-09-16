@@ -1225,6 +1225,140 @@ TEST(flux2_smoke, dit_forward_shape_finite)
               img_seq, c.out_channels);
 }
 
+// THE ANE TIERS AGAINST THE GPU, on a real checkpoint at 1024x1024.
+//
+// The double blocks' image feed-forward (and, with VPIPE_FLUX2_ANE_QKV, their
+// image q|k|v) and the single blocks' to_qkv_mlp_proj run half their rows on
+// the ANE. Each tier's output is fp16 there and bf16 on the GPU, and only
+// that difference may separate the two forwards -- so this is a PRECISION bar,
+// not an equality one, and a split with wrong rows or a wrong offset lands
+// nowhere near it. The two must also DIFFER: identical output means no row
+// ever reached the ANE.
+//
+// Env: VPIPE_FLUX2_TEST_MODEL_PATH (+ VPIPE_FLUX2_DIT_DIR), VPIPE_FLUX2_ANE_GRID
+// (64), VPIPE_FLUX2_ANE_QKV.
+TEST(flux2_smoke, forward_dit_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+                               ? std::string(ddir)
+                               : std::string(root) + "/transformer";
+  auto envi = [](const char* k, int d) {
+    const char* e = std::getenv(k); return (e && *e) ? std::atoi(e) : d; };
+  // 64 == 1024x1024, 4096 image rows: the tiers are chunked at 2048, so a
+  // smaller grid gives them less than a chunk and they switch themselves off.
+  const int grid = envi("VPIPE_FLUX2_ANE_GRID", 64);
+  const int TS = 64;
+  const int img_seq = grid * grid;
+
+  struct Arm {
+    std::vector<float> vel;
+    double ms = 0.0;
+    bool armed = false;
+  };
+  auto run = [&](bool ane) {
+    Arm out;
+    MetalFlux2Transformer::Config cfg;
+    if (ane) {
+      cfg.session  = &sess;
+      // _ROWS: the ANE's share (0 = measured balance); _LAYERS: cap the
+      // blocks, double then single -- the double count isolates them.
+      // Default: the tier's own share and chunk, which is what a graph gets.
+      cfg.ane_rows =
+          std::getenv("VPIPE_FLUX2_ANE_ROWS") != nullptr
+              ? (float)std::atof(std::getenv("VPIPE_FLUX2_ANE_ROWS"))
+              : 0.0f;
+      cfg.ane_layers = envi("VPIPE_FLUX2_ANE_LAYERS", 0);
+      cfg.ane_qkv  = std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr;
+    }
+    auto m = MetalFlux2Transformer::load(tdir, mc, cfg);
+    if (m == nullptr) { return out; }
+    const auto& c = m->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer vel;
+    // The first forward pays the module compile and the controller's
+    // opening and is not timed; the best of the rest is (_ITERS forwards in
+    // all, default 2). Sub-5% questions need the best of several.
+    const int iters = std::max(2, envi("VPIPE_FLUX2_ANE_ITERS", 2));
+    for (int it = 0; it < iters; ++it) {
+      const auto t0 = std::chrono::steady_clock::now();
+      vel = m->forward_dit(ctx, TS, lat, img_seq, grid, grid, 0.5f);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      if (vel.empty()) { return out; }
+      if (it > 0 && (out.ms == 0.0 || ms < out.ms)) { out.ms = ms; }
+    }
+    out.armed = m->ane_armed();
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (vel.byte_size() < n * 2) { return out; }
+    // The DiT runs bf16: the top half of an f32.
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    out.vel.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t bits = (std::uint32_t)vp[i] << 16;
+      std::memcpy(&out.vel[i], &bits, sizeof(float));
+    }
+    return out;
+  };
+
+  // _ANE_FIRST swaps the arms: the second arm runs on a warmer SoC, and a
+  // sub-10% whole-forward comparison is otherwise biased by the order.
+  const bool ane_first = std::getenv("VPIPE_FLUX2_ANE_FIRST") != nullptr;
+  Arm gpu, ane;
+  // _ANE_ONLY: the ANE arm alone, for comparing ANE settings by their stack
+  // timers at resolutions where every forward is long.
+  if (std::getenv("VPIPE_FLUX2_ANE_ONLY") != nullptr) {
+    ane = run(true);
+    std::printf("[flux2_smoke] ANE-only arm at %dx%d (armed %d): best warm "
+                "forward %.0f ms\n", grid * 16, grid * 16, ane.armed ? 1 : 0,
+                ane.ms);
+    EXPECT_TRUE(ane.armed && !ane.vel.empty());
+    return;
+  }
+  if (ane_first) {
+    ane = run(true);
+    gpu = run(false);
+  } else {
+    gpu = run(false);
+    ane = run(true);
+  }
+  ASSERT_TRUE(!gpu.vel.empty());
+  ASSERT_TRUE(ane.vel.size() == gpu.vel.size());
+  if (gpu.vel.empty() || ane.vel.size() != gpu.vel.size()) { return; }
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < gpu.vel.size(); ++i) {
+    const double d = (double)ane.vel[i] - (double)gpu.vel[i];
+    num += d * d;
+    den += (double)gpu.vel[i] * (double)gpu.vel[i];
+  }
+  const double r = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[flux2_smoke] ANE-vs-GPU velocity rel-L2 %.3e at %dx%d (armed "
+              "%d); warm forward GPU %.0f ms, ANE %.0f ms (%.2fx)\n", r,
+              grid * 16, grid * 16, ane.armed ? 1 : 0, gpu.ms, ane.ms,
+              ane.ms > 0.0 ? gpu.ms / ane.ms : 0.0);
+  EXPECT_TRUE(ane.armed);
+  EXPECT_TRUE(r > 0.0);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+}
+
 // BLOCK STREAMING MUST NOT CHANGE A SINGLE BIT.
 //
 // The streamed path reads every block off disk per forward into two

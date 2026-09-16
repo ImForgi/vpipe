@@ -694,7 +694,7 @@ MetalMiniMaxH3Transformer::weight_(WeightSet& ws, const std::string& nm,
   if (info->dtype == "BF16") {
     // Already the forward's dtype, so the model keeps it AS IS; whose
     // memory it is follows kept_residency_ above.
-    const auto res = kept_residency_(_stream_blocks, _wire_resident);
+    const auto res = kept_residency_(_stream_blocks, _wire.on());
     return r == Retain::Streamed
                ? ws.stream_tensor(nm, _mc, res)
                : ws.tensor(nm, _mc, res);
@@ -732,10 +732,10 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     l.codes  = r == Retain::Streamed
                    ? ws.stream_tensor(nm + ".weight", _mc,
                                       kept_residency_(_stream_blocks,
-                                                      _wire_resident))
+                                                      _wire.on()))
                    : ws.tensor(nm + ".weight", _mc,
                                kept_residency_(_stream_blocks,
-                                               _wire_resident));
+                                               _wire.on()));
     l.scales = weight_(ws, nm + ".scales", r);
     l.qbias  = weight_(ws, nm + ".biases", r);
     if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
@@ -962,7 +962,7 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
     // else is read as bf16, which is what weight_() delivers.
     SharedBuffer rebuilt =
         raw ? ws.stream_tensor(
-                  nm, _mc, kept_residency_(_stream_blocks, _wire_resident))
+                  nm, _mc, kept_residency_(_stream_blocks, _wire.on()))
             : weight_(ws, nm, Retain::Streamed);
     if (rebuilt.empty()) { ok = false; return; }
     dst = std::move(rebuilt);
@@ -1549,7 +1549,7 @@ MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer()
   // would not, and a DiT that is destroyed after every clip (the
   // ordinary `unload_when_idle: destroy` path) would leak its whole
   // share of the budget per clip until nothing could wire at all.
-  if (_wire_resident) {
+  if (_wire.on()) {
     wire_fixed_(false);
     for (Block& b : _blocks) { wire_block_(b, false); }
     _slot[0] = Block{};
@@ -1988,7 +1988,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // Restored here after the prefix retirement deleted it by accident:
   // the assignment lived inside the block that sized the pinned prefix,
   // that block went, and the five places that READ these two fields
-  // stayed. The effect was silent and total -- `_wire_resident` is
+  // stayed. The effect was silent and total -- the pool flag was
   // false-initialised, so wire_fixed_() never ran, no block was ever
   // wired, and the only visible trace was "wire budget 0 MB" in the
   // residency probe line.
@@ -1999,24 +1999,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // model guesses separately never adds up to the box. The pool is the
   // one accounting, and wire_into_pool() is what enforces it -- this
   // flag only says whether to ask.
-  //
-  // `_wire_budget` is what is still UNUSED, since the probe below asks
-  // how many more blocks can be wired, not how large the pool is.
-  {
-    const auto* sess = mc != nullptr ? mc->session() : nullptr;
-    auto* mgr = sess != nullptr && sess->services() != nullptr
-                    ? sess->services()->generative_model_manager()
-                    : nullptr;
-    const std::size_t lim = mgr != nullptr ? mgr->wired_pool_limit() : 0;
-    if (lim > 0) {
-      const std::size_t used = mgr->wired_pool_used();
-      m->_wire_resident = true;
-      m->_wire_budget = lim > used ? lim - used : 0;
-    }
-    if (const char* e = std::getenv("VPIPE_WIRE_RESIDENT")) {
-      m->_wire_resident = std::atoi(e) != 0;
-    }
-  }
+  m->_wire.open(mc);
   // The 50 main blocks: preloaded (default), or -- streaming -- only the
   // pinned prefix, with forward() reading and freeing the tail per block.
   if (!stream_blocks) {
@@ -3313,6 +3296,10 @@ MetalMiniMaxH3Transformer::bake_adaln(
         "AdaLN baked for a {}-step schedule", schedule.size())());
   }
 
+  // A new run: a pool ceiling some earlier model collapsed may be asked
+  // about again. See WiredPool::retry.
+  _wire.new_run();
+
   // Both of BlockResidency's rates are tuned for a 30-step schedule and
   // are wrong for a 5-step turbo one, in the same direction.
   //
@@ -3359,7 +3346,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
     // nothing kept is ever reused and every admission is a block-sized
     // memcpy plus an mlock paid for nothing.
     int probe = 1;
-    if (steps > 1 && _wire_resident) {
+    if (steps > 1 && _wire.on()) {
       // WIRING ON: NO RATE LIMIT. Take everything the box will give on
       // the first pass.
       //
@@ -3372,7 +3359,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
       //
       // Wiring replaces that evidence with a SYNCHRONOUS one. mlock
       // either takes the block or refuses it, per block, before it is
-      // kept -- and a refusal collapses `_wire_budget` to what was
+      // kept -- and a refusal collapses the pool to what was
       // granted, so admissions stop on the spot. There is no window
       // between committing and finding out, which is the only thing the
       // cap was buying. (And since the walk now skips wired buffers,
@@ -3415,8 +3402,8 @@ MetalMiniMaxH3Transformer::bake_adaln(
           probe, c.n_layers,
           resident_block_bytes_() >> 20,
           _mc->memory_budget().available_physical >> 20,
-          _wire_budget >> 20,
-          _wire_resident
+          _wire.budget() >> 20,
+          _wire.on()
               ? " -- uncapped, the wire budget is the gate"
               : ", doubling per healthy forward"));
     }
@@ -3706,33 +3693,20 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
       &b.fc2.w, &b.fc2.b, &b.fc2.codes, &b.fc2.scales, &b.fc2.qbias,
       &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
       &b.adaln.qbias};
-  auto* mgr = _mc != nullptr && _mc->session() != nullptr
-                  ? _mc->session()->services()->generative_model_manager()
-                  : nullptr;
-  if (mgr == nullptr) { return 0; }
   std::size_t changed = 0;
   for (metal_compute::SharedBuffer* p : all) {
-    if (p->byte_size() == 0 || p->is_wired() == on) { continue; }
-    if (!on) {
-      mgr->unwire_from_pool(*p);
-      changed += p->byte_size();
-      continue;
+    const std::size_t n = _wire.wire_one(_mc, *p, on);
+    // A buffer that would not wire for a reason of its own -- too small to
+    // be a pool question, or its own mlock property -- leaves the pool able
+    // to take the next: go on. Only a pool that can no longer take it STOPS
+    // the block, keeping what is already wired rather than unwinding it: a
+    // partly wired block is partly protected, and giving it back means
+    // competing for it again against a pool that just said no.
+    if (on && n == 0 && p->byte_size() > 0 && !p->is_wired() &&
+        _wire.refused(_mc, *p)) {
+      break;
     }
-    // Too small to be a pool question: never wired, and not a reason to
-    // stop. See GenerativeModelManager::pool_wirable.
-    if (!GenerativeModelManager::pool_wirable(*p)) { continue; }
-    if (mgr->wire_into_pool(*p) == 0) {
-      // A buffer that would not wire for a reason of its own leaves the
-      // pool able to take the next: go on. Only a pool that can no longer
-      // take it -- full, or capped by a real shortage -- STOPS the block,
-      // keeping what is already wired rather than unwinding it. A partly
-      // wired block is partly protected, which is strictly better than
-      // none -- and giving protection back on the way out means competing
-      // for it again on the next block, against a pool that just said no.
-      if (!mgr->wired_pool_can_take(p->byte_size())) { break; }
-      continue;
-    }
-    changed += p->byte_size();
+    changed += n;
   }
   return changed;
 }
@@ -3759,23 +3733,18 @@ MetalMiniMaxH3Transformer::scratch_buffers_()
 std::size_t
 MetalMiniMaxH3Transformer::wire_fixed_(bool on)
 {
-  auto* mgr = _mc != nullptr && _mc->session() != nullptr
-                  ? _mc->session()->services()->generative_model_manager()
-                  : nullptr;
-  if (mgr == nullptr) { return 0; }
   std::size_t changed = 0;
-  auto one = [&](metal_compute::SharedBuffer& b) {
-    if (b.byte_size() == 0 || b.is_wired() == on) { return; }
-    if (!on) { mgr->unwire_from_pool(b); changed += b.byte_size(); return; }
-    changed += mgr->wire_into_pool(b);
-  };
-  for (metal_compute::SharedBuffer* b : scratch_buffers_()) { one(*b); }
+  for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+    changed += _wire.wire_one(_mc, *b, on);
+  }
   // The TRUNK: everything the weight set cached for this model, which
   // for a streaming DiT is the non-block tensors it holds for the whole
   // run. Read on every block of every forward and never shed, so it has
   // a better claim on the pool than any single resident block does.
   if (_ws) {
-    _ws->for_each_weight([&](metal_compute::SharedBuffer& b) { one(b); });
+    _ws->for_each_weight([&](metal_compute::SharedBuffer& b) {
+      changed += _wire.wire_one(_mc, b, on);
+    });
   }
   return changed;
 }
@@ -3795,10 +3764,9 @@ MetalMiniMaxH3Transformer::evict_tail_block_()
     const std::size_t n = block_bytes_(b);
     if (n == 0) { continue; }
     // Before the buffers go: give the wiring back. Dropping a wired
-    // mapping would unwire it anyway, but doing it here keeps
-    // _wired_bytes honest without having to infer it from destructors.
-    const std::size_t unwired = wire_block_(b, false);
-    _wired_bytes -= (unwired > _wired_bytes) ? _wired_bytes : unwired;
+    // mapping would unwire it anyway, but doing it here keeps the pool's
+    // counter honest without having to infer it from destructors.
+    _wire.note_unwired(wire_block_(b, false));
     b = Block{};
     // Taking one out of the PINNED prefix un-pins it: that prefix was
     // sized at load against what the box was believed to hold, and a
@@ -3968,14 +3936,9 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   //
   // Before the assignment rather than after, because after it the old
   // buffers are gone and there is nothing left to unwire.
-  if (_wire_resident) {
-    auto* mgr = _mc != nullptr && _mc->session() != nullptr
-                    ? _mc->session()->services()->generative_model_manager()
-                    : nullptr;
-    if (mgr != nullptr) {
-      for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
-        mgr->unwire_from_pool(*b);
-      }
+  if (_wire.on()) {
+    for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+      _wire.wire_one(_mc, *b, false);
     }
   }
   _s = std::move(s);
@@ -4638,80 +4601,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // The scratch is allocated by now, so it can take its place in the
   // pool BEFORE this forward's block admissions start asking for room.
   // Order matters: the blocks are the shed-able half.
-  if (_wire_resident) {
-    // RETRY THE WIRED POOL, at the top of each forward.
-    //
-    // wire_into_pool() collapses the pool to what was granted when mlock
-    // refuses, which is right for a box that is full and wrong for one
-    // that was momentarily busy -- another process spiking during load.
-    // Without a retry the second case holds a small resident set for the
-    // whole schedule on the strength of one syscall: MEASURED, a 9 GB
-    // pool that granted 5857 MB sat at 16 of 50 blocks for the rest of
-    // the run.
-    //
-    // The flag stays set until a retry actually RAISES the budget, so a
-    // box busy at forward 2 is still asked again at forward 5. A single
-    // attempt would have spent itself against the same spike that
-    // caused the refusal.
-    //
-    // GATED on the box having demonstrably freed a block's worth since
-    // the refusal, so a genuinely full box is never asked: reopening the
-    // ceiling makes wired_pool_can_take() pass, and the mlock behind it
-    // would then fail and leave that block resident but UNWIRED -- one
-    // per forward, exactly the state the wirable gate exists to avoid.
-    // A peer holding wired memory shows up in this reading, since its
-    // pages are unavailable while it holds them and return when it lets
-    // go.
-    //
-    // A forward is the granularity because it is where the resident set
-    // is reconsidered anyway, and the check costs one budget read when
-    // the flag is clear.
-    const std::size_t avail =
-        _wire_retry ? _mc->memory_budget().available_physical : 0;
-    if (_wire_retry && avail > _wire_retry_at + resident_block_bytes_()) {
-      const std::size_t now = avail;
-      auto* mgr = _mc->session() != nullptr &&
-                          _mc->session()->services() != nullptr
-                      ? _mc->session()->services()->generative_model_manager()
-                      : nullptr;
-      if (mgr != nullptr) {
-        mgr->reopen_wired_pool();
-        const std::size_t lim = mgr->wired_pool_limit();
-        const std::size_t used = mgr->wired_pool_used();
-        const std::size_t room = lim > used ? lim - used : 0;
-        // Only ever RAISED here. The budget also bounds what this model
-        // has already wired, and lowering it below `_wired_bytes` would
-        // read as an over-spend that nothing can give back.
-        //
-        // CLAMPED TO THE POOL, belt and braces. The arithmetic already
-        // gives `_wired_bytes + (lim - used) <= lim` because this
-        // model's wired bytes are part of the manager's `used` -- but
-        // that holds only while the two counters agree, and the failure
-        // mode if they ever drift is not a slow run. Wired memory is the
-        // one allocation the kernel cannot reclaim, so an over-budget
-        // here panics the box rather than degrading it. One min() is a
-        // cheap way to never find out.
-        std::size_t want = _wired_bytes + room;
-        if (want > lim) { want = lim; }
-        if (want > _wire_budget) {
-          if (_mc->session() != nullptr) {
-            _mc->session()->log_debug(fmt(
-                "MetalMiniMaxH3Transformer: retrying the wired pool -- "
-                "budget {} -> {} MB", _wire_budget >> 20, want >> 20));
-          }
-          _wire_budget = want;
-          _wire_retry  = false;
-          // The residency policy stopped growing when the budget ran
-          // out, and it cannot see that the budget moved. This is the
-          // same "the ground moved" case the AdaLN bake uses.
-          _resid.note_landscape_changed();
-        } else {
-          // The ceiling did not move after all -- the pool is full
-          // rather than the box being busy. Re-arm against the CURRENT
-          // reading so the next look asks about a fresh block's worth.
-          _wire_retry_at = now;
-        }
-      }
+  if (_wire.on()) {
+    // RETRY A COLLAPSED POOL at the top of each forward -- after this
+    // model's own refusal once the box has freed a block's worth, and a
+    // ceiling someone else collapsed once per run. See WiredPool::retry.
+    // The residency policy stopped growing when the pool ran out, and it
+    // cannot see that the pool moved: the same "the ground moved" case the
+    // AdaLN bake uses.
+    if (_wire.retry(_mc, resident_block_bytes_())) {
+      _resid.note_landscape_changed();
     }
     wire_fixed_(true);
   }
@@ -4748,7 +4646,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             "RAM ({} of {} sampled pages paged out, {} MB wired) -- "
             "released {} MB, now {} blocks resident",
             (int)(100.0 * (double)incore / (double)examined),
-            paged_out, examined, _wired_bytes >> 20, freed >> 20,
+            paged_out, examined, _wire.wired_bytes() >> 20, freed >> 20,
             _resid.count()));
       }
     }
@@ -6479,8 +6377,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           // is the coldest memory in the process), and the next walk
           // would shed a block and ratchet the ceiling over the whole
           // resident set. Better not to hold it at all.
-          const bool wirable = !_wire_resident ||
-                               _wired_bytes + nb <= _wire_budget;
+          const bool wirable = _wire.wirable(nb);
           if (wirable && _resid.admit(_mc, nb)) {
             // Out of a SLOT the block has to be copied -- the slot is the
             // streamer's own destination and the next read needs it back.
@@ -6510,37 +6407,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               // Wired LAST, after every write this block will ever get:
               // mlock pins the pages that exist now, and interleave_gu_
               // above replaces buffers outright.
-              if (_wire_resident) {
-                const std::size_t got =
-                    wire_block_(_blocks[(std::size_t)Lx], true);
-                _wired_bytes += got;
-                // The percentage is an UP-TO, not a reservation. When
-                // mlock refuses, the box is not going to give us the
-                // rest of it -- another process holds wired memory, or
-                // the system limit is nearer than the fraction implied
-                // -- so the pool becomes what was actually granted and
-                // growth stops here rather than continuing to admit
-                // blocks nothing can protect.
-                if (got < nb) {
-                  // Hold HERE, for the rest of this forward only. The
-                  // box has just said no, so asking again on the next
-                  // block would be one failed syscall per block -- but
-                  // the refusal may have been another process spiking,
-                  // and a run that never asks again holds a small
-                  // resident set for the rest of the schedule on the
-                  // strength of one syscall. `_wire_retry` is what makes
-                  // the next forward ask again.
-                  _wire_budget = _wired_bytes;
-                  _wire_retry  = true;
-                  _wire_retry_at = _mc->memory_budget().available_physical;
-                  if (_mc->session() != nullptr) {
-                    _mc->session()->log_debug(fmt(
-                        "MetalMiniMaxH3Transformer: the box granted {} MB "
-                        "of the wired pool and refused more; holding there "
-                        "for this forward and retrying on the next",
-                        _wired_bytes >> 20));
-                  }
-                }
+              if (_wire.on()) {
+                _wire.note_wired(
+                    _mc, wire_block_(_blocks[(std::size_t)Lx], true), nb);
               }
               _resid.note_admitted(nb);
               if (_mc->session() != nullptr) {
@@ -6550,7 +6419,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                     "{} MB, {} MB wired; {} MB idle, {} MB compressed, "
                     "{} MB swap, reserve {} MB)", Lx,
                     _resid.count(), c.n_layers, _resid.bytes() >> 20,
-                    _wired_bytes >> 20,
+                    _wire.wired_bytes() >> 20,
                     mb.free_physical >> 20, mb.compressed >> 20,
                     mb.swap_used >> 20, _resid.reserve() >> 20));
               }

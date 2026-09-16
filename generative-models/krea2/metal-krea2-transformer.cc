@@ -1705,6 +1705,9 @@ void
 MetalKrea2Transformer::set_residency_schedule(int steps)
 {
   if (!_ws) { return; }
+  // A new run: a pool ceiling some earlier model collapsed may be asked
+  // about again. See WiredPool::retry.
+  _wire.new_run();
   const MetalLlamaWeights& src = _ws->src();
   const std::size_t blk = widest_block_bytes(
       src.tensor_names(),

@@ -56,9 +56,9 @@ final class Permissions: ObservableObject {
         let s = avState(.video)
         return PermissionRow(
             id: "camera",
-            title: "Camera",
-            detail: describe(s, when: "video-capture stages and live "
-                                    + "vision-model input"),
+            title: L("Camera"),
+            detail: describe(s, when: L("video-capture stages and live "
+                                      + "vision-model input")),
             state: s,
             request: s == .undetermined ? { [weak self] in
                 _ = await AVCaptureDevice.requestAccess(for: .video)
@@ -72,9 +72,9 @@ final class Permissions: ObservableObject {
         let s = avState(.audio)
         return PermissionRow(
             id: "microphone",
-            title: "Microphone",
-            detail: describe(s, when: "audio capture, transcription and "
-                                    + "audio tagging"),
+            title: L("Microphone"),
+            detail: describe(s, when: L("audio capture, transcription and "
+                                      + "audio tagging")),
             state: s,
             request: s == .undetermined ? { [weak self] in
                 _ = await AVCaptureDevice.requestAccess(for: .audio)
@@ -95,12 +95,12 @@ final class Permissions: ObservableObject {
     private func localNetworkRow() -> PermissionRow {
         PermissionRow(
             id: "localnetwork",
-            title: "Local Network",
+            title: L("Local Network"),
             detail: localNetworkProbed
-                ? "Probe sent. ONVIF camera discovery and RTSP streams "
-                + "need this; without it they find nothing."
-                : "Needed to discover ONVIF cameras, reach RTSP streams, "
-                + "and serve the web UI to your phone.",
+                ? L("Probe sent. ONVIF camera discovery and RTSP streams "
+                  + "need this; without it they find nothing.")
+                : L("Needed to discover ONVIF cameras, reach RTSP streams, "
+                  + "and serve the web UI to your phone."),
             state: localNetworkProbed ? .unknown : .undetermined,
             request: { [weak self] in await self?.probeLocalNetwork() },
             settingsURL: "x-apple.systempreferences:com.apple.preference"
@@ -141,13 +141,13 @@ final class Permissions: ObservableObject {
         }
         return PermissionRow(
             id: "fulldisk",
-            title: "Full Disk Access",
+            title: L("Full Disk Access"),
             detail: s == .granted
-                ? "Granted."
-                : "Optional. Only needed to read models or media from "
-                + "protected folders such as Desktop, Documents or an "
-                + "external volume. macOS has no way for an app to ask "
-                + "for this -- it has to be granted in System Settings.",
+                ? L("Granted.")
+                : L("Optional. Only needed to read models or media from "
+                  + "protected folders such as Desktop, Documents or an "
+                  + "external volume. macOS has no way for an app to ask "
+                  + "for this -- it has to be granted in System Settings."),
             state: s,
             request: nil,
             settingsURL: "x-apple.systempreferences:com.apple.preference"
@@ -156,10 +156,15 @@ final class Permissions: ObservableObject {
 
     private func describe(_ s: PermState, when: String) -> String {
         switch s {
-        case .granted:      return "Authorized."
-        case .denied:       return "Denied. Needed for \(when)."
-        case .undetermined: return "Not yet requested. Needed for \(when)."
-        case .unknown:      return "Unknown. Needed for \(when)."
+        case .granted:
+            return L("Authorized.")
+        case .denied:
+            return String(format: L("Denied. Needed for %@."), when)
+        case .undetermined:
+            return String(format: L("Not yet requested. Needed for %@."),
+                          when)
+        case .unknown:
+            return String(format: L("Unknown. Needed for %@."), when)
         }
     }
 

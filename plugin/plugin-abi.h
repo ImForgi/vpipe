@@ -68,6 +68,12 @@
 // memory_budget(), so every field after it moved. Both landed before any
 // plugin was rebuilt against 4, so no binary reports 4 and means only
 // the first.
+// FIVE: generative-models/shared/wired-pool.h's WiredPool became OPAQUE --
+// one pointer, every method out of line -- after its layout had changed
+// under a plugin that holds one as a member (SenseNova-U1.5). From here its
+// layout and method signatures are FROZEN like ane::Tier's below; its
+// open() options, info() fields, new methods and the policy itself grow
+// without a bump.
 // THE ANE TIER IS THE SAME SHAPE OF PROMISE, and was built that way so
 // new work never costs a bump. generative-models/shared/ane-tier.h
 // FREEZES ane::Binding, the signatures of ane::create/runtime_bytes and of
@@ -77,7 +83,7 @@
 // params key, a new binding name, a new info() field are all additions an
 // old plugin never asks for. Tier itself is one pointer with out-of-line
 // methods, so its layout is not compiled into anything.
-#define VPIPE_PLUGIN_ABI_VERSION 4u
+#define VPIPE_PLUGIN_ABI_VERSION 5u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

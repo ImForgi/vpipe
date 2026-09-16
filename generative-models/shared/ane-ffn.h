@@ -140,8 +140,9 @@ class AneFeedForward {
   static std::size_t runtime_bytes(int hidden, int ffn, int seq,
                                    int chunk) noexcept;
   // The same for a matmul tier, `in` -> `out` wide: the slot, CoreML's
-  // copy of it plus one chunk's activations, and one chunk of host rows at
-  // both widths.
+  // copy of it plus one chunk's activations, CoreML's own runtime buffers
+  // (~5/8 of the weights, whatever the chunk), and one chunk of host rows
+  // at both widths.
   static std::size_t matmul_runtime_bytes(int in, int out, int seq,
                                           int chunk) noexcept;
   // `env`'s value when it names a chunk in [256, 16384], else the default.
@@ -220,6 +221,10 @@ class AneFeedForward {
   struct OutSeg {
     const metal_compute::SharedBuffer* buf = nullptr;
     int width = 0;
+    // Row `r` of the input lands at row `row_offset + r` of this buffer --
+    // for an output that shares its plane with rows the split does not
+    // compute (FLUX.2's image q/k/v sit after the text rows).
+    std::size_t row_offset = 0;
   };
   int begin(const metal_compute::SharedBuffer& in,
             const std::vector<OutSeg>& outs, int seq);

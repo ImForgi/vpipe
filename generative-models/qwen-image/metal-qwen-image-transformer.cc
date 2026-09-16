@@ -489,6 +489,9 @@ MetalQwenImageTransformer::wire_retry_slack_() const
 void
 MetalQwenImageTransformer::set_residency_schedule(int steps)
 {
+  // A new run: a pool ceiling some earlier model collapsed may be asked
+  // about again. See WiredPool::retry.
+  _wire.new_run();
   if (!_ws) { return; }
   const MetalLlamaWeights& src = _ws->src();
   const std::size_t blk = widest_block_bytes(

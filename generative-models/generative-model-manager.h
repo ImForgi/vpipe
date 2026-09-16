@@ -501,7 +501,7 @@ public:
   // `pct` is an UP-TO, not a reservation. When mlock refuses -- another
   // process holds wired memory, or the system limit is nearer than the
   // fraction implies -- the pool collapses to what was actually granted
-  // (note_pool_refused) and callers stop asking for more. So the figure
+  // (note_wired_pool_refused) and callers stop asking for more. So the figure
   // is a ceiling on ambition, never a promise.
   //
   // 0 turns wiring off entirely and is the answer for a box where
@@ -549,6 +549,18 @@ public:
   // refused. 0 when wiring is off.
   std::size_t wired_pool_limit() const;
   std::size_t wired_pool_used() const;
+
+  // The CONFIGURED ceiling: the ask capped by the device maximum, before
+  // any refusal lowered it. wired_pool_limit() below this means the pool
+  // is collapsed -- by whichever model or tier met the refusal -- and a
+  // model that did not see it can tell, which is how it knows to ask
+  // again rather than live inside someone else's cap.
+  std::size_t wired_pool_ask() const;
+
+  // Collapse the ceiling to what is held now. What wire_into_pool() does
+  // on a real shortage; public so the policy built on it can be exercised
+  // without having to provoke the kernel.
+  void        note_wired_pool_refused();
 
   // Would `bytes` more fit? Asked before an allocation the caller could
   // still decline to make, so it does not have to be undone.

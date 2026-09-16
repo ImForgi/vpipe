@@ -44,6 +44,7 @@
 #include "common/session.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "stages/model-quantize-stage.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
@@ -2484,6 +2485,110 @@ TEST(minimax_h3_dit, baked_adaln_matches_the_projections)
                 den > 0.0 ? std::sqrt(num / den) : 0.0);
     EXPECT_TRUE(diff == 0);
   }
+}
+
+// A STREAMED STACK GROWS ITS WIRED RESIDENT SET, even inside a pool
+// ceiling an earlier refusal collapsed.
+//
+// Two ways this silently ran at the streaming floor:
+//   - every block carries buffers below the pool's 64 KB minimum, which
+//     are never wired, so a block always wires less than its resident
+//     size -- and H3's own copy of the pool logic read that as the box
+//     refusing, holding growth at one block per forward;
+//   - a ceiling collapsed before this model loaded was only ever reopened
+//     by the model that met the refusal, so this one lived inside it.
+// With wiring on, the first forward admits the whole stack; the pool must
+// still bound it, and destroying the model gives every byte back.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, streamed_blocks_are_kept_wired_across_forwards)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto* mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  const float kV[] = {0.9f, 0.5f, 0.15f};
+  const float kA[] = {0.8f, 0.45f, 0.1f};
+  const int kSteps = 3;
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+  std::vector<std::vector<float>> sched;
+  std::vector<std::vector<float>> uniqs(kSteps);
+  std::vector<std::vector<int>>   ridx(kSteps);
+  for (int i = 0; i < kSteps; ++i) {
+    h3::build_row_timesteps(L, kV[i], kA[i], 1.0f, &uniqs[(std::size_t)i],
+                            &ridx[(std::size_t)i]);
+    sched.push_back(uniqs[(std::size_t)i]);
+  }
+
+  const std::size_t kPool = 8ull << 30;
+  mgr->set_wired_pool_bytes(kPool);
+  // An earlier model met a refusal with nothing wired: the ceiling this
+  // model loads into is one byte.
+  mgr->note_wired_pool_refused();
+  int kept_first = -1, kept_last = -1;
+  {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg,
+                                             /*stream_blocks=*/true);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { mgr->set_wired_pool_pct(0); return; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    // A zero reserve is an answer: this test frees the model itself.
+    m->set_residency_reserve(0);
+    std::string berr;
+    ASSERT_TRUE(m->bake_adaln(sched, &berr));
+    for (int i = 0; i < kSteps; ++i) {
+      MetalMiniMaxH3Transformer::Step st;
+      st.video = &vb;  st.audio = &ab;  st.text = &tb;
+      st.layout = &L;
+      st.timesteps          = &uniqs[(std::size_t)i];
+      st.row_timestep_index = &ridx[(std::size_t)i];
+      st.schedule_index     = i;
+      std::string ferr;
+      const auto v = m->forward(st, &ferr);
+      ASSERT_TRUE(!v.empty());
+      if (v.empty()) { break; }
+      const int kept = m->resident_block_count();
+      if (i == 0) { kept_first = kept; }
+      kept_last = kept;
+      std::printf("[minimax_h3_dit] forward %d: %d of %d blocks resident, "
+                  "pool %zu of %zu MB\n", i, kept, cfg.n_layers,
+                  mgr->wired_pool_used() >> 20,
+                  mgr->wired_pool_limit() >> 20);
+      EXPECT_TRUE(mgr->wired_pool_used() <= mgr->wired_pool_limit());
+    }
+  }
+  EXPECT_TRUE(kept_first == cfg.n_layers);
+  EXPECT_TRUE(kept_last == cfg.n_layers);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
 }
 
 // The ANE feed-forward tier against the GPU alone, over the same forward.

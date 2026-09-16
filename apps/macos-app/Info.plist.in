@@ -8,6 +8,18 @@
   <key>CFBundleIdentifier</key>        <string>@VPIPE_APP_BUNDLE_ID@</string>
   <key>CFBundleExecutable</key>        <string>vpipe</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
+  <!-- The languages the app itself is translated into. Without this
+       macOS treats the bundle as English-only: it will not offer the
+       app in Language & Region's per-app list, and a system set to
+       Chinese still gets English. The .lproj directories alone are not
+       enough. Keep in step with Localizations/. -->
+  <key>CFBundleDevelopmentRegion</key>      <string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+    <string>zh-Hant</string>
+  </array>
   <key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
   <key>CFBundleVersion</key>           <string>@VPIPE_APP_BUILD@</string>
   <key>LSMinimumSystemVersion</key>    <string>@CMAKE_OSX_DEPLOYMENT_TARGET@</string>

@@ -2030,29 +2030,187 @@ TEST(model_memory, a_refused_wiring_stops_growth_and_the_retry_is_capped)
 
   // A REAL partial grant: the box gave less than the block asked for AND
   // the pool cannot take the rest -- here because memory wired on the
-  // process's behalf fills it.
-  mgr->charge_external_wired(8ull << 20);
+  // process's behalf fills it, and the box collapsed the ceiling there.
+  mgr->charge_external_wired(6ull << 20);
+  mgr->note_wired_pool_refused();                 // collapsed at 6 of 8 MB
   w.note_wired(mc, got, want);
   EXPECT_TRUE(w.wired_bytes() == got);
-  // Budget is now exactly what was granted, so nothing further is
-  // admissible: growth stops on the spot rather than one failed mlock
-  // per block for the rest of the schedule.
+  // Nothing further is admissible: growth stops on the spot rather than
+  // one failed mlock per block for the rest of the schedule.
   EXPECT_TRUE(w.budget() == got);
   EXPECT_FALSE(w.wirable(1));
 
-  // The retry is gated on the box having freed a block's worth SINCE the
-  // refusal, so asking with a huge block never fires -- a genuinely full
-  // box is never asked, because reopening the ceiling would let the mlock
-  // behind it fail and leave a block resident but unwired.
+  // The retry of THIS model's refusal is gated on the box having freed a
+  // block's worth SINCE, so asking with a huge block never fires -- a
+  // genuinely full box is never asked, because reopening the ceiling would
+  // let the mlock behind it fail and leave a block resident but unwired.
   EXPECT_FALSE(w.retry(mc, (std::size_t)1 << 60));
-  EXPECT_TRUE(w.budget() == got);
+  EXPECT_TRUE(mgr->wired_pool_limit() < mgr->wired_pool_ask());
+  EXPECT_FALSE(w.wirable(1));
 
   // And however it goes, the budget never passes the pool's own limit.
   w.retry(mc, 0);
-  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit());
-  EXPECT_TRUE(w.wired_bytes() <= w.budget());
+  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit() + w.wired_bytes());
+  EXPECT_TRUE(mgr->wired_pool_limit() <= mgr->wired_pool_ask());
 
-  mgr->release_external_wired(8ull << 20);
+  mgr->release_external_wired(6ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
+}
+
+// THE GATE READS THE POOL AS IT IS NOW. A budget snapshotted at load kept
+// whatever a peer held at that moment out of the model's reach for its
+// whole life -- a model loaded while its predecessor was still being torn
+// down stayed capped by bytes that were already gone.
+TEST(model_memory, the_wire_gate_follows_the_pool_live)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  // A peer holds most of the pool when this model loads.
+  mgr->charge_external_wired(6ull << 20);
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) {
+    mgr->release_external_wired(6ull << 20);
+    mgr->set_wired_pool_pct(0);
+    return;
+  }
+  EXPECT_FALSE(w.wirable(4ull << 20));
+  // The peer lets go: the room is this model's at once.
+  mgr->release_external_wired(6ull << 20);
+  EXPECT_TRUE(w.wirable(4ull << 20));
+  EXPECT_TRUE(w.budget() == kAsk);
+  // And a peer arriving later takes it back.
+  mgr->charge_external_wired(kAsk);
+  EXPECT_FALSE(w.wirable(1));
+  mgr->release_external_wired(kAsk);
+  mgr->set_wired_pool_pct(0);
+}
+
+// THE SET API, THE REPORT, AND THE OPAQUE HANDLE. wire_set() is the loop
+// every model used to write for itself -- wire in order, skip what is too
+// small to be a pool question, STOP at a real refusal and keep what is
+// wired -- and info() is how a plugin reads the pool without reaching past
+// this class. WiredPool is one pointer, so a moved-from handle must stay
+// callable and an `enabled: false` option must keep it closed.
+TEST(model_memory, a_wire_set_stops_at_the_refusal_and_reports_it)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  namespace acc = genai::accel;
+  namespace wp = genai::wired_pool;
+
+  const std::size_t kAsk = 4ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  genai::WiredPool w;
+  FlexData opts = FlexData::make_object();
+  acc::set_text(&opts, wp::kTag, "test-pool");
+  w.open(mc, opts);
+  if (!w.on()) { mgr->set_wired_pool_pct(0); return; }
+
+  // 3 MB fits, the next 3 MB does not, and the tiny one after it is never a
+  // pool question either way.
+  auto a = mc->make_shared_buffer(3ull << 20);
+  auto b = mc->make_shared_buffer(3ull << 20);
+  auto t = mc->make_shared_buffer(64);
+  metal_compute::SharedBuffer* set[] = {&a, nullptr, &b, &t};
+  const std::size_t got = w.wire_set(set, true);
+  // An mlock the box refuses outright (a tight RLIMIT_MEMLOCK) wires
+  // nothing and says nothing about the set logic; only check what did wire.
+  if (got > 0) {
+    EXPECT_TRUE(got == (3ull << 20));
+    EXPECT_TRUE(a.is_wired());
+    EXPECT_FALSE(b.is_wired());
+    const FlexData inf = w.info();
+    EXPECT_TRUE(acc::flag(&inf, wp::kInfoOn));
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoLastRefused, 0) ==
+                (long long)(3ull << 20));
+    EXPECT_TRUE(acc::flag(&inf, wp::kInfoRetryArmed));
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoRefusals, 0) >= 1);
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoPoolAsk, 0) == (long long)kAsk);
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoPoolUsed, 0) ==
+                (long long)(3ull << 20));
+  }
+  // wire_set does not book: that is note_wired's decision.
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+  // Unwiring the set gives the pool back everything it took.
+  EXPECT_TRUE(w.wire_set(set, false) == got);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  // A moved-from handle stays callable and inert; the moved-to one works.
+  genai::WiredPool v(std::move(w));
+  EXPECT_FALSE(w.on());
+  EXPECT_TRUE(w.wirable(1));
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(w.wire_set(set, true) == 0u);
+  EXPECT_TRUE(v.on());
+
+  // Asked to stay out, it stays out even with the manager's pool on.
+  genai::WiredPool off;
+  FlexData no = FlexData::make_object();
+  acc::set_flag(&no, wp::kEnabled, false);
+  if (std::getenv("VPIPE_WIRE_RESIDENT") == nullptr) {
+    off.open(mc, no);
+    EXPECT_FALSE(off.on());
+    EXPECT_TRUE(off.wirable((std::size_t)1 << 60));
+  }
+  mgr->set_wired_pool_pct(0);
+}
+
+// A CEILING SOMEONE ELSE COLLAPSED IS ASKED ABOUT ONCE PER RUN. The model
+// that met the refusal is the only one with a retry armed, so a model
+// loaded afterwards used to live inside that cap for its whole life -- and
+// so did every model after it, since none of them had refused anything.
+TEST(model_memory, an_inherited_pool_cap_is_reopened_once_per_run)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  mgr->charge_external_wired(2ull << 20);
+  mgr->note_wired_pool_refused();                 // an earlier refusal
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) {
+    mgr->release_external_wired(2ull << 20);
+    mgr->set_wired_pool_pct(0);
+    return;
+  }
+  EXPECT_TRUE(mgr->wired_pool_limit() == (2ull << 20));
+  EXPECT_FALSE(w.wirable(1ull << 20));
+
+  // First forward of a run: reopened, whatever the box's free reading.
+  w.new_run();
+  EXPECT_TRUE(w.retry(mc, (std::size_t)1 << 60));
+  EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+  EXPECT_TRUE(w.wirable(1ull << 20));
+
+  // Collapsed again within the same run: not asked again until the next.
+  mgr->note_wired_pool_refused();
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(mgr->wired_pool_limit() == (2ull << 20));
+  w.new_run();
+  EXPECT_TRUE(w.retry(mc, 0));
+  EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+
+  // Nothing collapsed: nothing to reopen, and no reopen reported.
+  w.new_run();
+  EXPECT_FALSE(w.retry(mc, 0));
+
+  mgr->release_external_wired(2ull << 20);
   EXPECT_TRUE(mgr->wired_pool_used() == 0u);
   mgr->set_wired_pool_pct(0);
 }

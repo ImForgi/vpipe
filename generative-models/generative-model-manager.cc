@@ -240,6 +240,13 @@ GenerativeModelManager::set_wired_pool_bytes(std::size_t bytes)
 }
 
 void
+GenerativeModelManager::note_wired_pool_refused()
+{
+  const std::size_t used = _pool_used.load(std::memory_order_relaxed);
+  _pool_granted.store(used > 0 ? used : 1, std::memory_order_relaxed);
+}
+
+void
 GenerativeModelManager::reopen_wired_pool()
 {
   // Only the CEILING is reset. `_pool_used` is what is really wired and
@@ -520,7 +527,7 @@ GenerativeModelManager::wired_pool_pct() const
 }
 
 std::size_t
-GenerativeModelManager::wired_pool_limit() const
+GenerativeModelManager::wired_pool_ask() const
 {
   // The ASK: an absolute figure when one was given, else the share of
   // the box. Zero either way turns wiring off entirely, which is a
@@ -540,6 +547,14 @@ GenerativeModelManager::wired_pool_limit() const
   // failures it can actually diagnose.
   const std::size_t devmax = wired_pool_device_max();
   if (devmax > 0 && ask > devmax) { ask = devmax; }
+  return ask;
+}
+
+std::size_t
+GenerativeModelManager::wired_pool_limit() const
+{
+  const std::size_t ask = wired_pool_ask();
+  if (ask == 0) { return 0; }
   // Then whatever the box turned out to grant. Recorded only after an
   // mlock refusal, and never above the ask -- an operator lowering the
   // limit must not be overruled by a ceiling discovered when it was
@@ -687,7 +702,7 @@ GenerativeModelManager::wire_into_pool(metal_compute::SharedBuffer& b)
     // this is the box saying what it will actually give. reopen_wired_pool
     // is how a caller asks again later.
     const std::size_t used = _pool_used.load(std::memory_order_relaxed);
-    _pool_granted.store(used > 0 ? used : 1, std::memory_order_relaxed);
+    note_wired_pool_refused();
     // WARN, not info: every later request fails too until a reopen, and
     // the run loses protection it was configured for. WHAT was refused is
     // named, in bytes, because that is what says why.

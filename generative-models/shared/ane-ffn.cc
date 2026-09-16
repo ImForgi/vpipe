@@ -264,7 +264,11 @@ AneFeedForward::matmul_runtime_bytes(int in, int out, int seq,
   (void)seq;       // the host term is one chunk whatever the sequence
   const std::size_t weights = k * n * 2;
   const std::size_t staging = weights + c * (k + n) * 2;
-  return weights + staging + c * (k + n) * 2;
+  // What CoreML holds past the slot and its staged copy: MEASURED 0.54x
+  // the weights at 4096 -> 36864 (chunks 2048 and 3072 alike) and 0.58x at
+  // 4096 -> 12288, independent of the chunk. Booked at 5/8.
+  const std::size_t runtime = weights * 5 / 8;
+  return weights + staging + runtime + c * (k + n) * 2;
 }
 
 int
@@ -671,6 +675,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
   struct Seg {
     std::uint16_t* p = nullptr;
     std::size_t    w = 0, c0 = 0;
+    std::size_t    r0 = 0;       // OutSeg::row_offset
   };
   std::vector<Seg> segs;
   std::size_t wsum = 0;
@@ -679,7 +684,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
       return 0;
     }
     segs.push_back({static_cast<std::uint16_t*>(o.buf->contents()),
-                    (std::size_t)o.width, wsum});
+                    (std::size_t)o.width, wsum, o.row_offset});
     wsum += (std::size_t)o.width;
   }
   if (_in.empty() || _out.empty() || in_p == nullptr || segs.empty() ||
@@ -802,7 +807,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
         for (std::size_t r = r0; r < r1; ++r) {
           const _Float16* orow = o16 + r * ow;
           for (const Seg& sg : segs) {
-            std::uint16_t* d = sg.p + (rbase + r) * sg.w;
+            std::uint16_t* d = sg.p + (sg.r0 + rbase + r) * sg.w;
             for (std::size_t cc = 0; cc < sg.w; ++cc) {
               const float f = (float)orow[sg.c0 + cc] * up;
               std::uint32_t bits = 0;

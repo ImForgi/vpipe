@@ -169,6 +169,16 @@ add_custom_target(vpipe-app-swift DEPENDS ${VPIPE_APP_SWIFT_EXE})
 # notices.
 set(VPIPE_APP_RES ${CMAKE_CURRENT_BINARY_DIR}/Resources)
 
+# ---- localizations ---------------------------------------------------
+# Localizations/<lang>.lproj/Localizable.strings, staged verbatim. The
+# keys are the English text itself (see Sources/Localize.swift), so a
+# language with no entry for a string falls back to readable English
+# rather than to a symbol. Listed here so editing a translation
+# re-stages the resources.
+file(GLOB VPIPE_APP_LPROJ
+     ${CMAKE_CURRENT_SOURCE_DIR}/Localizations/*.lproj/*.strings)
+set(_lproj_files ${VPIPE_APP_LPROJ})
+
 # ---- license notices -------------------------------------------------
 # The bundle carries the licence of everything binary inside it. FFmpeg
 # and LAME are LGPL-2.1, which REQUIRES shipping a copy of the licence
@@ -332,6 +342,11 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory ${VPIPE_APP_RES}/Licenses
     COMMAND ${CMAKE_COMMAND} -E copy
             ${VPIPE_APP_ICON} ${VPIPE_APP_RES}/AppIcon.icns
+    # The .lproj directories go in whole: bundle-app.sh copies the
+    # staged tree with `cp -R`, and NSBundle looks up <lang>.lproj by
+    # name inside Contents/Resources.
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/Localizations ${VPIPE_APP_RES}
     COMMAND ${CMAKE_COMMAND} -E copy
             ${CMAKE_CURRENT_BINARY_DIR}/NOTICE.txt
             ${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md
@@ -344,7 +359,8 @@ add_custom_command(
             ${CMAKE_CURRENT_BINARY_DIR}/resources.stamp
     DEPENDS ${_lic_files} ${CMAKE_CURRENT_BINARY_DIR}/NOTICE.txt
             ${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md ${VPIPE_APP_ICON}
-    COMMENT "Staging Vpipe Manager icon + licences"
+            ${_lproj_files}
+    COMMENT "Staging Vpipe Manager icon + licences + localizations"
     VERBATIM)
 
 # ---------------------------------------------------------------------

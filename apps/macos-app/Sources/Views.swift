@@ -337,8 +337,9 @@ struct SettingsPane: View {
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("Only this Mac can reach the server, and no access "
-                         + "key is required.")
+                    Text(LocalizedStringKey(
+                         "Only this Mac can reach the server, and no access "
+                         + "key is required."))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 // grouping(.never): a port is an identifier, not a
@@ -347,10 +348,11 @@ struct SettingsPane: View {
                 TextField("Port", value: $model.port,
                           format: .number.grouping(.never))
                 Toggle("HTTPS (Self-Signed)", isOn: $model.useTLS)
-                Text("Needed for the low-latency Preview view on other "
+                Text(LocalizedStringKey(
+                     "Needed for the low-latency Preview view on other "
                      + "devices: browsers only allow WebCodecs in a secure "
                      + "context. The certificate is self-signed, so the "
-                     + "browser shows a one-time warning to accept.")
+                     + "browser shows a one-time warning to accept."))
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -386,9 +388,10 @@ struct SettingsPane: View {
                 }
                 .disabled(model.exposeNativeFS)
 
-                Text("Real folders outside the sandbox that stages may "
+                Text(LocalizedStringKey(
+                     "Real folders outside the sandbox that stages may "
                      + "reach by their real path. Ignored while access to "
-                     + "the whole filesystem is allowed.")
+                     + "the whole filesystem is allowed."))
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -413,8 +416,9 @@ struct SettingsPane: View {
                     .fixedSize(horizontal: false, vertical: true)
                 LabeledContent("Command-Line Tools") {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("The app drives these two binaries; the same "
-                             + "commands work in a terminal.")
+                        Text(LocalizedStringKey(
+                             "The app drives these two binaries; the same "
+                             + "commands work in a terminal."))
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack {
@@ -435,10 +439,11 @@ struct SettingsPane: View {
                 LabeledContent("Legal") {
                     VStack(alignment: .leading, spacing: 4) {
                         Button("Third-Party Notices…") { showLicenses = true }
-                        Text("This app bundles FFmpeg and other open-source "
+                        Text(LocalizedStringKey(
+                             "This app bundles FFmpeg and other open-source "
                              + "software. FFmpeg is used under the LGPL and "
                              + "may be replaced with your own build — see "
-                             + "the notices, and the FFmpeg setting above.")
+                             + "the notices, and the FFmpeg setting above."))
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -669,8 +674,8 @@ struct PipelinePane: View {
 
             if runner.stopping {
                 Button("Force Quit") { runner.forceStop() }
-                Text("Force-quit automatically after "
-                     + "\(Int(PipelineRunner.stopGrace))s.")
+                let grace = String(Int(PipelineRunner.stopGrace))
+                Text("Force-quit automatically after \(grace)s.")
                     .font(.caption).foregroundStyle(Color.secondary)
             }
 
@@ -735,9 +740,10 @@ struct PipelinePane: View {
                     }
                     .toggleStyle(.checkbox)
                 }
-                Text("Checked plugins are passed to the run and stay "
+                Text(LocalizedStringKey(
+                     "Checked plugins are passed to the run and stay "
                      + "loaded for it. Changing them applies to the next "
-                     + "run, not the one going now.")
+                     + "run, not the one going now."))
                     .font(.caption).foregroundStyle(Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -756,9 +762,8 @@ struct PipelinePane: View {
     private var missingPluginsRow: some View {
         if !missingPlugins.isEmpty {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("Not in this folder: "
-                     + missingPlugins.joined(separator: ", ")
-                     + " — skipped when running.")
+                let names = missingPlugins.joined(separator: ", ")
+                Text("Not in this folder: \(names) — skipped when running.")
                     .font(.caption).foregroundStyle(Color.orange)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Forget") {
@@ -823,8 +828,9 @@ struct PipelinePane: View {
                 if let s = selection { runInTerminal(s) }
             }
             .disabled(selection == nil)
-            Text("Runs the same command in Terminal, for pipelines that "
-                 + "need a real terminal.")
+            Text(LocalizedStringKey(
+                 "Runs the same command in Terminal, for pipelines that "
+                 + "need a real terminal."))
                 .font(.caption).foregroundStyle(Color.secondary)
             Spacer()
         }
@@ -871,8 +877,13 @@ struct PipelinePane: View {
             .padding(.vertical, 1)
             .background(Color.orange.opacity(0.15))
             .clipShape(Capsule())
-            .help("Contains " + f.composerStages.joined(separator: ", ")
-                  + " — needs the web UI to finish.")
+            .help(composerHelp(f))
+    }
+
+    private func composerHelp(_ f: PipelineFile) -> String {
+        let stages = f.composerStages.joined(separator: ", ")
+        return String(format: L("Contains %@ — needs the web UI to "
+                              + "finish."), stages)
     }
 
     @ViewBuilder
@@ -951,9 +962,11 @@ struct WebUIPane: View {
                     // offer the escalation directly.
                     if server.stopping {
                         Button("Force Quit") { server.forceStop() }
-                        Text("Waiting for the server to shut down. It "
+                        let grace = String(Int(WebUIServer.stopGrace))
+                        Text(String(format: L(
+                             "Waiting for the server to shut down. It "
                              + "will be force-quit automatically after "
-                             + "\(Int(WebUIServer.stopGrace)) seconds.")
+                             + "%@ seconds."), grace))
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -985,14 +998,16 @@ struct WebUIPane: View {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Reachable from other devices on this "
-                                 + "network")
+                            Text(LocalizedStringKey(
+                                 "Reachable from other devices on this "
+                                 + "network"))
                                 .font(.callout.weight(.medium))
-                            Text("Anyone who reaches this server and has the "
+                            Text(LocalizedStringKey(
+                                 "Anyone who reaches this server and has the "
                                  + "access key can start and stop pipelines, "
                                  + "browse the sandbox and drive models on "
                                  + "this Mac. Only enable it on a network you "
-                                 + "trust; change it under Settings ▸ Web UI.")
+                                 + "trust; change it under Settings ▸ Web UI."))
                                 .font(.caption).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -1019,15 +1034,17 @@ struct WebUIPane: View {
                                     .font(.system(.title3, design: .monospaced))
                                     .bold()
                             }
-                            Text("This Mac connects without a key. Other "
-                                 + "devices must supply it.")
+                            Text(LocalizedStringKey(
+                                 "This Mac connects without a key. Other "
+                                 + "devices must supply it."))
                                 .font(.caption).foregroundStyle(.secondary)
                             if c.qr_link != nil {
-                                Text("Scanning the code opens the UI already "
+                                Text(LocalizedStringKey(
+                                     "Scanning the code opens the UI already "
                                      + "signed in and removes the key from "
                                      + "the address bar. The code is a "
                                      + "secret in a link — it is only as "
-                                     + "private as this screen.")
+                                     + "private as this screen."))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1108,10 +1125,11 @@ struct PermissionsPane: View {
 
     var body: some View {
         VStack(alignment: .leading) {
-            Text("These are the permissions the pipeline stages need. "
+            Text(LocalizedStringKey(
+                 "These are the permissions the pipeline stages need. "
                  + "Granting them here grants them to vpipe itself — run "
                  + "from a terminal instead, macOS attributes them to the "
-                 + "terminal application.")
+                 + "terminal application."))
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)

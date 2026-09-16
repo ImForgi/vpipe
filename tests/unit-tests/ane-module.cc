@@ -3434,6 +3434,9 @@ TEST(ane_tier, memory_it_holds_and_where)
   const int seq = envi("VPIPE_ANE_MEM_PROBE_SEQ", 8160);
   const int chunk = envi("VPIPE_ANE_MEM_PROBE_CHUNK", 2048);
   const bool gelu = envi("VPIPE_ANE_MEM_PROBE_GELU", 1) != 0;
+  // _MATMUL: one projection _HID -> _FFN instead (e.g. FLUX.2-klein-9B's
+  // single-block to_qkv_mlp_proj, 4096 -> 36864).
+  const bool matmul = std::getenv("VPIPE_ANE_MEM_PROBE_MATMUL") != nullptr;
   vpipe::Session sess;
   vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr || !mc->valid()) { return; }
@@ -3459,7 +3462,9 @@ TEST(ane_tier, memory_it_holds_and_where)
   const auto bu = bf16((std::size_t)F, 0.1f);
   const auto bd = bf16((std::size_t)H, 0.1f);
   const auto x  = bf16((std::size_t)seq * H, 0.5f);
-  auto y = mc->make_shared_buffer((std::size_t)seq * H * 2);
+  const auto ww = bf16(matmul ? (std::size_t)F * H : 1,
+                       1.0f / std::sqrt((float)H));
+  auto y = mc->make_shared_buffer((std::size_t)seq * (matmul ? F : H) * 2);
 
   struct Snap {
     const char* what;
@@ -3473,8 +3478,13 @@ TEST(ane_tier, memory_it_holds_and_where)
 
   auto spec = tier_spec_("ffn", gelu ? "gelu_tanh" : "swiglu", H, F, seq,
                          chunk);
-  acc::set_flag(&spec, ane::kBiases, gelu);
+  acc::set_flag(&spec, ane::kBiases, gelu && !matmul);
   acc::set_real(&spec, ane::kRows, 0.75);
+  if (matmul) {
+    acc::set_text(&spec, ane::kKind, std::string(ane::kKindMatmul));
+    acc::set_integer(&spec, ane::kInWidth, H);
+    acc::set_integer(&spec, ane::kOutWidth, F);
+  }
   std::string why;
   auto tier = ane::create(&sess, mc, spec, &why);
   if (tier == nullptr) {
@@ -3489,8 +3499,11 @@ TEST(ane_tier, memory_it_holds_and_where)
   const std::string nd_ = ane::key(ane::kProjDown, "w");
   const std::string nub = ane::key(ane::kProjUp, "bias");
   const std::string ndb = ane::key(ane::kProjDown, "bias");
+  const std::string nw = ane::key(ane::kProjW, "w");
   std::vector<ane::Binding> wb = {{nu, &wu}, {nd_, &wd}};
-  if (gelu) {
+  if (matmul) {
+    wb = {{nw, &ww}};
+  } else if (gelu) {
     wb.push_back({nub, &bu});
     wb.push_back({ndb, &bd});
   } else {
@@ -3519,7 +3532,8 @@ TEST(ane_tier, memory_it_holds_and_where)
   auto mb = [](std::size_t v) { return (long long)(v >> 20); };
   std::printf("[ane_tier] mem probe %s %dx%d, seq %d, chunk %d, %d ANE rows; "
               "tier estimate %lld MB (host rows %lld MB)\n",
-              gelu ? "gelu" : "swiglu", H, F, seq, chunk, a,
+              matmul ? "matmul" : gelu ? "gelu" : "swiglu", H, F, seq, chunk,
+              a,
               mb(ane::runtime_bytes(spec)),
               (long long)(acc::integer(&inf, ane::kInfoHostBytes, 0) >> 20));
   std::printf("[ane_tier]   %-10s %10s %10s %10s %10s %10s\n", "step",

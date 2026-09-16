@@ -60,7 +60,7 @@ struct VpipeApp: App {
                 // into a Text goes through LocalizedStringKey, which
                 // formats it as a QUANTITY and renders 9876 as "9,876".
                 // A port is an identifier.
-                Text("Serving on Port " + String(c.port))
+                Text("Serving on Port \(String(c.port))")
                 Text("Access Key: \(c.key)")
                 Button("Open in Browser") { server.openInBrowser() }
                 Button("Copy Access Key") {
@@ -240,9 +240,10 @@ struct RootView: View {
     private var missingHelperBanner: some View {
         let missing = BundlePaths.missingHelpers
         if !missing.isEmpty {
-            Text("This build is incomplete — missing: "
-                 + missing.map { ($0 as NSString).lastPathComponent }
-                          .joined(separator: ", "))
+            let names = missing
+                .map { ($0 as NSString).lastPathComponent }
+                .joined(separator: ", ")
+            Text("This build is incomplete — missing: \(names)")
                 .font(.callout)
                 .padding(8)
                 .frame(maxWidth: .infinity)

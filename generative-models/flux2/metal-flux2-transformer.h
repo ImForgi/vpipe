@@ -7,6 +7,7 @@
 #include "generative-models/shared/runtime-lora.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -101,7 +102,62 @@ class MetalFlux2Transformer {
     // Isolating the references is also what makes their K/V independent of
     // the denoising step, which is what KvCache then exploits.
     bool  klein_kv = false;
+
+    // ---- the ANE tier (generate-image's `ane_ffn`) ---------------------
+    //
+    // Row splits on the shared runtime-weight machinery (shared/ane-ffn.h),
+    // armed on the first forward:
+    //   * the double blocks' image SwiGLU feed-forward;
+    //   * with `ane_qkv`, the double blocks' image q|k|v, stacked;
+    //   * the single blocks' to_qkv_mlp_proj -- q|k|v and the MLP's
+    //     gate|up, the single block's widest projection -- as one matmul
+    //     scattered into its five planes, the SwiGLU then on the GPU.
+    // A null `session` is OFF. `ane_rows` is the ANE's share of a split's
+    // rows (0 = balanced from measured rates, and a split the GPU beats
+    // turns itself off); `ane_layers` caps the blocks that use it, counted
+    // double then single (0 = all). to_out stays on the GPU: it reads the
+    // attention output as well as the MLP, which no row split can hand
+    // over before the attention has run.
+    const SessionContextIntf* session = nullptr;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
+    bool  ane_qkv    = false;
   };
+
+  // What the ANE tiers hold for `cfg`, summed over the ones it turns on: the
+  // weight slots, staging and one chunk of host rows each. Independent of
+  // the clip, so a plan-time claim can ask it. A config whose derived FF
+  // widths are still 0 (before load) uses `mlp_ratio`, which is how the
+  // checkpoint builds them.
+  // `image_rows` is the clip's image token count when the caller knows it
+  // (width/16 * height/16); it sizes the chunk, and so the host rows.
+  static std::size_t ane_runtime_bytes(const Config& cfg,
+                                       int image_rows = 0) noexcept;
+  // The chunk a tier over `rows` predicts in. With the share left to the
+  // tier (ane_rows 0) and no VPIPE_FLUX2_ANE_CHUNK, ONE chunk of 62.5% of the
+  // rows, rounded up to 256: MEASURED on klein-9B at 1024x1024 (M4 Pro), the
+  // GPU half was the slow one at 50%, and a smaller chunk to move rows over
+  // cost the ANE ~25% per row -- one 2560-row chunk took the double stack
+  // 1.70 s -> 1.53 s and the forward 8.0 s -> 7.6 s. Never above
+  // ane_chunk_cap(): past it the tier takes several chunks. A pinned share
+  // keeps the fixed chunk, which it is a multiple of.
+  static int ane_chunk_for_(int rows, float ane_rows) noexcept;
+  // The most rows one chunk may hold (VPIPE_FLUX2_ANE_CHUNK_MAX overrides):
+  // what bounds each tier's host rows and module shape. See ane_chunk_for_.
+  static constexpr int kAneChunkCap = 3072;
+  static int ane_chunk_cap() noexcept;
+  // The structural dims (heads, head dim -> hidden, block counts, mlp_ratio)
+  // from `model_dir`/config.json into `cfg`, for a caller sizing the model
+  // before it loads. False when the file is missing or unreadable; `cfg`
+  // then keeps what it held.
+  static bool read_dims(const std::string& model_dir, Config* cfg);
+  static int ane_chunk_rows() noexcept;
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept
+  {
+    return _ane_dff != nullptr || _ane_dqkv != nullptr ||
+           _ane_sproj != nullptr;
+  }
 
   // What a CALLER chooses for a FLUX.2 run, as against Config, which is
   // read from the checkpoint. It lives here rather than in the driving
@@ -427,6 +483,24 @@ class MetalFlux2Transformer {
   // must be rebuilt out of the raw tensor after every read.
   bool load_single_(WeightSet& ws, const std::string& pre,
                     SingleBlock& b, Retain r, bool keep_split = false);
+
+  // ---- the ANE tiers (Config::session) ----------------------------------
+  // Built together on the first forward, each of them only where it has a
+  // chunk of rows and something stageable: the double feed-forward and
+  // q|k|v over the image rows, the single projection over the joint rows.
+  std::unique_ptr<AneFeedForward> _ane_dff, _ane_dqkv, _ane_sproj;
+  bool _ane_tried  = false;
+  bool _ane_warned = false;
+  void ane_setup_(int image_rows, int joint_rows);
+  // Blocks are counted double then single against `ane_layers`.
+  bool ane_layer_ok_(int flat) const noexcept;
+  static bool ane_stageable_(const QWeight& q) noexcept;
+  bool ane_dff_ok_(int L, const DoubleBlock& b);
+  bool ane_dqkv_ok_(const DoubleBlock& b) const noexcept;
+  bool ane_sproj_ok_(const SingleBlock& b) const noexcept;
+  void ane_stage_dff_(int L, const DoubleBlock& b);
+  void ane_stage_dqkv_(int L, const DoubleBlock& b);
+  void ane_stage_sproj_(int L, const SingleBlock& b);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

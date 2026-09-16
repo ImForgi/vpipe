@@ -8,6 +8,7 @@
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
@@ -1369,23 +1370,11 @@ class MetalMiniMaxH3Transformer {
   // set on demand in forward() and freed after use.
   std::vector<Block> _blocks;
   bool _stream_blocks = false;
-  // Wiring the resident set, and the ceiling on it. Wired pages cannot
-  // be reclaimed AT ALL, so this is bounded by a fraction of RAM rather
-  // than by the admission gate alone: admission spends `available_
-  // physical`, which counts file cache, and cache yields to an
-  // allocation -- wired memory yields to nothing.
   // Said once when a checkpoint needs per-tensor repair on the refill
   // path, so a pack that pays for it every forward is visible.
   bool        _refill_repaired = false;
-  bool        _wire_resident = false;
-  std::size_t _wired_bytes   = 0;
-  std::size_t _wire_budget   = 0;
-  // The box refused mid-forward; ask again at the next one. See the
-  // retry in forward() and GenerativeModelManager::reopen_wired_pool.
-  bool        _wire_retry    = false;
-  // available_physical when the box refused, so a retry can ask whether
-  // it has actually freed anything since rather than asking blind.
-  std::size_t _wire_retry_at = 0;
+  // This model's window onto the manager's wired pool (shared/wired-pool.h).
+  WiredPool   _wire;
   metal_compute::SharedBuffer _final_norm;
   Linear _final_adaln, _video_out, _audio_out;
 

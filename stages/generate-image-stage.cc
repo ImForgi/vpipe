@@ -1152,6 +1152,23 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
+  // FLUX.2's tiers -- the double feed-forward (and q|k|v) and the single
+  // projection -- are fixed modules too, summed into ONE unit: granted
+  // together or not at all. Sized from the checkpoint's own dims, since the
+  // klein-4B and -9B modules differ by ~1.8x.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "flux2") {
+    genai::MetalFlux2Transformer::Config fc;
+    (void)genai::MetalFlux2Transformer::read_dims(dit, &fc);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalFlux2Transformer::ane_runtime_bytes(
+                 fc, ((_width > 0 ? _width : 1024) / 16) * ((_height > 0 ? _height : 1024) / 16)),
+             1,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   return out;
 }
 
@@ -1515,6 +1532,31 @@ GenerateImageStage::ensure_loaded_()
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
     fcfg.sage = _sage;
+    // The ANE tiers, whose claim declare_resources booked: WHETHER they run
+    // is the plan's grant, read here where the grant exists. Sized from the
+    // checkpoint's own dims -- klein-4B and -9B differ by ~1.8x -- and a
+    // refusal leaves the config without a session, which is how the DiT is
+    // told to keep its GPU path.
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      namespace a = genai::accel;
+      genai::MetalFlux2Transformer::Config dims = fcfg;
+      (void)genai::MetalFlux2Transformer::read_dims(dit_dir, &dims);
+      const std::size_t bytes =
+          genai::MetalFlux2Transformer::ane_runtime_bytes(
+              dims, ((_width > 0 ? _width : 1024) / 16) * ((_height > 0 ? _height : 1024) / 16));
+      if (bytes > 0 && model_memory::coreml_grant(
+                           session(), ane_claim_label_(), bytes, 1) > 0) {
+        fcfg.session    = session();
+        fcfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
+        fcfg.ane_layers = (int)std::max<long long>(
+            0, a::integer(&_accel, a::kAneLayers, 0));
+      } else {
+        session()->info(fmt(
+            "GenerateImageStage('{}'): the ANE feed-forward was requested "
+            "but the plan left no room for FLUX.2's modules ({} MB); keeping "
+            "the GPU", this->id(), bytes >> 20));
+      }
+    }
     _flux2_params.apply_to(fcfg);
     // Nothing in the checkpoint says which recipe it wants, and getting it
     // backwards costs plausible-looking wrong images rather than an error --
@@ -2661,6 +2703,8 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   DenoiseProgress prog(&bar, S, 1);
   ScopedBlockProgress<std::remove_reference_t<decltype(*_flux2_dit)>>
       prog_guard(_flux2_dit.get(), prog);
+  // Set once the first forward has shown whether the ANE tiers armed.
+  bool flux2_ane_checked = false;
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
@@ -2669,6 +2713,21 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
                                                gh, gw, (float)sigma, guid, ri,
                                                kvp);
     prog.end_forward();
+    // After the first forward, whose blocks are where the ANE tiers arm or
+    // decline: book what is HELD -- the modules when any armed, 0 when none
+    // did. revise_scratch() refuses to create, so this is a no-op when the
+    // plan booked nothing.
+    if (!flux2_ane_checked && _flux2_dit->ane_attempted()) {
+      flux2_ane_checked = true;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->revise_scratch(
+            "coreml:" + ane_claim_label_(),
+            _flux2_dit->ane_armed()
+                ? genai::MetalFlux2Transformer::ane_runtime_bytes(
+                      _flux2_dit->config(), img_seq)
+                : 0);
+      }
+    }
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());

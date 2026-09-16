@@ -1101,6 +1101,16 @@ method.
   were never told about is one you never ask for. If a new tier ever
   forces a rebuild, something has been put back that should not have
   been.
+
+  **Two SDK classes are OPAQUE for the same reason: `ane::Tier`
+  (`ane-tier.h`) and `WiredPool` (`wired-pool.h`).** Each is one pointer
+  with every method out of line, so no part of its state is compiled into
+  your plugin. Their layouts and method signatures are frozen (a change is a
+  bump). Their vocabularies grow freely: Tier kinds and keys, WiredPool
+  `open()` options and `info()` fields, new methods, and the policy behind
+  them. A plugin built against an older header keeps loading; one that
+  calls a method an older host lacks fails to load by symbol rather than
+  misbehaving.
 - The `libvpipe` `SOVERSION` guards the underlying C++/ABI. It moves
   independently; a plugin records a dependency on a compatible `libvpipe`.
 - `VpipePluginInfo::schema_version` lets the info struct grow additively.
