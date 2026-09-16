@@ -1,5 +1,7 @@
 #include "apps/web-ui/system-status.h"
 
+#include "common/soc-energy-channel.h"
+
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
@@ -300,6 +302,14 @@ detect_ane_max_watts_()
   }
   std::string brand(buf);
   if (brand.find("M3") != std::string::npos) { return 8.5; }
+  // M5: UNVERIFIED. Apple publishes no figure and macmon's table has no
+  // M5 row, so this is the M1/M2/M4 number carried forward rather than a
+  // measurement. It scales the percentage, never the watts -- the watts
+  // are read from the counter -- so a wrong ceiling misreports how busy
+  // the ANE is and nothing else. Stated here rather than left implicit
+  // because the fallback and a real M5 entry are indistinguishable once
+  // the branch exists.
+  if (brand.find("M5") != std::string::npos) { return 8.0; }
   return 8.0;
 }
 
@@ -371,6 +381,10 @@ struct SystemStatusPoller::Impl {
   std::chrono::steady_clock::time_point       t_prev{};
   bool                                        ready     = false;
 
+  // PER ANE UNIT, not per box. A part with two ANEs (the `0` suffix is
+  // a tile index -- see common/soc-energy-channel.h) can draw twice
+  // this, and the ceiling the percentage divides by is this figure
+  // times the number of ANE channels the sample actually carried.
   double                                      ane_max_w = 8.0;
 
   Impl() {
@@ -404,10 +418,19 @@ struct SystemStatusPoller::Impl {
     if (desired)   { CFRelease(desired);   desired   = nullptr; }
   }
 
+  // What one sample said: the block's power, and how many ANE units
+  // contributed to it. The count travels with the watts because the
+  // ceiling depends on it and both come from the same sample -- asking
+  // the machine again afterwards could answer about a different one.
+  struct AneSample {
+    double watts = 0.0;
+    int    units = 0;
+  };
+
   // Read one Energy Model sample, delta against `prev`, sum per-
   // channel ANE energy, divide by elapsed time -> instantaneous ANE
   // power in watts.
-  std::optional<double> ane_power_w() {
+  std::optional<AneSample> ane_power_w() {
     std::lock_guard<std::mutex> lk(mu);
     if (!ready) { return std::nullopt; }
     const auto& api = ioreport::resolve();
@@ -435,7 +458,7 @@ struct SystemStatusPoller::Impl {
     CFArrayRef arr = static_cast<CFArrayRef>(arr_raw);
     const CFIndex n = CFArrayGetCount(arr);
     double ane_energy_J = 0.0;
-    bool   got_ane      = false;
+    int    ane_units    = 0;
 
     for (CFIndex i = 0; i < n; ++i) {
       CFDictionaryRef ch = static_cast<CFDictionaryRef>(
@@ -446,9 +469,11 @@ struct SystemStatusPoller::Impl {
       if (group != "Energy Model") { continue; }
       const std::string name =
           cf_string_to_utf8_(api.channel_get_channel_name(ch));
-      // macOS publishes the ANE channel as "ANE" (occasionally with a
-      // suffix like "ANE0" on multi-tile parts). Match the prefix.
-      if (name.rfind("ANE", 0) != 0) { continue; }
+      // "ANE" (macOS 26 and earlier) or "ANE<n>" (macOS 27 indexes every
+      // block), summed across units. NOT a prefix match: that would also
+      // take any future "ANE SRAM"-style companion into the total, the
+      // way the GPU reader used to double-count "GPU Energy".
+      if (!soc_block_energy_channel(name, "ANE")) { continue; }
       const std::string unit =
           cf_string_to_utf8_(api.channel_get_unit_label(ch));
       const std::int64_t raw =
@@ -460,11 +485,11 @@ struct SystemStatusPoller::Impl {
       else if (unit.find("nJ") != std::string::npos) { scale = 1e-9; }
       else if (unit.find("J")  != std::string::npos) { scale = 1.0;  }
       ane_energy_J += static_cast<double>(raw) * scale;
-      got_ane = true;
+      ++ane_units;
     }
     CFRelease(delta);
-    if (!got_ane) { return std::nullopt; }
-    return ane_energy_J / elapsed_s;
+    if (ane_units == 0) { return std::nullopt; }
+    return AneSample{ ane_energy_J / elapsed_s, ane_units };
   }
 };
 
@@ -505,13 +530,20 @@ SystemStatusPoller::query()
     oo.insert("gpu_cores", FlexData::make_uint(gpu.core_count));
   }
 
-  // ANE (IOReport).
-  oo.insert("ane_max_w", FlexData::make_real(_impl->ane_max_w));
-  if (auto w = _impl->ane_power_w()) {
-    const double pct = (*w / _impl->ane_max_w) * 100.0;
-    oo.insert("ane_power_w", FlexData::make_real(*w));
+  // ANE (IOReport). The ceiling is per-unit times the units this box
+  // turned out to have, so a two-ANE part does not read 200% busy.
+  // Before the first sample there is nothing to count, and one unit is
+  // the honest assumption -- every part shipped so far has one.
+  if (auto s = _impl->ane_power_w()) {
+    const double ceiling = _impl->ane_max_w * (double)s->units;
+    const double pct     = ceiling > 0.0 ? (s->watts / ceiling) * 100.0 : 0.0;
+    oo.insert("ane_max_w",   FlexData::make_real(ceiling));
+    oo.insert("ane_units",   FlexData::make_int(s->units));
+    oo.insert("ane_power_w", FlexData::make_real(s->watts));
     oo.insert("ane_util_pct",
         FlexData::make_real(pct < 0.0 ? 0.0 : (pct > 100.0 ? 100.0 : pct)));
+  } else {
+    oo.insert("ane_max_w", FlexData::make_real(_impl->ane_max_w));
   }
 
   // This process's physical footprint -- the number Activity

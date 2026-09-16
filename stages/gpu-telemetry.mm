@@ -1,5 +1,7 @@
 #include "stages/gpu-telemetry.h"
 
+#include "common/soc-energy-channel.h"
+
 #import <Foundation/Foundation.h>
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -680,7 +682,14 @@ struct GpuTelemetrySampler::Impl {
           != "Energy Model") { continue; }
       const std::string name =
           cf_string_to_utf8_(api.channel_get_channel_name(ch));
-      if (name.rfind("GPU", 0) != 0) { continue; }
+      // "GPU" (macOS 26 and earlier) or "GPU<n>" (macOS 27 indexes every
+      // block). NOT a prefix match, which is what this used to be: the
+      // same group carries "GPU SRAM" -- a component already inside the
+      // block's figure -- and "GPU Energy", the SAME energy republished
+      // in nanojoules. MEASURED on an M4 Pro: GPU 376284 J against GPU
+      // Energy 375695 J, 0.16% apart, so summing them reported close to
+      // double and an idle box read ~48 W.
+      if (!soc_block_energy_channel(name, "GPU")) { continue; }
       const std::string unit =
           cf_string_to_utf8_(api.channel_get_unit_label(ch));
       const std::int64_t raw = api.simple_get_integer_value(ch, 0);

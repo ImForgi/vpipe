@@ -113,6 +113,16 @@ const ConfigKey kAttrs[] = {
           "module fits. A 4/8-bit affine checkpoint is dequantized "
           "into those buffers per block. Ignored by families that do "
           "not implement it -- they say so in the log"},
+  {.key = "ane_qkv", .type = ConfigType::Bool, .required = false,
+   .doc = "the fused q|k|v projection on the ANE too, as a SECOND module "
+          "beside the feed-forward's, split the same way and sharing the "
+          "one ANE worker. REQUIRES ane_ffn: the plan books both modules "
+          "as one unit and grants them together. It costs its own weight "
+          "slots and staging on top of the feed-forward's, so the plan "
+          "may decline the pair where it would have granted the "
+          "feed-forward alone. Implemented by Krea-2 (q|k|v|gate) and "
+          "FLUX.2 (the double blocks' image q|k|v); "
+          "VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 also turn it on"},
   {.key = "ane_rows", .type = ConfigType::Real, .required = false,
    .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
           "rest CONCURRENTLY (rows are independent in a feed-forward, so "
@@ -558,6 +568,9 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
     long long layers = attr_int("ane_layers");
     if (layers < 0) { layers = 0; }
     genai::accel::set_flag(&_accel, genai::accel::kAneFfn, on);
+    // Only with the feed-forward: the two modules are one booking.
+    genai::accel::set_flag(&_accel, genai::accel::kAneQkv,
+                           on && attr_bool("ane_qkv"));
     genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
     genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
     genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
@@ -642,6 +655,9 @@ GenerateImageStage::apply_ane_(Cfg& cfg) const
   cfg.session       = session();
   cfg.ane_templates = a::text(&_accel, a::kAneTemplates);
   cfg.ane_rows      = (float)a::real(&_accel, a::kAneRows, 0.0);
+  // Before the bytes below, which must cover BOTH modules or the grant
+  // is for less than the family will build.
+  cfg.ane_qkv       = a::flag(&_accel, a::kAneQkv);
   // WHETHER the tier runs is the plan's call; HOW MANY blocks use it is
   // not a memory question.
   //
@@ -654,8 +670,7 @@ GenerateImageStage::apply_ane_(Cfg& cfg) const
   // claim time because the grant is not computed until every stage has
   // claimed.
   const std::size_t bytes = genai::MetalKrea2Transformer::ane_runtime_bytes(
-      cfg.hidden, cfg.ffn,
-      genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
+      cfg, genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
   if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
       0) {
     cfg.session = nullptr;
@@ -1142,11 +1157,12 @@ GenerateImageStage::declare_resources() const
   // costs what it costs a dense one.
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
       t2i_family_(dit) == "krea2") {
-    const genai::MetalKrea2Transformer::Config kc;
+    genai::MetalKrea2Transformer::Config kc;
+    kc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
     for (auto& c : model_memory::coreml_claims(
              ane_claim_label_(),
              genai::MetalKrea2Transformer::ane_runtime_bytes(
-                 kc.hidden, kc.ffn,
+                 kc,
                  genai::MetalKrea2Transformer::ane_plan_seq(_width, _height)),
              1, model_memory::kPhaseDenoise)) {
       out.push_back(std::move(c));
@@ -1160,6 +1176,7 @@ GenerateImageStage::declare_resources() const
       t2i_family_(dit) == "flux2") {
     genai::MetalFlux2Transformer::Config fc;
     (void)genai::MetalFlux2Transformer::read_dims(dit, &fc);
+    fc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
     for (auto& c : model_memory::coreml_claims(
              ane_claim_label_(),
              genai::MetalFlux2Transformer::ane_runtime_bytes(
@@ -1541,12 +1558,14 @@ GenerateImageStage::ensure_loaded_()
       namespace a = genai::accel;
       genai::MetalFlux2Transformer::Config dims = fcfg;
       (void)genai::MetalFlux2Transformer::read_dims(dit_dir, &dims);
+      dims.ane_qkv = a::flag(&_accel, a::kAneQkv);
       const std::size_t bytes =
           genai::MetalFlux2Transformer::ane_runtime_bytes(
               dims, ((_width > 0 ? _width : 1024) / 16) * ((_height > 0 ? _height : 1024) / 16));
       if (bytes > 0 && model_memory::coreml_grant(
                            session(), ane_claim_label_(), bytes, 1) > 0) {
         fcfg.session    = session();
+        fcfg.ane_qkv    = a::flag(&_accel, a::kAneQkv);
         fcfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
         fcfg.ane_layers = (int)std::max<long long>(
             0, a::integer(&_accel, a::kAneLayers, 0));
@@ -2272,11 +2291,11 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
     // memory is the same failure as one kept into the decode.
     std::size_t ane = 0;
     if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
-      const genai::MetalKrea2Transformer::Config kc;
+      genai::MetalKrea2Transformer::Config kc;
+      kc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
       const std::size_t bytes =
           genai::MetalKrea2Transformer::ane_runtime_bytes(
-              kc.hidden, kc.ffn,
-              genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
+              kc, genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
       if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes,
                                      1) > 0) {
         ane = bytes;
@@ -2455,12 +2474,18 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
       ane_checked = true;
       if (_dit->ane_attempted()) {
         if (auto* mgr = session()->services()->generative_model_manager()) {
-          const genai::MetalKrea2Transformer::Config kc;
+          genai::MetalKrea2Transformer::Config kc;
+          kc.ane_qkv = _dit->ane_qkv_armed();
+          // Either tier holding means the booking stands. When only the
+          // qkv one armed this still counts the feed-forward's term,
+          // which errs HIGH on purpose: under-booking hands memory the
+          // modules are holding to somebody else, and that is the
+          // failure worth avoiding.
           mgr->revise_scratch(
               "coreml:" + ane_claim_label_(),
-              _dit->ane_armed()
+              (_dit->ane_armed() || _dit->ane_qkv_armed())
                   ? genai::MetalKrea2Transformer::ane_runtime_bytes(
-                        kc.hidden, kc.ffn, n_real + img_seq)
+                        kc, n_real + img_seq)
                   : 0);
         }
       }

@@ -47,7 +47,9 @@ struct GpuTelemetry {
 // aggregates min/avg/max. Construction resolves the IOReport / IOKit /
 // SMC handles once and never throws -- any unavailable source degrades
 // that metric to ok=false. Sources (Apple Silicon):
-//   power -- IOReport "Energy Model", channels prefixed "GPU"
+//   power -- IOReport "Energy Model", channels named "GPU" or "GPU<n>"
+//            (see common/soc-energy-channel.h: NOT a prefix match, which
+//            would also take "GPU SRAM" and the "GPU Energy" twin)
 //   util  -- IOAccelerator PerformanceStatistics "Device Utilization %"
 //   freq  -- IOReport "GPU Stats" pstate residency, weighted by the
 //            "voltage-states9" MHz table read from the pmgr IORegistry node

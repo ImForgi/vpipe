@@ -4590,7 +4590,17 @@ MetalMiniMaxH3Transformer::ane_qkv_stage_(int L, const Block& b,
 std::size_t
 MetalMiniMaxH3Transformer::ane_runtime_bytes(const Config& c, int seq) noexcept
 {
-  return AneFeedForward::runtime_bytes(c.hidden, c.ffn, seq, ane_chunk_rows());
+  std::size_t n =
+      AneFeedForward::runtime_bytes(c.hidden, c.ffn, seq, ane_chunk_rows());
+  // The fused qkv projection's module, when the graph asked for it. The
+  // preflight in generate-video booked this term long before the CLAIM
+  // did, so the gate and the plan disagreed about the same tier; they
+  // read the same function now.
+  if (c.ane_qkv || std::getenv("VPIPE_H3_ANE_QKV") != nullptr) {
+    n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * c.inner(), seq,
+                                              ane_chunk_rows());
+  }
+  return n;
 }
 
 int

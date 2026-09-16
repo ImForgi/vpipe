@@ -16,6 +16,14 @@
 // holding transformer/).
 
 #include "minitest.h"
+
+// MiniMax-H3 is a VIDEO family and this file is the image plan's, but the
+// ANE claim is one contract and it broke the same way in both: the qkv
+// tier's module booked at zero. The arithmetic for both lives beside the
+// image family's here rather than in the H3 suite, whose tests are gated
+// on a 33B checkpoint and skip on most boxes -- which is how the gap
+// survived in the first place.
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include <iterator>
 #include "pipeline/resource-plan.h"
 #include "generative-models/generative-model-manager.h"
@@ -134,13 +142,107 @@ TEST(image_memory_plan, the_ane_tier_claims_coreml_residency)
   const genai::MetalKrea2Transformer::Config kc;
   EXPECT_TRUE(on.first ==
               genai::MetalKrea2Transformer::ane_runtime_bytes(
-                  kc.hidden, kc.ffn,
-                  genai::MetalKrea2Transformer::ane_plan_seq(0, 0)));
+                  kc, genai::MetalKrea2Transformer::ane_plan_seq(0, 0)));
   // At least the IOSurface weight slots themselves, which hold a full
   // fp16 copy of one block's feed-forward.
   const std::size_t slots =
       3ull * (std::size_t)kc.hidden * (std::size_t)kc.ffn * 2ull;
   EXPECT_TRUE(on.first > slots);
+}
+
+// THE ARITHMETIC, with no checkpoint in sight.
+//
+// ane_runtime_bytes() is static and takes a Config, so the accounting
+// can be checked on any box -- which matters here more than usual: the
+// stage-level test below needs a Krea-2 checkpoint and skips without
+// one, and this bug (the qkv module booked at zero) survived precisely
+// because nothing exercised the path. A test that runs everywhere is
+// what keeps it fixed.
+TEST(image_memory_plan, ane_runtime_bytes_counts_both_modules) {
+  // The env form ORs into the booking and would make both arms equal.
+  if (std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr) { return; }
+  namespace k = genai;
+  k::MetalKrea2Transformer::Config ff;
+  k::MetalKrea2Transformer::Config both;
+  both.ane_qkv = true;
+  const int seq = k::MetalKrea2Transformer::ane_plan_seq(0, 0);
+  const std::size_t a = k::MetalKrea2Transformer::ane_runtime_bytes(ff, seq);
+  const std::size_t b = k::MetalKrea2Transformer::ane_runtime_bytes(both, seq);
+  std::printf("[image_memory_plan] krea2 ane bytes: ff %zu MB, ff+qkv %zu MB\n",
+              a >> 20, b >> 20);
+  EXPECT_TRUE(a > 0);
+  // The qkv module is not free, and before this it was booked as if it
+  // were: the two figures were identical.
+  EXPECT_TRUE(b > a);
+
+  // MiniMax-H3 had the same gap, and from the same cause -- the video
+  // preflight charged for the qkv tier while the CLAIM did not, so the
+  // gate refused against memory the plan had never granted.
+  k::MetalMiniMaxH3Transformer::Config h3ff;
+  k::MetalMiniMaxH3Transformer::Config h3both;
+  h3both.ane_qkv = true;
+  if (std::getenv("VPIPE_H3_ANE_QKV") == nullptr) {
+    const std::size_t c =
+        k::MetalMiniMaxH3Transformer::ane_runtime_bytes(h3ff, 19456);
+    const std::size_t d =
+        k::MetalMiniMaxH3Transformer::ane_runtime_bytes(h3both, 19456);
+    std::printf("[image_memory_plan] h3 ane bytes: ff %zu MB, ff+qkv %zu MB\n",
+                c >> 20, d >> 20);
+    EXPECT_TRUE(c > 0);
+    EXPECT_TRUE(d > c);
+  }
+}
+
+// `ane_qkv` is a SECOND module, and the claim has to say so.
+//
+// It did not. ane_runtime_bytes() booked the feed-forward alone, so a
+// graph that turned the qkv tier on allocated a module no ledger knew
+// about -- on a box where the plan had already promised that memory to
+// something else. The tier was reachable only through
+// VPIPE_KREA2_ANE_QKV at the time, which is why it went unnoticed: no
+// pipeline spec could ask for it, so nothing exercised the path.
+TEST(image_memory_plan, ane_qkv_is_claimed_beside_the_feed_forward) {
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  // The env form ORs into the booking, so it would make the two arms
+  // below identical and the test vacuous rather than failing.
+  if (std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr) { return; }
+  Session sess;
+
+  auto claim_bytes = [&](bool qkv) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+    cfg.as_object().insert("ane_ffn", FlexData::make_bool(true));
+    if (qkv) { cfg.as_object().insert("ane_qkv", FlexData::make_bool(true)); }
+    GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                             std::move(cfg));
+    std::size_t bytes = 0;
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      if (c.kind != model_memory::kCoreMLKind) { continue; }
+      const std::size_t b2 = c.key.rfind('|');
+      const std::size_t b1 = c.key.rfind('|', b2 - 1);
+      bytes = (std::size_t)std::stoull(c.key.substr(b1 + 1, b2 - b1 - 1));
+    }
+    return bytes;
+  };
+
+  const std::size_t ff_only  = claim_bytes(false);
+  const std::size_t with_qkv = claim_bytes(true);
+  std::printf("[image_memory_plan] ANE claim: ff %zu MB, ff+qkv %zu MB\n",
+              ff_only >> 20, with_qkv >> 20);
+  // STRICTLY more, which is the whole point: the qkv module's weight
+  // slots and staging are not free, and a claim that did not grow is a
+  // claim that is not covering them.
+  EXPECT_TRUE(ff_only > 0);
+  EXPECT_TRUE(with_qkv > ff_only);
+
+  // And exactly what the family will build, so the plan grants the same
+  // shape the model allocates.
+  genai::MetalKrea2Transformer::Config kq;
+  kq.ane_qkv = true;
+  EXPECT_TRUE(with_qkv ==
+              genai::MetalKrea2Transformer::ane_runtime_bytes(
+                  kq, genai::MetalKrea2Transformer::ane_plan_seq(0, 0)));
 }
 
 // A QUANTIZED checkpoint claims the ANE module exactly as a dense one does:

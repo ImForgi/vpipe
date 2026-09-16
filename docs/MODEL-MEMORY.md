@@ -719,6 +719,29 @@ if (model_memory::coreml_grant(session(), label, module_bytes, 1) <= 0) {
 }
 ```
 
+**A family with more than one tier must book every one of them.** The
+feed-forward is rarely the only thing worth moving: a q|k|v projection is
+the same shape of work, and a family that runs both holds *two* modules,
+each with its own weight slots and staging. `module_bytes` has to be the
+sum — one unit covering both, granted together or not at all — because
+the two are armed by one decision and there is no useful state where the
+plan grants half.
+
+Getting this wrong is silent in a particular way, so it is worth naming.
+The tier that is *not* booked still allocates: CoreML hands it the
+memory, the process holds it, and no ledger in the plan knows. The graph
+then looks like it fits right up until the box is already short. MEASURED
+on Krea-2 at 1024², where the second tier is not a rounding error: the
+claim is **1440 MB for the feed-forward alone and 2080 MB with the q|k|v
+module beside it**. A booking that named only the first understated what
+the process would hold by 640 MB.
+
+The same applies to `revise_scratch()` after the first forward, where a
+tier reports whether it actually armed: ask *every* tier, and when only
+one did, book high rather than low. Releasing memory the modules are
+still holding is the failure worth avoiding; over-booking merely keeps a
+reservation nobody else needed.
+
 Two properties make this kind different from the other two, and both
 follow from what an accelerator *is*:
 

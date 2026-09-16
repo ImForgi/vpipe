@@ -1469,9 +1469,23 @@ MetalKrea2Transformer::ane_stage_(int L, const Block& b)
 }
 
 std::size_t
-MetalKrea2Transformer::ane_runtime_bytes(int hidden, int ffn, int seq) noexcept
+MetalKrea2Transformer::ane_runtime_bytes(const Config& c, int seq) noexcept
 {
-  return AneFeedForward::runtime_bytes(hidden, ffn, seq, ane_chunk_rows());
+  std::size_t n =
+      AneFeedForward::runtime_bytes(c.hidden, c.ffn, seq, ane_chunk_rows());
+  // The q|k|v|gate tier is a SECOND module with its own weight slots and
+  // staging -- see ane_qkv_setup_ for the shape, which this must match or
+  // the plan books one size and the model builds another. The env check
+  // is here as well as on the config because that is how the tier is
+  // turned on today, and a booking that misses the env form is the same
+  // under-report by another route.
+  if (c.ane_qkv || std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr) {
+    const int qd = c.n_heads * c.head_dim;
+    const int kd = c.n_kv_heads * c.head_dim;
+    n += AneFeedForward::matmul_runtime_bytes(
+        c.hidden, qd + 2 * kd + c.hidden, seq, ane_chunk_rows());
+  }
+  return n;
 }
 
 int
@@ -1501,6 +1515,10 @@ MetalKrea2Transformer::scratch_resident_bytes() const
       &_dit.qt, &_dit.kt, &_dit.vt, &_dit.atb, &_dit.g, &_dit.u, &_dit.gu,
       &_dit.modf, &_w_deq, &_splitk};
   std::size_t n = _ane != nullptr ? _ane->host_bytes() : 0;
+  // The qkv tier's host buffers too. Omitting them was exactly the
+  // "buffer the tier adds and this does not name" the comment above
+  // warns about: a reserve that under-reports.
+  n += _ane_qkv != nullptr ? _ane_qkv->host_bytes() : 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
 }

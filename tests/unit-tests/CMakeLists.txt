@@ -13,6 +13,7 @@ set(LOCAL_TEST_SOURCES
   denoise-progress.cc
   diagnostic-capture.cc
   gpu-thermal.cc
+  soc-energy-channel.cc
   detection-overlay-stage.cc
   feedback-pair.cc
   stage-relaunch-sweep.cc

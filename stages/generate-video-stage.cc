@@ -139,6 +139,15 @@ const ConfigKey kAttrs[] = {
           "per block, and a runtime LoRA on the feed-forward is merged "
           "into them. Implemented by MiniMax-H3; other families ignore "
           "it"},
+  {.key = "ane_qkv", .type = ConfigType::Bool, .required = false,
+   .doc = "the fused q|k|v projection on the ANE too, as a SECOND module "
+          "beside the feed-forward's, split the same way and sharing the "
+          "one ANE worker. REQUIRES ane_ffn: the plan books both modules "
+          "as one unit and grants them together. It costs its own weight "
+          "slots and staging on top of the feed-forward's, so the plan "
+          "may decline the pair where it would have granted the "
+          "feed-forward alone. Implemented by MiniMax-H3; "
+          "VPIPE_H3_ANE_QKV=1 also turns it on"},
   {.key = "ane_rows", .type = ConfigType::Real, .required = false,
    .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
           "rest CONCURRENTLY (rows are independent in a feed-forward, so "
@@ -482,6 +491,9 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
     long long layers = attr_int("ane_layers");
     if (layers < 0) { layers = 0; }
     genai::accel::set_flag(&_accel, genai::accel::kAneFfn, on);
+    // Only with the feed-forward: the two modules are one booking.
+    genai::accel::set_flag(&_accel, genai::accel::kAneQkv,
+                           on && attr_bool("ane_qkv"));
     genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
     genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
     genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
@@ -781,7 +793,11 @@ GenerateVideoStage::h3_ane_bytes_() const
   int w = _width, h = _height, f = _frames;
   (void)planned_geometry_(resolve_model_dir(session(), _hf_dir), &w, &h, &f);
   const genai::MetalMiniMaxH3VideoVae::Config vc;
-  const genai::MetalMiniMaxH3Transformer::Config tc;
+  genai::MetalMiniMaxH3Transformer::Config tc;
+  // The CLAIM has to cover every tier the graph asked for. It did not
+  // cover the qkv module while the preflight already charged for it, so
+  // the gate refused against a number the plan had never granted.
+  tc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
   constexpr int kCondFrames = 2, kTextRows = 512;
   const int lf = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
       vc, std::max(1, f));
@@ -807,6 +823,7 @@ GenerateVideoStage::apply_h3_ane_()
 {
   namespace a = genai::accel;
   _h3_cfg.ane_ffn = false;
+  _h3_cfg.ane_qkv = false;
   if (!a::flag(&_accel, a::kAneFfn)) { return; }
   const std::size_t bytes = h3_ane_bytes_();
   if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
@@ -818,6 +835,9 @@ GenerateVideoStage::apply_h3_ane_()
     return;
   }
   _h3_cfg.ane_ffn    = true;
+  // Granted as one unit with the feed-forward, so it rides the same
+  // grant rather than asking again.
+  _h3_cfg.ane_qkv    = a::flag(&_accel, a::kAneQkv);
   _h3_cfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
   _h3_cfg.ane_layers =
       (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));

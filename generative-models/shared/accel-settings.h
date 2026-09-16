@@ -147,6 +147,21 @@ inline constexpr std::string_view kAneTemplates = "ane_templates";
 // decision. Set it only to cover fewer blocks on purpose.
 inline constexpr std::string_view kAneLayers = "ane_layers";
 
+// The fused q|k|v projection on the ANE too, as a SECOND module beside
+// the feed-forward's, split the same way and sharing the one ANE worker.
+// Bool; default false.
+//
+// REQUIRES kAneFfn, and not by accident: the plan books both modules as
+// ONE CoreML unit, so they are granted together or not at all. A tier
+// that could be granted alone would need a unit of its own, and nothing
+// asks for that yet.
+//
+// It is a SEPARATE cost, which is the reason this is a key rather than
+// something kAneFfn implies: the qkv module holds its own weight slots
+// and staging, so a family that books only the feed-forward under-reports
+// the moment a graph turns this on.
+inline constexpr std::string_view kAneQkv = "ane_qkv";
+
 // ---- reading --------------------------------------------------------
 //
 // A null bag reads as every default, which is what a family gets from a

@@ -205,9 +205,11 @@ class MetalMiniMaxH3Transformer {
     bool  ane_ffn    = false;
     float ane_rows   = 0.0f;
     int   ane_layers = 0;
-    // PROTOTYPE: the fused qkv projection split onto the ANE the same way,
-    // on its own matmul tier (auto share, same on/off controller).
-    // VPIPE_H3_ANE_QKV=1 also turns it on. Not wired to a stage yet.
+    // The fused qkv projection split onto the ANE the same way, on its
+    // own matmul tier (auto share, same on/off controller). Set from
+    // generate-video's `ane_qkv` key, which REQUIRES `ane_ffn`: the two
+    // modules are booked as one CoreML unit and granted together.
+    // VPIPE_H3_ANE_QKV=1 also turns it on.
     bool  ane_qkv    = false;
 
     int inner() const { return n_heads * head_dim; }        // 7168

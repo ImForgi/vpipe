@@ -266,10 +266,17 @@ class MetalKrea2Transformer {
   //   host     the fp16 input/output buffers for the ANE's rows, at most
   //            every whole chunk short of the sequence.
   //
-  // Static, and takes the shape rather than reading _cfg, because the
+  // Static, and takes a CONFIG rather than reading _cfg, because the
   // caller that needs it most is the PLAN, which asks before anything is
-  // loaded.
-  static std::size_t ane_runtime_bytes(int hidden, int ffn, int seq) noexcept;
+  // loaded -- it fills a default Config with the dims and the tiers it is
+  // about to ask for.
+  //
+  // `c.ane_qkv` adds the q|k|v|gate matmul module beside the feed-
+  // forward's. TWO modules, booked together: this took a config instead
+  // of loose dims precisely because the old (hidden, ffn, seq) form could
+  // not see the second tier, so a graph setting it allocated a module no
+  // ledger knew about.
+  static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   // The sequence a plan should book for a width x height image (either <= 0
   // books 1024x1024): its tokens plus the longest text the model conditions
   // on.
@@ -281,6 +288,10 @@ class MetalKrea2Transformer {
   // the module can release the booking when it did not.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+  // The qkv tier arms separately -- it has its own module and its own
+  // eligibility -- so a caller revising what the plan booked has to ask
+  // about both.
+  bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
 
   // M3a: run the text-fusion tower + txt_in on the (text_seq, n_text_layers,
   // text_hidden) f16 encoder-tap stack -> the (text_seq, hidden) fused text
