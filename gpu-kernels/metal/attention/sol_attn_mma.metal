@@ -185,15 +185,25 @@ kernel void sol_route_mma(
     constant int&           sink_hi [[buffer(16)]],
     constant int&           per     [[buffer(17)]],
     constant int&           NKS     [[buffer(18)]],
+    constant int&           GQA     [[buffer(19)]],
     uint3 tid  [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
   const int h  = (int)tid.y;
   const int qb = (int)tid.z;
+  // GQA. The routing is decided per QUERY head -- the flags, the kept
+  // count and the CSR are all indexed by `h` -- but the key centroids
+  // and their statistics are summarised per KV head, because that is
+  // what K and V have. So a query head reads the group it belongs to.
+  //
+  // GQA 1 makes `hk` exactly `h`, which is what every caller before
+  // this did implicitly: the MHA path is unchanged, not a special case
+  // layered on top.
+  const int hk = (GQA > 1) ? (h / GQA) : h;
   const float ls = scale * SOL_LOG2E;
   const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
-  const device float* mh = mean + (uint)h * D;
-  const device float* vh = var  + (uint)h * D;
+  const device float* mh = mean + (uint)hk * D;
+  const device float* vh = var  + (uint)hk * D;
 
   float rm = 0.0f, rv = 0.0f;
   for (int i = (int)lane; i < D; i += 32) {
@@ -225,7 +235,7 @@ kernel void sol_route_mma(
   }
   uint n_keep = 0;
   for (int n = 0; n < NK; ++n) {
-    const device VPIPE_ELT* kr = kc + ((uint)h * NK + n) * D;
+    const device VPIPE_ELT* kr = kc + ((uint)hk * NK + n) * D;
     float dot = 0.0f;
     if (fast) {
       for (int c = 0; c < NPT; ++c) {
@@ -299,15 +309,25 @@ kernel void sol_route_p_mma(
     constant int&           sink_hi [[buffer(16)]],
     constant int&           per     [[buffer(17)]],
     constant int&           NKS     [[buffer(18)]],
+    constant int&           GQA     [[buffer(19)]],
     uint3 tid  [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
   const int h  = (int)tid.y;
   const int qb = (int)tid.z;
+  // GQA. The routing is decided per QUERY head -- the flags, the kept
+  // count and the CSR are all indexed by `h` -- but the key centroids
+  // and their statistics are summarised per KV head, because that is
+  // what K and V have. So a query head reads the group it belongs to.
+  //
+  // GQA 1 makes `hk` exactly `h`, which is what every caller before
+  // this did implicitly: the MHA path is unchanged, not a special case
+  // layered on top.
+  const int hk = (GQA > 1) ? (h / GQA) : h;
   const float ls = scale * SOL_LOG2E;
   const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
-  const device float* mh = mean + (uint)h * D;
-  const device float* vh = var  + (uint)h * D;
+  const device float* mh = mean + (uint)hk * D;
+  const device float* vh = var  + (uint)hk * D;
 
   float rm = 0.0f, rv = 0.0f;
   for (int i = (int)lane; i < D; i += 32) {

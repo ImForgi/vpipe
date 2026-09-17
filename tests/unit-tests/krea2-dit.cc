@@ -424,6 +424,160 @@ TEST(krea2_dit, forward_dit_i8_matches_f16)
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
 }
 
+// SOL-ATTN OVER THE JOINT SEQUENCE, and the two things that have to be
+// true of any routing tier before its speed is worth discussing.
+//
+// 1. TURNING IT ON MUST NOT MOVE THE LAYERS IT DOES NOT ROUTE. With
+//    `sol_dense_layers` covering every block the answer has to be
+//    BYTE-IDENTICAL to the tier being off -- same kernel, same rounding.
+//    That is the ablation which says the filter works, and it is also
+//    the bug H3 hit: forcing the routed path off globally sent the dense
+//    layers to the scalar kernel, 19x slower, looking exactly like the
+//    new kernels being slow.
+//
+// 2. WHEN IT DOES ROUTE, THE ANSWER MOVES AND STAYS FINITE. An
+//    approximation that changed nothing would mean the routing kept
+//    everything (or ran nothing at all), and a NaN would mean the merge
+//    lost a partial.
+//
+// The geometry is the i8 test's: joint 1088 tokens is 17 routing blocks
+// at the default key block, which clears the 16-block floor forward_dit
+// applies. Below that the local band, the sink and the always-exact tail
+// cover nearly the whole sequence and the tier declines -- so a smaller
+// grid here would assert on a path that never engaged.
+TEST(krea2_dit, sol_attn_routes_the_joint_attention)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // THE GRID IS SWEEPABLE TOO, and it matters more than it looks. At
+  // grid 32 the joint sequence is 1088 tokens = 17 routing blocks, and
+  // the local band, the sink and the always-exact tail already force
+  // most of them exact -- so the THRESHOLD decides very few blocks and
+  // tau reads as nearly inert (0.033-0.037 rel-L2 from tau 0.5 to 1.5).
+  // That is a property of the fixture, not of tau. VPIPE_KREA2_SOL_GRID
+  // =64 gives joint 4160 = 65 routing blocks, the regime a real 1024^2
+  // generation is in.
+  const char* genv = std::getenv("VPIPE_KREA2_SOL_GRID");
+  const int text_seq = 64;
+  const int grid = (genv != nullptr && *genv != '\0') ? std::atoi(genv) : 32;
+  const int img_seq = grid * grid;
+  // HOW MANY BLOCKS ACTUALLY ROUTE, which is the quietest limit on what
+  // this test can say. `stop = 1` runs blocks 0..1 and the default
+  // `dense_layers = 1` leaves block 0 dense -- so ONE routed block
+  // carries the whole measurement, and a tau curve drawn from it can be
+  // the behaviour of a single block's proxy score rather than of tau.
+  // VPIPE_KREA2_SOL_STOP raises it; error compounds with depth, so the
+  // numbers are comparable only at equal depth.
+  const char* senv = std::getenv("VPIPE_KREA2_SOL_STOP");
+  const int stop = (senv != nullptr && *senv != '\0') ? std::atoi(senv) : 1;
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x50173a7bu;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+
+  // TAU IS SWEEPABLE FROM THE ENVIRONMENT, because this is the cheap
+  // instrument for the question "what does tau do": ~10 s and a small
+  // footprint at seq 1088, against ~7 minutes and a 15 GB peak for one
+  // 1024^2 image. Default 1.0, which is the shipped value and what the
+  // assertions below are written against.
+  const char* tenv = std::getenv("VPIPE_KREA2_SOL_TAU");
+  const float tau = (tenv != nullptr && *tenv != '\0')
+                        ? (float)std::atof(tenv) : 1.0f;
+  auto run = [&](bool on, int dense_layers) {
+    MetalKrea2Transformer::Config cfg;
+    cfg.sol.enabled      = on;
+    cfg.sol.tau          = tau;
+    cfg.sol.dense_layers = dense_layers;
+    cfg.sol.key_block    = 64;
+    cfg.sol.local_radius = 1;
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream_blocks=*/true);
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  // COULD THE BASELINE EVEN RUN? minitest's ASSERT_TRUE records a
+  // failure and keeps going, so asserting on the arms below against an
+  // empty baseline would report a Sol bug where the truth is that no
+  // forward happened at all -- a checkpoint this box cannot load, or a
+  // geometry it cannot fit. Say which, and stop.
+  const std::vector<float> off = run(false, 0);
+  if (off.empty()) {
+    std::printf("[krea2_dit] sol: the dense baseline produced no forward "
+                "(load or geometry); nothing to compare\n");
+    ASSERT_TRUE(!off.empty());
+    return;
+  }
+
+  // ALL DENSE: the tier is on and routes nothing, so every block runs
+  // the attention it would have run anyway. Exact equality, not a
+  // tolerance -- a difference here is the tier disturbing layers it was
+  // told to leave alone.
+  const std::vector<float> all_dense = run(true, base.n_layers);
+  ASSERT_TRUE(all_dense.size() == off.size());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < off.size(); ++i) {
+    if (off[i] != all_dense[i]) { ++diff; }
+  }
+  std::printf("[krea2_dit] sol all-dense vs off: %zu of %zu elements differ\n",
+              diff, off.size());
+  EXPECT_TRUE(diff == 0);
+
+  // ROUTED: both blocks this forward runs are routed.
+  const std::vector<float> routed = run(true, 0);
+  ASSERT_TRUE(routed.size() == off.size());
+  const double r = rel_l2_(routed.data(), off.data(), routed.size());
+  // REALIZED SPARSITY BESIDE THE ERROR, because rel-L2 alone cannot say
+  // whether a tau did nothing because the threshold was loose or because
+  // the local band and the sink had already kept everything. Sol counts
+  // steel key blocks, so `kept` is in those units and the fraction is
+  // what a speed claim would have to be built on.
+  // The routed arm above runs with dense_layers = 0, so every block this
+  // forward executes is routed. Say that from the arm's own setting
+  // rather than from `base`, whose sol.dense_layers is the shipped
+  // default (1) and would misreport it for every arm.
+  std::printf("[krea2_dit] sol routed vs dense rel-L2 = %.6g (seq=%d, "
+              "grid=%d, tau=%.2f, %d routing blocks, %d routed layer(s))\n",
+              r, text_seq + img_seq, grid, (double)tau,
+              (text_seq + img_seq + 63) / 64, stop + 1);
+  EXPECT_TRUE(std::isfinite(r));
+  // It approximated something...
+  EXPECT_TRUE(r > 1e-5);
+  // ...but it is still attention over the same sequence, not noise. The
+  // bar is loose on purpose: realized sparsity is a property of the
+  // activations, and two blocks of a 28-block stack is not a quality
+  // claim about a generated image.
+  EXPECT_TRUE(r < 0.5);
+}
+
 // Reference-image conditioning (Qwen-Image-Edit multi-reference): forward_dit
 // with reference latents (a) still emits ONLY the generated-token velocity
 // [img_seq, in_channels] (refs dropped from the output), (b) stays finite with

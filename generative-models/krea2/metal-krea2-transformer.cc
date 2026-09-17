@@ -863,6 +863,28 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
         mc, /*bf16=*/true, cfg.sage, "MetalKrea2Transformer", &sage_fatal);
     if (sage_fatal) { return nullptr; }
   }
+  // Sol-Attn. Built only when asked: its kernels are a separate library
+  // and its scratch is real, so a graph that never names the tier pays
+  // for none of it. A failure to build is a WARNING and not fatal -- the
+  // dense attention below is a complete answer, which is the difference
+  // from Sage, whose refusal would silently change what `sage_attn` in
+  // the log means.
+  if (cfg.sol.enabled) {
+    std::string serr;
+    m->_sol = MetalSolAttention::load(mc, /*bf16=*/true, &serr);
+    if (m->_sol == nullptr && mc->session() != nullptr) {
+      mc->session()->warn(fmt(
+          "MetalKrea2Transformer: sol_attn was asked for but its kernels "
+          "did not build ({}); keeping the dense attention", serr));
+    } else if (mc->session() != nullptr) {
+      mc->session()->info(fmt(
+          "MetalKrea2Transformer: Sol-Attn on -- tau {:.2f}, key block {}, "
+          "{} dense layer(s), local radius {}",
+          (double)cfg.sol.tau,
+          cfg.sol.key_block > 0 ? cfg.sol.key_block : sol::kBlock,
+          cfg.sol.dense_layers, cfg.sol.local_radius));
+    }
+  }
 
   // Fused SwiGLU FF: interleave each MAIN block's quantized ff gate/up at load.
   // Steel path (M4): a real win -- one affine_qmm_swiglu GEMM whose register-
@@ -1488,6 +1510,25 @@ MetalKrea2Transformer::ane_runtime_bytes(const Config& c, int seq) noexcept
   return n;
 }
 
+std::size_t
+MetalKrea2Transformer::sol_scratch_bytes(int seq) const
+{
+  if (!_sol || seq <= 0) { return 0; }
+  // The same condition forward_dit applies: every layer dense means the
+  // routed path is never reached and nothing is allocated for it.
+  if (_cfg.sol.dense_layers >= _cfg.n_layers) { return 0; }
+  // WHAT THE FORWARD LENDS IT, so this is what is left over rather than
+  // the whole scratch. `g` is the feed-forward's gate intermediate,
+  // written only after the attention; `n1` dies at the pre-attention
+  // adaLN. Both are dead for exactly the length of Sol's call.
+  const std::size_t s = (std::size_t)seq;
+  const std::size_t lend_g = s * (std::size_t)_cfg.ffn * 2;
+  const std::size_t lend_n = s * (std::size_t)_cfg.hidden * 2;
+  return MetalSolAttention::private_bytes(
+      _cfg.n_heads, _cfg.n_kv_heads, seq, _cfg.head_dim, _cfg.sol.key_block,
+      _sol->uses_matrix_cores(), lend_g, lend_n);
+}
+
 int
 MetalKrea2Transformer::ane_plan_seq(int width, int height) noexcept
 {
@@ -1519,6 +1560,10 @@ MetalKrea2Transformer::scratch_resident_bytes() const
   // "buffer the tier adds and this does not name" the comment above
   // warns about: a reserve that under-reports.
   n += _ane_qkv != nullptr ? _ane_qkv->host_bytes() : 0;
+  // And whatever Sol could not carve from what the forward lent it. Its
+  // carved windows are the lender's bytes and are already counted below;
+  // this is only the remainder it had to allocate.
+  n += _sol != nullptr ? _sol->resident_bytes() : 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
 }
@@ -2519,6 +2564,51 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     const bool nax = _use_attn_nax && _lib_attn_nax.valid();
     const int A_BQ = nax ? 64 : 32;
     const int A_BK = nax ? 32 : 16;
+    // ---- Sol-Attn over the joint sequence ---------------------------
+    //
+    // ROUTED LAYERS ONLY, and the rest stay exactly where they were.
+    // Turning the tier on must not move the dense layers onto a
+    // different kernel: that would change their rounding for no reason
+    // and, on H3, it once sent them to the scalar path and looked like
+    // the new kernels being slow.
+    //
+    // BELOW 16 ROUTING BLOCKS IT IS NOT WORTH IT -- the local band, the
+    // sink and the always-exact tail already cover most of the sequence,
+    // so the routing would spend passes to keep nearly everything. At
+    // Krea-2's 2x2 patches that is ~1024 image tokens, i.e. anything
+    // under about 512x512.
+    const int sol_blk =
+        _cfg.sol.key_block > 0 ? _cfg.sol.key_block : sol::kBlock;
+    const bool sol_on = (bool)_sol &&
+                        _cfg.sol.dense_layers < c.n_layers &&
+                        ((seq + sol_blk - 1) / sol_blk) >= 16;
+    if (sol_on) {
+      // LEND SOL THE TWO BUFFERS THAT ARE DEAD WHILE IT RUNS. `g` is the
+      // feed-forward's gate intermediate, written only after the
+      // attention that ends before it; `n1` is the pre-attention norm,
+      // dead from the adaLN that consumes it. Neither is touched between
+      // the projection and the output, which is exactly Sol's window --
+      // and `atb` is deliberately NOT among them, being where Sol writes.
+      //
+      // Re-lent every forward so a caller whose scratch was rebuilt at a
+      // new geometry is correct without noticing. See
+      // MetalSolAttention::set_arena.
+      _sol->set_arena(g, n1);
+      // WHAT THE PREVIOUS FORWARD ROUTED, read and reset here rather
+      // than at the end: the counter is written by the GPU and this
+      // stack commits once, so reading it after the loop would report a
+      // number the device had not produced yet. Same clock confusion as
+      // the block progress.
+      const long long tot = _sol->total_blocks() * (c.n_layers -
+                                                    _cfg.sol.dense_layers);
+      const long long got = _sol->exact_blocks();
+      if (got > 0 && tot > 0 && _mc->session() != nullptr) {
+        _mc->session()->log_debug(fmt(
+            "Krea-2 Sol-Attn: kept {} of {} key blocks exact ({:.1f}%)",
+            got, tot, 100.0 * (double)got / (double)tot));
+      }
+      _sol->reset_counts();
+    }
     metal_compute::ComputeFunction fn_attn, fn_attn_i8;
     bool use_steel = _steel_attn_ok && KVH > 0 && HED % KVH == 0
                      && !_attn_params.empty();
@@ -2762,7 +2852,34 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       transpose(v, vt, seq, KVH, HD);
       rope(qt, HED, seq, HD);
       rope(kt, KVH, seq, HD);
-      if (use_steel) {
+      // SOL'S ROUTED ATTENTION, when this layer is one it routes. The
+      // exact blocks go to Sol's own steel/nax flash kernel (it builds
+      // one for this geometry), so this replaces the dispatch below
+      // rather than wrapping it.
+      //
+      // THE SINK IS THE TEXT PREFIX. The joint sequence is [text; image]
+      // and a centroid over prompt tokens is a prompt half-read, so
+      // those rows are attended exactly. It is the layout's figure and
+      // not a setting -- only the family knows where its own modality
+      // starts.
+      const bool sol_here = sol_on && L >= _cfg.sol.dense_layers;
+      if (sol_here) {
+        sol::Config sc = _cfg.sol;
+        sc.sink_start  = 0;
+        sc.sink_tokens = TS;
+        std::string serr;
+        if (!_sol->encode(enc, qt, kt, vt, atb, HED, KVH, seq, HD, scale,
+                          sc, &serr)) {
+          // Said once per forward, not once per block: a geometry Sol
+          // cannot serve fails the same way for all 28 of them.
+          if (L == _cfg.sol.dense_layers && _mc->session() != nullptr) {
+            _mc->session()->warn(fmt(
+                "MetalKrea2Transformer: sol_attn declined this forward "
+                "({}); the dense attention ran instead", serr));
+          }
+          sdpa(qt, kt, vt, atb, scale, seq, HD, HED, KVH, seq, seq);
+        }
+      } else if (use_steel) {
         // Register-resident flash attention: Q/O [HED,seq,HD], K/V [KVH,seq,HD],
         // GQA via gqa_factor. Grid (32*NQ, 4*Hq, 1), tg (32,4,1) per MLX steel.
         // SAGE: quantize q/k for THIS block, into the same encoder and

@@ -1570,7 +1570,9 @@ struct KvFixture {
   int TS = 8, gh = 4, gw = 4, img_seq = 16;
   std::size_t n = 0;
 
-  bool build(bool klein_kv) {
+  // `sol` defaults to the shipped Config (tier off), so every caller that
+  // predates Sol is unchanged and a klein_kv test still measures klein_kv.
+  bool build(bool klein_kv, const sol::Config& sol_cfg = sol::Config{}) {
     const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
     if (root == nullptr || *root == '\0') { return false; }
     // VPIPE_FLUX2_KV_BENCH=<grid> runs the REAL generation geometry (32 -> a
@@ -1585,6 +1587,7 @@ struct KvFixture {
     if (mc == nullptr) { return false; }
     MetalFlux2Transformer::Config cfg;
     cfg.klein_kv = klein_kv;
+    cfg.sol = sol_cfg;
     dit = MetalFlux2Transformer::load(std::string(root) + "/transformer", mc,
                                       cfg);
     if (dit == nullptr) { return false; }
@@ -1719,6 +1722,97 @@ TEST(flux2_kv, cached_matches_uncached)
               r0, r1, kv.ref_seq);
   EXPECT_TRUE(r0 < 1e-6);          // same arithmetic
   EXPECT_TRUE(r1 < 5e-3);          // cache stands in for recomputation
+}
+
+// SOL-ATTN ON FLUX.2, and the three things that have to be true of it.
+//
+// 1. A tier that routes NOTHING must be byte-identical to the tier being
+//    off -- same kernel, same rounding for every block it skips.
+// 2. WITH REFERENCES AND klein_kv OFF it must actually route. That is
+//    the path that matters here: the references sit IN the joint
+//    sequence, so the keys are still the queries and Sol applies.
+// 3. WITH klein_kv ON it must decline. A cached step attends the live
+//    queries over sequence-plus-spliced-reference keys and a fill step
+//    runs a second query group over reference keys alone -- the keys are
+//    then not the queries, and a centroid would summarise the wrong
+//    sequence. forward_dit gates on the GEOMETRY, so this must come back
+//    byte-identical to klein_kv without Sol.
+//
+// GEOMETRY IS THE TRAP. The fixture's default 4x4 grid is a 24-token
+// joint sequence -- one routing block -- and Sol declines below 16, so
+// every arm would be trivially identical and arm 2 would assert on a
+// path that never engaged. VPIPE_FLUX2_KV_BENCH=32 raises it to 512
+// text + 1024 image tokens = 24 routing blocks. Without it this test
+// says so and skips rather than passing vacuously.
+TEST(flux2_kv, sol_routes_the_joint_attention_and_declines_klein_kv)
+{
+  const char* g = std::getenv("VPIPE_FLUX2_KV_BENCH");
+  if (g == nullptr || std::atoi(g) < 32) {
+    std::printf("[flux2_kv] sol: needs VPIPE_FLUX2_KV_BENCH>=32 for a "
+                "sequence Sol will route (>=16 key blocks); skipped\n");
+    return;
+  }
+  sol::Config on;
+  on.enabled = true;
+  on.tau = 0.7f;              // generate-image's shipped default
+  on.key_block = 64;
+  on.local_radius = 1;
+  on.dense_layers = 1;
+  sol::Config all_dense = on;
+  // PAST ANY BLOCK COUNT, which is what "routes nothing" means here.
+  // Deliberately not `n_double + n_single` read from a default Config: a
+  // checkpoint's own dims come from read_dims at load, so a figure taken
+  // before the load could be smaller than the stack this test actually
+  // runs and would leave the tail routed while claiming it was dense.
+  all_dense.dense_layers = 1 << 16;
+
+  auto refs_of = [](KvFixture& f, unsigned seed) {
+    f.rng.seed(seed);
+    std::vector<MetalFlux2Transformer::RefImage> r;
+    r.push_back(f.make_ref(2, 3));
+    return r;
+  };
+  auto run = [&](KvFixture& f) {
+    const auto refs = refs_of(f, 99);
+    return f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh, f.gw,
+                              0.5f, -1.0f, refs);
+  };
+
+  // --- klein_kv OFF: the reference-editing path Sol is for -------------
+  KvFixture off, dense, routed;
+  if (!off.build(/*klein_kv=*/false)) { return; }
+  if (!dense.build(/*klein_kv=*/false, all_dense)) { return; }
+  if (!routed.build(/*klein_kv=*/false, on)) { return; }
+  SharedBuffer v_off = run(off), v_dense = run(dense), v_routed = run(routed);
+  ASSERT_TRUE(!v_off.empty() && !v_dense.empty() && !v_routed.empty());
+  const std::vector<float> a = off.vec(v_off), b = dense.vec(v_dense),
+                           c = routed.vec(v_routed);
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) { if (a[i] != b[i]) { ++diff; } }
+  std::printf("[flux2_kv] sol all-dense vs off: %zu of %zu differ\n", diff,
+              a.size());
+  EXPECT_TRUE(diff == 0);
+  const double r = rel_l2_(c.data(), a.data(), off.n);
+  std::printf("[flux2_kv] sol routed vs dense rel-L2 %.4f (refs, klein_kv "
+              "off, seq %d)\n", r, off.TS + off.img_seq);
+  EXPECT_TRUE(std::isfinite(r));
+  EXPECT_TRUE(r > 1e-5);    // it approximated something
+  EXPECT_TRUE(r < 0.5);     // and it is still this attention
+
+  // --- klein_kv ON: the geometry Sol must refuse ----------------------
+  KvFixture kv_off, kv_sol;
+  if (!kv_off.build(/*klein_kv=*/true)) { return; }
+  if (!kv_sol.build(/*klein_kv=*/true, on)) { return; }
+  SharedBuffer k0 = run(kv_off), k1 = run(kv_sol);
+  ASSERT_TRUE(!k0.empty() && !k1.empty());
+  const std::vector<float> ka = kv_off.vec(k0), kb = kv_sol.vec(k1);
+  std::size_t kdiff = 0;
+  for (std::size_t i = 0; i < ka.size(); ++i) {
+    if (ka[i] != kb[i]) { ++kdiff; }
+  }
+  std::printf("[flux2_kv] sol under klein_kv vs dense: %zu of %zu differ "
+              "(want 0 -- the gate declined)\n", kdiff, ka.size());
+  EXPECT_TRUE(kdiff == 0);
 }
 
 // A changed geometry must REBUILD the cache rather than splice a band of the

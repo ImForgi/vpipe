@@ -245,6 +245,11 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {"choices", "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "model: a models-DB key (registered by model-fetch) or an "
@@ -254,7 +259,8 @@ constexpr ConfigKey kAttrs[] = {
    // text (so the browser hides ASR/image/audio-out models).
    .need_inputs = "text", .need_outputs = "text"},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "bf16"},
+   .doc = "bf16 | f16 | f32", .def_str = "bf16",
+   .extra = kComputeDtypeChoices},
   {.key = "page_tokens", .type = ConfigType::Int,
    .doc = "ContextManager K/V page size", .def_int = 512},
   {.key = "max_pages", .type = ConfigType::Int,

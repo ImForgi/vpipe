@@ -65,9 +65,14 @@ kernel void sol_proxy_mma(
     constant int&           NQ    [[buffer(3)]],
     constant int&           NK    [[buffer(4)]],
     constant int&           D     [[buffer(5)]],
+    constant int&           GQA   [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]])
 {
   const int h  = (int)tgid.z;
+  // GQA: `qc` and the proxy it writes are per QUERY head; `kc` is per
+  // KV head. GQA 1 leaves this as the identity, so the MHA path keeps
+  // the indexing it always had.
+  const int hk = (GQA > 1) ? (h / GQA) : h;
   const int m0 = (int)tgid.y * SOL_PX_BM;
   const int n0 = (int)tgid.x * SOL_PX_BN;
   // A tile that STARTS past the extent is not a ragged tail, it is a
@@ -84,7 +89,7 @@ kernel void sol_proxy_mma(
   // operand is already [M, K] and the right one is [N, K], which is the
   // transpose_right form the dense GEMM uses for the same reason.
   const int64_t qbase = (int64_t)h * (int64_t)NQ * (int64_t)D;
-  const int64_t kbase = (int64_t)h * (int64_t)NK * (int64_t)D;
+  const int64_t kbase = (int64_t)hk * (int64_t)NK * (int64_t)D;
   const int64_t pbase = (int64_t)h * (int64_t)NQ * (int64_t)NK;
   TE tQ(const_cast<device VPIPE_ELT*>(qc) + qbase,
         dextents<int32_t, 2>(D, NQ));

@@ -252,10 +252,54 @@ TEST(accel_settings, an_image_graph_that_asked_for_nothing_gets_defaults)
   const sol::Config from_null = sol::config_from_flex(nullptr);
   EXPECT_TRUE(!from_bag.enabled);
   EXPECT_TRUE(from_bag.enabled == from_null.enabled);
-  EXPECT_TRUE(from_bag.tau == from_null.tau);
   EXPECT_TRUE(from_bag.dense_layers == from_null.dense_layers);
   EXPECT_TRUE(from_bag.local_radius == from_null.local_radius);
   EXPECT_TRUE(from_bag.key_block == from_null.key_block);
+  // TAU IS THE ONE FIELD THE TWO READERS DISAGREE ON, on purpose.
+  //
+  // The absent-bag reader falls back to sol::Config's own default, which
+  // is the value generate-video and every out-of-tree family still take.
+  // generate-image SETTLES a lower one, because Krea-2 at image
+  // sequence lengths crosses a measured error step above ~0.82 (see the
+  // `sol_tau` key's doc). So "asked for nothing" is not the same as "no
+  // bag at all" for this field, and a stage-settled value reaching the
+  // family is the whole point of writing the bag rather than leaving it
+  // empty. Do not restore the equality: it would only pass again by
+  // making one of the two defaults wrong.
+  EXPECT_TRUE(from_null.tau == 1.0f);
+  EXPECT_TRUE(from_bag.tau == 0.7f);
   // The stage's own view agrees with the bag it wrote.
   EXPECT_TRUE(st.sol_config().dense_layers == from_bag.dense_layers);
+  EXPECT_TRUE(st.sol_config().tau == from_bag.tau);
+}
+
+// THE TWO STAGES' DEFAULT TAU, spelled out, because nothing pinned
+// either of them until a change to one surfaced as an unrelated
+// equality failure in the test above.
+//
+// They differ deliberately: generate-image ships 0.7 and generate-video
+// ships 1.0. MEASURED on Krea-2 at 1024^2 -- velocity rel-L2 against
+// dense is 0.0529 at tau <= 0.815 and 0.0680 at tau >= 0.82, a 29% step
+// inside 0.005 of a standard deviation -- so an image graph's default
+// sits mid-plateau below the step. Video sequences are ~5x longer, the
+// published profile was measured there at 1.0/1.25/1.5, and the step
+// has NOT been re-measured at that length, so video keeps 1.0.
+//
+// If one of these moves, this test should fail rather than the
+// divergence being discovered somewhere else.
+TEST(accel_settings, the_two_stages_ship_different_default_tau)
+{
+  Session sess;
+  GenerateImageStage img(&sess, "gi", std::vector<InEdge>{},
+                         FlexData::make_object());
+  GenerateVideoStage vid(&sess, "gv", std::vector<InEdge>{},
+                         FlexData::make_object());
+  EXPECT_TRUE(img.config_error().empty());
+  EXPECT_TRUE(vid.config_error().empty());
+  EXPECT_TRUE(img.sol_config().tau == 0.7f);
+  EXPECT_TRUE(vid.sol_config().tau == 1.0f);
+  // Whatever each stage settled is what its bag carries, so a family
+  // reading the bag cannot see a different number from the log line.
+  EXPECT_TRUE(sol::config_from_flex(&img.accel_settings()).tau == 0.7f);
+  EXPECT_TRUE(sol::config_from_flex(&vid.accel_settings()).tau == 1.0f);
 }

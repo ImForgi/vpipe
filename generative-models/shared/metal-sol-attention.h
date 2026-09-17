@@ -130,12 +130,22 @@ class MetalSolAttention {
   // MetalCompute::supports_matrix_cores().
   static std::size_t scratch_bytes(int heads, int tokens, int d,
                                    int key_block, bool nax);
+  // GQA. `kv_heads` is how many heads K and V carry; `heads` is always
+  // the QUERY count, because that is what the routing, the CSR and the
+  // output are indexed by. The two-argument form above is this one with
+  // kv_heads == heads, which is MHA and what every caller meant before
+  // the distinction existed.
+  static std::size_t scratch_bytes(int heads, int kv_heads, int tokens,
+                                   int d, int key_block, bool nax);
 
   // ...and what is left AFTER a lend of `lend_a` / `lend_b` bytes: the
   // same greedy carve, alignment and all, rather than a subtraction.
   // This is the number a planner adds to the model's own scratch.
   static std::size_t private_bytes(int heads, int tokens, int d,
                                    int key_block, bool nax,
+                                   std::size_t lend_a, std::size_t lend_b);
+  static std::size_t private_bytes(int heads, int kv_heads, int tokens,
+                                   int d, int key_block, bool nax,
                                    std::size_t lend_a, std::size_t lend_b);
 
   // Encode summaries -> stats -> threshold -> forward into `enc`.
@@ -150,6 +160,29 @@ class MetalSolAttention {
               const metal_compute::SharedBuffer& v,
               metal_compute::SharedBuffer& out, int heads, int tokens,
               int d, float scale, const sol::Config& cfg,
+              std::string* err);
+
+  // GQA: K and V carry `kv_heads` heads, Q and the output `heads`.
+  //
+  // The summaries of K and V are per KV head -- that is what there is to
+  // summarise -- while the routing decision, the flags, the CSR and both
+  // partial softmaxes stay per QUERY head, so a query head reads the
+  // group it belongs to. The exact half is steel, which has always been
+  // GQA-aware; this sets its `gqa` instead of the 1 it was pinned at.
+  //
+  // `heads % kv_heads` must be 0. The form above is this one at
+  // kv_heads == heads.
+  //
+  // REFUSED under VPIPE_SOL_NO_MASKED_APPROX: the simdgroup approximate
+  // kernel indexes the summary sequence by the query head, so it would
+  // read another group's centroids. That path is a bench A/B, and a
+  // wrong answer there is worse than not having it.
+  bool encode(metal_compute::ComputeEncoder& enc,
+              const metal_compute::SharedBuffer& q,
+              const metal_compute::SharedBuffer& k,
+              const metal_compute::SharedBuffer& v,
+              metal_compute::SharedBuffer& out, int heads, int kv_heads,
+              int tokens, int d, float scale, const sol::Config& cfg,
               std::string* err);
 
   // Blocks kept exact by the LAST completed encode, and the total the
@@ -286,7 +319,8 @@ class MetalSolAttention {
   // `unload_when_idle: destroy` and left the VAE decode with nothing.
   // See metal_compute_residency.a_subview_adds_the_whole_parent.
   void drop_residency_();
-  bool ensure_scratch_(int heads, int tokens, int d, std::string* err);
+  bool ensure_scratch_(int heads, int kv_heads, int tokens, int d,
+                       std::string* err);
   bool ensure_steel_(int tokens, std::string* err);
   // The steel entry point for this object's kernel arm AND head width.
   metal_compute::ComputeFunction _lib_for_width_(
@@ -370,6 +404,10 @@ class MetalSolAttention {
   bool                        _res_added = false;
   metal_compute::SharedBuffer _counts, _params, _sp_params, _sp_bounds;
   int _heads = 0, _tokens = 0, _d = 0, _nq = 0, _nk = 0, _tpad = 0;
+  // Heads K and V carry. Equal to _heads under MHA, which is what every
+  // caller was until GQA; part of the geometry tag because the key
+  // summaries are sized by it.
+  int _kv_heads = 0;
   int _nqa = 0;      // approximate-half tiles: ceil(T / 32), always
   int _blk = 0;
   long long _total_blocks = 0;

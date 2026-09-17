@@ -96,7 +96,35 @@ final class AppModel: ObservableObject {
         didSet { defaults.set(memoryCapMB, forKey: "memoryCapMB") }
     }
     @Published var language: String {
-        didSet { defaults.set(language, forKey: "language") }
+        didSet {
+            defaults.set(language, forKey: "language")
+            applyAppLanguage()
+        }
+    }
+
+    // The app's OWN interface, as distinct from the session's.
+    //
+    // `language` reaches the helpers through the config JSON, which is
+    // read when each one launches. AppKit does not work that way: it
+    // resolves the bundle's localization from AppleLanguages ONCE at
+    // startup, so this sets the app's own per-application override --
+    // the same value System Settings' Language & Region writes -- and
+    // it takes effect on the next launch rather than immediately.
+    //
+    // The session tags are usable verbatim: macOS canonicalises zh-cn
+    // to the Simplified bundle and zh-tw to the Traditional one, which
+    // is why there is no mapping table here. VERIFIED by launching
+    // under each and reading back the menu bar.
+    //
+    // Empty removes the key rather than writing "", so the app follows
+    // the system language again instead of being pinned to a locale
+    // that does not exist.
+    private func applyAppLanguage() {
+        if language.isEmpty {
+            defaults.removeObject(forKey: "AppleLanguages")
+        } else {
+            defaults.set([language], forKey: "AppleLanguages")
+        }
     }
     // Plugins ticked in the Pipelines pane, by FILE NAME within
     // <work>/plugins. Names rather than paths so the selection follows

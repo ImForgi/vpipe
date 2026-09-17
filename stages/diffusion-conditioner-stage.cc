@@ -46,6 +46,16 @@ namespace {
 // (Referenced only from the Apple-gated code; maybe_unused for non-Apple.)
 [[maybe_unused]] constexpr unsigned kModelPort = 2;
 
+// Closed value sets for the editor's dropdowns. The idle policies are
+// model_memory::parse_unload_policy's modern four (it also takes the
+// legacy "always" / "never", which this stage's own doc still names);
+// the reference modes are the ctor's own three.
+constexpr SpecExtra kUnloadChoices[] = {
+  {"choices", "auto,destroy,park,keep"},
+};
+constexpr SpecExtra kReferenceModeChoices[] = {
+  {"choices", "auto,latch,per_beat"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "model dir (text_encoder/, transformer/, tokenizer/); the "
@@ -75,7 +85,7 @@ const ConfigKey kAttrs[] = {
           "would quietly restore a folder of images from the first one. "
           "\"auto\" (default) is per_beat for a vision-only family and "
           "latch for the rest",
-   .def_str = "auto"},
+   .def_str = "auto", .extra = kReferenceModeChoices},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
           "oport1 -- a GROUNDED encode of the (possibly empty) negative prompt "
@@ -94,7 +104,7 @@ const ConfigKey kAttrs[] = {
           "kernel as purgeable -- reclaimed only if the box needs the RAM, "
           "reused without a reload if not) or \"keep\" (hold them pinned). "
           "Legacy: \"always\" = destroy, \"never\" = keep",
-   .def_str = "auto"},
+   .def_str = "auto", .extra = kUnloadChoices},
 };
 const PortSpec kIports[] = {
   {.name = "prompt", .doc = "prompt text (FlexData string or {text: ...})",

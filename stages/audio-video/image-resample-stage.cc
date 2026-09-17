@@ -86,6 +86,18 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
 ImageResampleStage::~ImageResampleStage() = default;
 
 namespace {
+// The closed value sets, for the editor's dropdowns (see SpecExtra's
+// "choices" in stage-config.h). Named arrays because `extra` is a span:
+// a braced temporary would not outlive the declaration it is written in.
+//
+// These must agree with the ctor's own branch chains above, which stay
+// the authority on what is accepted.
+constexpr SpecExtra kFitChoices[] = {
+  {"choices", "pad,crop,stretch,manual"},
+};
+constexpr SpecExtra kAlgorithmChoices[] = {
+  {"choices", "lanczos,bilinear,bicubic"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "width",  .type = ConfigType::Int,
    .doc = "output width in pixels; omit (or set <= 0) to infer it from "
@@ -99,7 +111,7 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "aspect-ratio handling: pad (match long side + pad_color) | "
           "crop (match short side + centre-crop) | stretch (change AR) | "
           "manual (sample from src_x,src_y at scale, pad the rest)",
-   .def_str = "pad"},
+   .def_str = "pad", .extra = kFitChoices},
   {.key = "pad_color", .type = ConfigType::String,
    .doc = "#RRGGBB solid pad colour for pad / manual (f32 frames treat it "
           "as 0..1 normalised)",
@@ -123,7 +135,7 @@ constexpr ConfigKey kAttrs[] = {
           "a VOSR restoration upscales its input this way before anything "
           "sees it, and a different filter there is a different input. It "
           "has no GPU kernel and runs on the CPU",
-   .def_str = "lanczos"},
+   .def_str = "lanczos", .extra = kAlgorithmChoices},
 };
 const PortSpec kIports[] = {
   {.name = "frames", .doc = "planar RGB TensorBeat [3,H,W] (u8 or f32)",

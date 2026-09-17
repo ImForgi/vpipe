@@ -1077,6 +1077,27 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
         mc, /*bf16=*/true, cfg.sage, "MetalFlux2Transformer", &sage_fatal);
     if (sage_fatal) { return nullptr; }
   }
+  // Sol-Attn. Built only when asked: its kernels are a separate library
+  // and its scratch is real, so a graph that never names the tier pays
+  // nothing. A failure to build WARNS rather than being fatal -- the
+  // dense attention below is a complete answer, which is the difference
+  // from Sage, whose silent refusal would change what the log means.
+  if (cfg.sol.enabled) {
+    std::string serr;
+    m->_sol = MetalSolAttention::load(mc, /*bf16=*/true, &serr);
+    if (m->_sol == nullptr && mc->session() != nullptr) {
+      mc->session()->warn(fmt(
+          "MetalFlux2Transformer: sol_attn was asked for but its kernels "
+          "did not build ({}); keeping the dense attention", serr));
+    } else if (mc->session() != nullptr) {
+      mc->session()->info(fmt(
+          "MetalFlux2Transformer: Sol-Attn on -- tau {:.2f}, key block {}, "
+          "{} dense layer(s), local radius {}",
+          (double)cfg.sol.tau,
+          cfg.sol.key_block > 0 ? cfg.sol.key_block : sol::kBlock,
+          cfg.sol.dense_layers, cfg.sol.local_radius));
+    }
+  }
   // Fuse the SwiGLU FF (default on, EXCEPT on the matmul2d path): needs the
   // dense swiglu twin, and -- for a quantized DiT -- the g64 qmm swiglu twins.
   // The weight dequant is F16 (the f16 metallib's native-half path).
@@ -1941,6 +1962,25 @@ MetalFlux2Transformer::ane_runtime_bytes(const Config& cfg,
   return n;
 }
 
+std::size_t
+MetalFlux2Transformer::sol_scratch_bytes(int seq) const
+{
+  if (!_sol || seq <= 0) { return 0; }
+  // The same condition forward_dit applies: every block dense means the
+  // routed path is never reached and nothing is allocated for it.
+  if (_cfg.sol.dense_layers >= _cfg.n_double + _cfg.n_single) { return 0; }
+  // WHAT THE FORWARD LENDS IT. `nrm` is the modulated norm, consumed by
+  // the q/k/v projections before the attention; `ob` is the out-
+  // projection's destination, written after it. Both are one hidden
+  // width, so FLUX.2 lends far less than Krea-2 does and most of Sol's
+  // scratch here is its own -- which is exactly why this figure has to
+  // reach the residency reserve.
+  const std::size_t lend = (std::size_t)seq * (std::size_t)_cfg.hidden * 2;
+  return MetalSolAttention::private_bytes(
+      _cfg.n_heads, _cfg.n_heads, seq, _cfg.head_dim, _cfg.sol.key_block,
+      _sol->uses_matrix_cores(), lend, lend);
+}
+
 void
 MetalFlux2Transformer::ane_setup_(int image_rows, int joint_rows)
 {
@@ -2662,7 +2702,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   };
 
   // Steel flash-attention setup (built ONCE; seq is constant across all blocks
-  // of a forward). FLUX.2 attention is MHA -- 32 q/k/v heads, head_dim 128, no
+  // of a forward). FLUX.2 attention is MHA -- HED = n_heads q/k/v heads (24
+  // at the shipped width), head_dim 128, no
   // GQA (gqa_factor 1) -- so Q/K/V/O are all [HED, seq, HD] (the head-major
   // transposes below produce exactly that). Register-resident flash attention
   // is O(seq) memory + tiled, vs the scalar sdpa_full_f16's O(seq^2) inner loop
@@ -2718,6 +2759,50 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     fill_params(attn_params_ref, IS_REF, IS_REF);
     fn_attn_ref = attn_fn(IS_REF, IS_REF, false);
     use_steel = fn_attn_ref.valid();
+  }
+  // ---- Sol-Attn ------------------------------------------------------
+  //
+  // GATED ON THE GEOMETRY, NOT ON `klein_kv`. Sol summarises a key set
+  // and stands in for the blocks it drops, which only means anything
+  // when the keys ARE the queries. That holds for the plain joint
+  // attention -- [text, generated], and with references but without
+  // klein_kv, [text, generated, refs] -- and it is exactly what the
+  // reference-editing path runs. It does NOT hold under klein_kv: a
+  // cached step attends QA queries over seq + spliced reference keys,
+  // and a fill step runs a second query group over reference keys
+  // alone. Testing the shapes rather than the flag means a later change
+  // to how those are derived cannot hand Sol an asymmetric geometry
+  // without this line noticing.
+  //
+  // BELOW 16 ROUTING BLOCKS IT IS NOT WORTH IT: the local band, the
+  // sink and the always-exact tail already cover most of the sequence.
+  const int sol_blk =
+      _cfg.sol.key_block > 0 ? _cfg.sol.key_block : sol::kBlock;
+  const bool sol_on = (bool)_sol && QA == seq && KL == seq && !split_attn &&
+                      _cfg.sol.dense_layers < n_blocks &&
+                      ((seq + sol_blk - 1) / sol_blk) >= 16;
+  if (sol_on) {
+    // LEND THE TWO BUFFERS THAT ARE DEAD WHILE IT RUNS. `nrm` is the
+    // modulated norm, fully consumed by the q/k/v projections that
+    // precede the attention in both stacks; `ob` is the out-projection's
+    // destination, written only after it. `atb` is deliberately NOT
+    // among them -- it is where Sol writes. Each is one hidden width, so
+    // this covers less than Krea-2's lend and the rest is Sol's own;
+    // sol_scratch_bytes() reports that remainder to the residency
+    // reserve.
+    _sol->set_arena(nrm, ob);
+    // WHAT THE PREVIOUS FORWARD ROUTED. Read and reset here rather than
+    // after the stacks: the counter is written by the GPU and this
+    // forward commits in pieces, so reading it at the end would report a
+    // number the device had not finished producing.
+    const long long tot = _sol->total_blocks();
+    const long long got = _sol->exact_blocks();
+    if (got > 0 && tot > 0 && _mc->session() != nullptr) {
+      _mc->session()->log_debug(fmt(
+          "FLUX.2 Sol-Attn: kept {} of {} key blocks exact ({:.1f}%)",
+          got, tot, 100.0 * (double)got / (double)tot));
+    }
+    _sol->reset_counts();
   }
   // SAGE, on the matrix-core entry and on the UNDIVIDED attention only.
   //
@@ -2801,7 +2886,39 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     op.tr_rope(jq, qt, seq, HED, HD);   // fused transpose + rope (q)
     op.tr_rope(jk, kt, KL, HED, HD);    // fused transpose + rope (k)
     op.tr(jv, 0, vt, 0, KL, HED, HD);   // v: transpose only (no rope)
-    if (use_steel) {
+    // SOL'S ROUTED ATTENTION, on the blocks it routes. The exact half
+    // runs Sol's own steel/nax entry built for this geometry, so this
+    // REPLACES the dispatch below rather than wrapping it.
+    //
+    // `layer` IS PER STACK -- both loops start at 0 -- so
+    // `sol_dense_layers` leaves that many leading blocks dense in the
+    // doubles AND in the singles. That is the convention `sage_on`
+    // below already uses against the same argument; changing it here
+    // would silently change Sage's meaning too.
+    //
+    // THE SINK IS THE TEXT PREFIX. The joint sequence is [text,
+    // generated(, refs)] and a centroid over prompt tokens is a prompt
+    // half-read, so those rows are attended exactly. Reference tokens
+    // are image content with the same spatial redundancy as the
+    // generated ones and are routed like them.
+    const bool sol_here = sol_on && layer >= _cfg.sol.dense_layers;
+    if (sol_here) {
+      sol::Config sc = _cfg.sol;
+      sc.sink_start  = 0;
+      sc.sink_tokens = TS;
+      std::string serr;
+      if (!_sol->encode(*op.e, qt, kt, vt, atb, HED, seq, HD, scale, sc,
+                        &serr)) {
+        // Said once per forward rather than once per block: a geometry
+        // Sol cannot serve fails the same way for all of them.
+        if (layer == _cfg.sol.dense_layers && _mc->session() != nullptr) {
+          _mc->session()->warn(fmt(
+              "MetalFlux2Transformer: sol_attn declined this forward ({}); "
+              "the dense attention ran instead", serr));
+        }
+        op.sdpa(qt, kt, vt, atb, scale, seq, HD, HED);
+      }
+    } else if (use_steel) {
       // SAGE: quantize q/k for THIS block, into the same encoder and
       // immediately before the dispatch that reads them. The encoder is
       // serial, so the ordering is the encoder's and there is no barrier

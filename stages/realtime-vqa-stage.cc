@@ -481,6 +481,11 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {"choices", "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "VLM model: a models-DB key (registered by model-fetch) or an "
@@ -496,7 +501,8 @@ constexpr ConfigKey kAttrs[] = {
    .def_str = "", .suggest_db = kModelRegistryDb,
    .suggest_db_type = "qwen3.5-vision-encoder,gemma4-vision-encoder"},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "bf16"},
+   .doc = "bf16 | f16 | f32", .def_str = "bf16",
+   .extra = kComputeDtypeChoices},
   {.key = "language", .type = ConfigType::String,
    .doc = "IETF UI/prompt locale for the built-in scene prompts "
           "(en-us | zh-cn | zh-tw); empty inherits the session language",

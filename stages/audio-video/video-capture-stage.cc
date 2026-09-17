@@ -161,6 +161,11 @@ VideoCaptureStage::VideoCaptureStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The element types this stage emits, for the editor's dropdown; the
+// ctor's own check stays the authority.
+constexpr SpecExtra kOutputDtypeChoices[] = {
+  {"choices", "u8,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "device_id", .type = ConfigType::Uint,
    .doc = "avfoundation VIDEO device index (mutually exclusive with "
@@ -188,7 +193,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "output_dtype", .type = ConfigType::String,
    .doc = "emitted element type: \"u8\" (default) or \"f32\" (normalized "
           "to [0,1])",
-   .def_str = "u8"},
+   .def_str = "u8", .extra = kOutputDtypeChoices},
   {.key = "camera_name", .type = ConfigType::String,
    .doc = "label copied into each beat's sideband so multi-camera graphs can "
           "tell sources apart",

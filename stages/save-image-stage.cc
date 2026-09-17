@@ -193,6 +193,12 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
 SaveImageStage::~SaveImageStage() = default;
 
 namespace {
+// The keys of kFormats above, which stays the authority. Both spellings
+// of the two aliased formats are offered, because both are accepted and
+// a config may hold either.
+constexpr SpecExtra kFormatChoices[] = {
+  {"choices", "png,jpeg,jpg,webp,bmp,tiff,tif"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
    .doc = "output image file path; a printf integer conversion "
@@ -201,7 +207,8 @@ constexpr ConfigKey kAttrs[] = {
    .is_path = true, .path_write = true, .path_filter = "image"},
   {.key = "format", .type = ConfigType::String, .required = false,
    .doc = "png | jpeg (jpg) | webp | bmp | tiff; default from the path "
-          "extension, else png"},
+          "extension, else png",
+   .extra = kFormatChoices},
   {.key = "quality", .type = ConfigType::Int, .required = false,
    .doc = "lossy codecs (jpeg, lossy webp): 1..100, higher is better "
           "(default 90)"},

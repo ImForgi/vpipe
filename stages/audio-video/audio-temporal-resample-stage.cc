@@ -57,6 +57,11 @@ atempo_chain_(double tempo)
   return out;
 }
 
+// The pitch policies, for the editor's dropdown; the ctor's own check
+// stays the authority.
+constexpr SpecExtra kPitchChoices[] = {
+  {"choices", "maintain,follow,raise,lower"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_sample_rate", .type = ConfigType::Int, .required = false,
    .doc = "the sample rate to resample TO -- the temporal RESOLUTION, "
@@ -77,7 +82,7 @@ constexpr ConfigKey kAttrs[] = {
           "free, because it is a resample and nothing else. \"raise\" / "
           "\"lower\" shift by `pitch_semitones` INDEPENDENTLY of speed, "
           "so the two knobs compose",
-   .def_str = "maintain"},
+   .def_str = "maintain", .extra = kPitchChoices},
   {.key = "pitch_semitones", .type = ConfigType::Real, .required = false,
    .doc = "how far `raise` / `lower` shifts, in equal-tempered "
           "semitones (12 = an octave). Must be positive for those two -- "

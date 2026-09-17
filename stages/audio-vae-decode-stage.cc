@@ -28,6 +28,13 @@ namespace {
 // The model iport, appended after the primary `latent` input.
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
 
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" would land in the `auto` branch and mean
+// something other than what it says, so it is not offered. The legacy
+// "always" / "never" stay accepted and show as unlisted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {"choices", "auto,destroy,keep"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "model dir carrying an audio VAE (read from <hf_dir>/audio_vae). "
@@ -38,8 +45,12 @@ const ConfigKey kAttrs[] = {
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "\"auto\" (default) decides from physical RAM vs the pipeline's "
-          "weight bytes; \"always\" / \"never\" force it",
-   .def_str = "auto"},
+          "weight bytes; \"destroy\" / \"keep\" force it (legacy spellings: "
+          "\"always\" / \"never\"). \"park\" is NOT implemented here and "
+          "resolves as \"auto\": parking is the manager's to do and needs "
+          "this stage's borrow to end first -- only diffusion-conditioner "
+          "does that today",
+   .def_str = "auto", .extra = kUnloadChoices},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
           "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "

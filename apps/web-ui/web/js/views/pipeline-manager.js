@@ -1,5 +1,7 @@
-// Pipeline Manager view: three panes -- pipeline list (1/4), stage
-// graph (1/2), and the config panel (1/4).
+// Pipeline Manager view: the pipeline list beside the reusable editor,
+// which is the stage graph plus the configuration panel. The panel docks
+// BELOW the graph by default and can be moved to its right; either way a
+// divider sets the split. See the layout preferences below.
 
 import { el, clear, append, toast, openModal, openErrorModal, openMenu, kbd }
   from '../dom.js';
@@ -15,6 +17,42 @@ import { openConnectEditor } from '../connect-editor.js';
 import { typesCompatible, tagsCompatible } from '../port-compat.js';
 import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
+
+// --- editor layout preferences --------------------------------------
+// Where the configuration pane docks, whether field documentation shows,
+// and whether the graph pane is pinned to the lane list. Per USER rather
+// than per pipeline: they describe how someone likes to work, not
+// anything about the graph, so they are not part of a pipeline file and
+// not part of a composer panel's config -- the same reasoning the theme
+// and the file dialog's preview toggle already follow. Every read and
+// write is guarded: storage is blocked in a private window, and a
+// layout toggle is not worth a thrown exception.
+const LS_DOCK  = 'vpipe_pe_cfg_dock';    // 'bottom' (default) | 'right'
+const LS_DOCS  = 'vpipe_pe_cfg_docs';    // '1' (default) | '0'
+const LS_LANES = 'vpipe_pe_lane_view';   // '1' | '0' (default)
+// WHICH PIPELINE THE SELECTOR LAST HAD. Every view switch re-mounts this
+// view (app.js calls mount() again), so the selection cannot live in the
+// closure: leaving the Pipelines view for User I/O and coming back built
+// a fresh state with no selection and fell to the first pipeline, losing
+// whichever one was being edited.
+//
+// Advisory, like the rest: a pipeline can be unloaded or renamed from
+// anywhere, so a miss just means "no opinion" and the first pipeline is
+// used. Kept separate from the phone shell's own last-pipeline key
+// (phone-recent.js): that one steers which pipeline the phone's stage
+// panels open on, and a desktop selection should not quietly re-point
+// them.
+const LS_PIPE  = 'vpipe_pe_pipeline';    // '' when nothing is selected
+
+function prefGet(key, dflt) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? dflt : v;
+  } catch (e) { return dflt; }
+}
+function prefSet(key, v) {
+  try { localStorage.setItem(key, v); } catch (e) { /* storage blocked */ }
+}
 
 export function mountPipelineManager(container) {
   return mountEditor(container, { showSelector: true, showControls: false });
@@ -48,6 +86,48 @@ function mountEditor(container, opts = {}) {
   // the divider; onSplit lets a host persist it as a view config.
   let split = clampN(
     Number.isFinite(opts.split) ? opts.split : 2 / 3, 0.2, 0.85);
+  // BOTTOM by default. A pipeline reads left to right, so width is what
+  // the canvas is always short of and height is what it has spare -- a
+  // configuration pane beside it takes the scarce axis to show a column
+  // of fields that does not need it. Docked below, the same form spreads
+  // into however many columns fit (see the .cfg grid) and the canvas
+  // keeps the full width.
+  let cfgDock = prefGet(LS_DOCK, 'bottom') === 'right' ? 'right' : 'bottom';
+  let showDocs = prefGet(LS_DOCS, '1') !== '0';
+  // The lane list is normally a FALLBACK the pane drops to when it is too
+  // narrow to draw a graph. This pins it on at any width: it says more
+  // about a long pipeline per vertical pixel than the canvas does, and
+  // someone reading topology rather than editing it may simply prefer it.
+  let forceLanes = prefGet(LS_LANES, '0') === '1';
+  // ONE step of undo for a configuration edit, which is the mistake this
+  // is for: a value typed over, a checkbox flipped, a field cleared --
+  // noticed immediately. {sid, before, after, undone}; `undone` says
+  // which way the pair currently points, so the same slot serves Redo
+  // rather than needing a second stack.
+  //
+  // The PUT replaces a stage's config outright (it is not a merge), so
+  // restoring `before` really does remove a key the edit added.
+  let cfgUndo = null;
+  // What the form on screen is known to hold, so the NEXT apply can pair
+  // itself against it. A render seeds it from the schema; each apply
+  // moves it on -- which is what keeps repeated auto-applies (one per
+  // blur) collapsing into a single step rather than pairing every edit
+  // against the state the form was first built from.
+  let cfgLast = null;    // {sid, cfg}
+  // The rendered pair of buttons, held so an apply can re-enable them
+  // WITHOUT a re-render. The auto-apply-on-blur path does not rebuild the
+  // form on purpose -- that would take the caret out of the field the
+  // user just tabbed into -- so without this the first edit of a session
+  // leaves Undo greyed out until something else redraws the header.
+  let undoBtns = null;   // {undo, redo}
+  // Which configuration render is the current one. renderConfig empties
+  // the header BEFORE awaiting the stage's config and fills it AFTER, so
+  // two overlapping renders interleave as clear, clear, fill, fill --
+  // and the header ends up holding two sets of buttons, then three,
+  // crowding the layout toggles out of the row. Anything that re-renders
+  // in bursts reaches this: a dock flip, or a panel dragged through the
+  // narrow crossover. Only the newest render may write.
+  let cfgSeq = 0;
   const state = {
     pipelines: [],        // summaries
     stageTypes: [],
@@ -205,10 +285,29 @@ function mountEditor(container, opts = {}) {
     onclick: (e) => { e.stopPropagation(); openStagePicker(); },
   }, '+');
 
+  // The documentation toggle, repeated in the GRAPH header.
+  //
+  // One column hides the configuration pane and the three layout toggles
+  // in its header with it, so turning documentation off while reading a
+  // narrow panel meant widening it, toggling, and narrowing it again.
+  //
+  // Only this one is repeated. With no pane there is nothing to dock,
+  // and the lane list is what this width draws whatever the lane toggle
+  // says -- so the other two would be buttons that do nothing here.
+  //
+  // Built with el() rather than the toolBtn helper below: `const` is in
+  // its temporal dead zone until its own line runs, and this is needed
+  // before the header is assembled.
+  const docsBtnHead = el('button', {
+    class: 'graph-head-tool', type: 'button',
+    onclick: (e) => { e.stopPropagation(); toggleDocs(); },
+  }, 'ⓘ');
+
   graphHead.append(
     el('span', { class: 'title' }, t('pl.stages')),
     el('span', { class: 'grow' }),
     stagesCount,
+    docsBtnHead,
     addStageBtn);
 
   function openStagePicker() {
@@ -320,9 +419,48 @@ function mountEditor(container, opts = {}) {
   // so they stay reachable no matter where a long form is scrolled.
   // renderConfig fills this per stage; it is empty when none is selected.
   const cfgActions = el('span', { class: 'pane-head-actions' });
+  // The three LAYOUT toggles, grouped at the far right of the same
+  // header: where this pane sits, whether its fields carry their
+  // documentation, and whether the graph pane draws a canvas or the lane
+  // list. They live here rather than on the graph header because all
+  // three are about the shape of the editor, and one group in one corner
+  // is easier to find again than three buttons in three places.
+  //
+  // Titles and pressed state are filled by the apply* functions below, so
+  // the button and the state it reports cannot be spelled twice.
+  const toolBtn = (glyph, onclick) => el('button', {
+    class: 'pe-tool', type: 'button', onclick,
+  }, glyph);
+  const dockBtn = toolBtn('', () => {
+    cfgDock = cfgDock === 'bottom' ? 'right' : 'bottom';
+    prefSet(LS_DOCK, cfgDock);
+    applyDock();
+    // The dock decides how much WIDTH the configuration costs, which is
+    // the input to the one-column crossover -- so the layout has to be
+    // re-decided here rather than waiting for the next resize.
+    renderGraphPane();
+    if (!state.oneColumn) { renderConfig(); }
+  });
+  // One flip, two buttons: this one and the graph header's copy for the
+  // one-column layout. A handler each would be two spellings of a single
+  // decision, which is how they come to disagree.
+  function toggleDocs() {
+    showDocs = !showDocs;
+    prefSet(LS_DOCS, showDocs ? '1' : '0');
+    applyDocs();
+  }
+  const docsBtn = toolBtn('ⓘ', () => toggleDocs());
+  const laneBtn = toolBtn('☰', () => {
+    forceLanes = !forceLanes;
+    prefSet(LS_LANES, forceLanes ? '1' : '0');
+    applyLanes();
+  });
+  const cfgTools = el('span', { class: 'pe-cfg-tools' },
+    dockBtn, docsBtn, laneBtn);
   const cfgPane = el('div', { class: 'pane' },
     el('div', { class: 'pane-head' },
-      el('span', { class: 'title' }, t('pl.configuration')), cfgActions),
+      el('span', { class: 'title' }, t('pl.configuration')),
+      cfgActions, cfgTools),
     cfgBody);
 
   // Run / pause / stop overlay pinned to the canvas top-left (standalone
@@ -344,12 +482,63 @@ function mountEditor(container, opts = {}) {
     graphPane.style.flexGrow = String(split);
     cfgPane.style.flexGrow = String(1 - split);
   }
+  // `split` is the GRAPH's share of whichever axis the dock chose, so one
+  // fraction serves both orientations and a dock flip keeps the
+  // proportion the operator set rather than resetting it.
+  function applyDock() {
+    const bottom = cfgDock === 'bottom';
+    editorArea.classList.toggle('dock-bottom', bottom);
+    dockBtn.textContent = bottom ? '⬓' : '◨';
+    dockBtn.title = bottom ? t('pl.dock_right') : t('pl.dock_bottom');
+    divider.title = bottom ? t('pl.resize_height') : t('pl.resize_width');
+    applySplit();
+  }
+  function applyDocs() {
+    // On the EDITOR, not the pane: the one-column layout renders the same
+    // form inline under a lane row, and a reader who turned the
+    // documentation off meant everywhere.
+    editorArea.classList.toggle('no-docs', !showDocs);
+    // Both copies: the pane header's, and the graph header's for the
+    // one-column layout. They are one setting, so they read the same.
+    for (const b of [docsBtn, docsBtnHead]) {
+      b.title = showDocs ? t('pl.docs_hide') : t('pl.docs_show');
+      b.setAttribute('aria-pressed', showDocs ? 'true' : 'false');
+    }
+    // The tooltip stands in for the documentation, so it exists exactly
+    // while the lines do not -- on whatever form is on screen already.
+    for (const k of editorArea.querySelectorAll('.field .key')) {
+      const d = k.dataset.doc || '';
+      if (!showDocs && d) { k.title = d; } else { k.removeAttribute('title'); }
+    }
+  }
+  // The button's own state, separate from acting on it: at mount there is
+  // no graph to re-render yet (renderGraphPane runs once the pipeline
+  // detail arrives), and spelling the pressed state twice is how the
+  // button and the layout come to disagree.
+  function applyLaneBtn() {
+    laneBtn.title = forceLanes ? t('pl.lane_view_off') : t('pl.lane_view_on');
+    laneBtn.setAttribute('aria-pressed', forceLanes ? 'true' : 'false');
+  }
+  function applyLanes() {
+    applyLaneBtn();
+    // Returning to the canvas: its pan/zoom was recorded against a
+    // viewport the lane list has since resized, so refit rather than
+    // restore (the resize watcher does the same on its own crossover).
+    if (!forceLanes) { state.graphView = {}; }
+    renderGraphPane();
+  }
   applySplit();
+  applyDock();
+  applyDocs();
+  applyLaneBtn();
   divider.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
     const r = editorArea.getBoundingClientRect();
+    // The divider resizes the axis the dock laid the panes out on.
+    const bottom = cfgDock === 'bottom';
     const mv = (e) => {
-      split = clampN((e.clientX - r.left) / r.width, 0.2, 0.85);
+      split = clampN(bottom ? (e.clientY - r.top) / r.height
+                            : (e.clientX - r.left) / r.width, 0.2, 0.85);
       applySplit();
     };
     const up = () => {
@@ -381,7 +570,7 @@ function mountEditor(container, opts = {}) {
     const ro = new ResizeObserver(() => {
       if (!document.body.contains(pmRoot)) { return; }
       const one = editorNarrow();
-      const now = one || isNarrow();
+      const now = laneMode(one);
       // Compared against WHAT IS ON SCREEN (recorded by renderGraphPane)
       // rather than against the last observation. The two differ at
       // mount: the pane is measured at 0 before layout, which isNarrow()
@@ -410,6 +599,15 @@ function mountEditor(container, opts = {}) {
     // canvas-vs-list, and a resize can move either without the other.
     ro.observe(graphBody);
     ro.observe(editorArea);
+  }
+  // The configuration's own width, which the window, the divider and the
+  // dock button all move. A SECOND observer because the one above
+  // returns early whenever the canvas/list decision is unchanged -- which
+  // is most of a divider drag, and exactly when the columns must reflow.
+  if (typeof ResizeObserver !== 'undefined') {
+    const cro = new ResizeObserver(() => layoutCfgColumns());
+    cro.observe(cfgBody);
+    cro.observe(editorArea);
   }
 
   function iconBtn(icon, label, onclick, key) {
@@ -524,7 +722,15 @@ function mountEditor(container, opts = {}) {
     } catch (e) { toast(t('pl.list_failed', { msg: e.message }), 'error');
       return; }
     if (!keepSel || !state.pipelines.find((p) => p.id === state.selectedId)) {
-      state.selectedId = state.pipelines[0] ? state.pipelines[0].id : null;
+      // No selection to keep -- a fresh mount, or the selected pipeline
+      // is gone. Prefer the one this operator last chose, and fall back
+      // to the first when it is no longer loaded: the memory is a
+      // preference, never a reason to show nothing.
+      const want = prefGet(LS_PIPE, '');
+      const remembered = !!want && state.pipelines.some((p) => p.id === want);
+      state.selectedId = remembered
+          ? want
+          : (state.pipelines[0] ? state.pipelines[0].id : null);
       state.detail = null;
       state.selectedStage = null;
       state.laneOpen = null;      // fold the inline form with its stage
@@ -532,9 +738,20 @@ function mountEditor(container, opts = {}) {
       state.graphLayout = null;   // lay out the new pipeline clean (no glide)
       state.graphPins = new Map();
     }
+    rememberSelection();
     renderList();
     if (state.selectedId) { await loadDetail(state.selectedId); }
     else { renderGraphPane(); renderConfig(); }
+  }
+
+  // The selection, written down wherever it SETTLES rather than at each
+  // of the half-dozen places that move it (create, load, rename, rebind,
+  // a click in the list): those all end in refreshList or selectPipeline.
+  // The standalone editor is bound to its pipeline rather than choosing
+  // one, so it has no opinion to record.
+  function rememberSelection() {
+    if (!showSelector) { return; }
+    prefSet(LS_PIPE, state.selectedId || '');
   }
 
   async function loadDetail(id) {
@@ -552,6 +769,7 @@ function mountEditor(container, opts = {}) {
 
   async function selectPipeline(id) {
     state.selectedId = id;
+    rememberSelection();
     state.selectedStage = null;
     state.pending = null;
     state.selectedEdge = null;
@@ -855,8 +1073,30 @@ function mountEditor(container, opts = {}) {
   function editorNarrow() {
     const w = editorArea.clientWidth;
     if (w <= 0) { return false; }        // unmeasured -> wide, as above
-    return w < NARROW_PX + toolbox.offsetWidth + CFG_MIN_PX;
+    // A FIXED crossover, measured from the editor and NOTHING ELSE.
+    //
+    // It used to add `toolbox.offsetWidth`, which is a measurement of the
+    // decision's own outcome: the toolbox is hidden exactly when the lane
+    // list shows, so the moment this returned true the term went to zero
+    // and the next render answered false. The `+ CFG_MIN_PX` term hid
+    // that -- until the dock made it conditional, and a bottom-docked
+    // panel in the band between the two thresholds settled with the lane
+    // list drawn and `oneColumn` false, where clicking a row selected it
+    // and expanded nothing.
+    //
+    // Nor does the DOCK belong here any more. Where the configuration
+    // sits decides how much width it costs the canvas, but this decides
+    // something else: whether the panel is big enough to be worth
+    // splitting at all. Below this, there is one column and the form
+    // goes inline under its row, wherever the pane would have been.
+    return w < NARROW_PX + CFG_MIN_PX;
   }
+
+  // Whether the graph pane draws the lane list rather than the canvas.
+  // Three causes, one answer, so the renderer and the resize watcher
+  // cannot reach different ones: the editor is down to a single column,
+  // the operator pinned the list on, or the pane is below the crossover.
+  function laneMode(one) { return one || forceLanes || isNarrow(); }
 
   function renderGraphPane(o = {}) {
     if (state.missing) { renderRebindPane(); return; }
@@ -870,10 +1110,15 @@ function mountEditor(container, opts = {}) {
     // rendering the inline form has anywhere to live. A WIDE editor whose
     // divider has been dragged hard left still reaches it on its own
     // crossover, and keeps its configuration pane.
-    const narrow = one || isNarrow();
+    const narrow = laneMode(one);
     state.oneColumn = one;
     state.renderedNarrow = narrow;
     editorArea.classList.toggle('pe-narrow', one);
+    // One column HIDES the configuration pane, and a hidden pane keeps
+    // whatever its last render put in the header -- which would still be
+    // there, stale, when the panel widens again. Empty it on the way in
+    // so it is rebuilt from nothing on the way out.
+    if (one) { clear(cfgActions); undoBtns = null; }
     // The surviving pane has to be TOLD to take the whole width. Being the
     // only flex item is not enough: `split` is a fraction, and an item whose
     // flex-grow sums to less than 1 gets only that share of the free space.
@@ -892,6 +1137,9 @@ function mountEditor(container, opts = {}) {
     // there is no way to drag onto.
     graphSplit.classList.toggle('tb-hidden', narrow);
     addStageBtn.classList.toggle('show', narrow && editable);
+    // The documentation toggle appears here only where the pane's own
+    // copy is out of reach -- i.e. exactly when the pane is hidden.
+    docsBtnHead.classList.toggle('show', one);
     // Edit affordances only make sense while stopped; drop any stale
     // arming/selection when the pipeline isn't editable.
     if (!editable) { state.pending = null; state.selectedEdge = null; }
@@ -1020,8 +1268,12 @@ function mountEditor(container, opts = {}) {
       }, gut, text));
       if (open) { list.append(laneDetail(r, gutter)); }
     }
+    // The note says how to get the canvas back, and that differs by WHY
+    // the list is on screen: a pane that shrank into it asks to be
+    // widened, one the operator pinned asks for the button back.
     list.append(el('div', { class: 'lane-note' },
-      t(inline ? 'pl.narrow_note' : 'pl.narrow_note_pane')));
+      t(forceLanes && !inline ? 'pl.lane_note_pinned'
+        : (inline ? 'pl.narrow_note' : 'pl.narrow_note_pane'))));
     graphBody.append(list);
   }
 
@@ -1528,7 +1780,61 @@ function mountEditor(container, opts = {}) {
     if (!state.oneColumn) { await renderConfig(); }
   }
 
-  // --- right pane (config) -----------------------------------------
+  // How many columns the configuration form gets, and which fields
+  // start a row.
+  //
+  // MEASURED rather than declared: the panel is resized by the window,
+  // by the divider and by the dock button, and the answer has to follow
+  // all three. It is not a CSS auto-fill because two of the rules cannot
+  // be said that way -- never more columns than there are FIELDS (three
+  // fields in a wide panel are three columns, not five with two empty),
+  // and a one-field form takes the WHOLE width rather than a column's
+  // worth of it, which is what a text-prompt stage wants.
+  const CFG_COL_MIN = 280;   // a column worth having: ~250px of content
+  const CFG_FIELD_GAP = 12;  // .field's margin-bottom, in the stack sum
+  function layoutCfgColumns(scope) {
+    const root = scope || editorArea;
+    for (const grid of root.querySelectorAll('.cfg-fields')) {
+      const items = grid.children;
+      const n = items.length;
+      const w = grid.clientWidth;
+      // Detached (a form built before its panel is laid out) or empty:
+      // one column, and the next call measures for real.
+      let cols = 1;
+      if (w > 0 && n > 0) {
+        // What the panel can hold side by side...
+        const byWidth = Math.max(1, Math.floor(w / CFG_COL_MIN));
+        // ...and what it needs. HOW TALL THE FIELDS ARE AS ONE STACK
+        // against how much panel is left below them: a form that already
+        // fits stays a single column, however wide the panel gets, and
+        // only a stack that would scroll is split. Field heights barely
+        // move with the column width (a label may wrap), so this is an
+        // estimate -- which is all the decision needs.
+        let stack = 0;
+        for (let i = 0; i < n; i++) {
+          stack += items[i].offsetHeight + CFG_FIELD_GAP;
+        }
+        const scroller = grid.closest('.pane-body');
+        const avail = scroller
+            ? scroller.getBoundingClientRect().bottom
+                - grid.getBoundingClientRect().top
+            : 0;
+        // No height to measure against (detached, or a panel collapsed
+        // to nothing): fall back to what the width allows.
+        const byHeight = avail > 40 ? Math.ceil(stack / avail) : byWidth;
+        cols = Math.min(byWidth, Math.max(1, byHeight), n);
+      }
+      // Written only when it CHANGES. Re-styling the form is what the
+      // resize observer is watching for, so an unconditional write would
+      // keep waking it -- and a count that oscillates between two values
+      // would then never settle.
+      if (grid.style.getPropertyValue('--cols') !== String(cols)) {
+        grid.style.setProperty('--cols', String(cols));
+      }
+    }
+  }
+
+  // --- the configuration form --------------------------------------
   // `target` names where the form goes: the standalone pane by default,
   // or -- in the narrow layout, which has no such pane -- the block an
   // expanded lane row supplies. Everything else about the form (the
@@ -1541,9 +1847,12 @@ function mountEditor(container, opts = {}) {
     if (!target && state.oneColumn) { return; }
     const body = (target && target.body) || cfgBody;
     const cfgHead = (target && target.actions) || cfgActions;
-    // An inline block can be folded away while its request is in flight;
-    // it is then detached and there is nothing to fill.
-    const live = () => !target || body.isConnected;
+    const seq = ++cfgSeq;
+    // Whether THIS render may still write. Two ways it may not: an inline
+    // block folded away while its request was in flight (detached, so
+    // there is nothing to fill), or a newer render started meanwhile --
+    // which has already emptied the header this one is about to fill.
+    const live = () => (target ? body.isConnected : true) && seq === cfgSeq;
     // WHAT THE USER IS DOING, remembered across the teardown.
     //
     // A rebuild replaces every control, so the focused one is removed
@@ -1581,7 +1890,8 @@ function mountEditor(container, opts = {}) {
       scroller.scrollTop = prevTop;
     };
     clear(body);
-    clear(cfgHead);   // header Apply/Remove; refilled below when editable
+    clear(cfgHead);   // header buttons; refilled below when editable
+    undoBtns = null;  // the ones just cleared are detached now
     if (!state.detail || !state.selectedStage) {
       body.append(el('div', { class: 'cfg' },
         el('div', { class: 'empty' }, t('pl.select_stage_config'))));
@@ -1605,18 +1915,50 @@ function mountEditor(container, opts = {}) {
     // block) so they stay pinned above the scroll. `inputs` is captured by
     // Apply's handler and filled in by the schema loop below.
     const inputs = [];
+    // The config this form was built from, in the shape a PUT takes: the
+    // PRESENT keys with their current values, which is exactly what the
+    // untouched form would read back. It is what Undo restores to, and
+    // what the first apply after this render is paired against.
+    {
+      const seed = {};
+      for (const f of info.schema) {
+        const here = f.present !== undefined
+            ? !!f.present
+            : (f.current !== undefined && f.current !== null);
+        if (here && f.current !== undefined) { seed[f.key] = f.current; }
+      }
+      cfgLast = { sid: state.selectedStage, cfg: seed };
+    }
+    // Undo / Redo are the same slot read in two directions, so one
+    // handler serves both and only their enabled state differs. Both are
+    // edits, so both need a stopped pipeline.
+    const undoBtn = el('button', {
+      class: 'btn ghost mini', disabled: true,
+      title: t('pl.undo_hint'),
+      onclick: () => stepConfigUndo(),
+    }, t('common.undo'));
+    const redoBtn = el('button', {
+      class: 'btn ghost mini', disabled: true,
+      title: t('pl.redo_hint'),
+      onclick: () => stepConfigUndo(),
+    }, t('common.redo'));
+    undoBtns = { undo: undoBtn, redo: redoBtn };
+    syncUndoBtns();
     const applyBtn = el('button', {
       class: 'btn primary mini', disabled: !editable,
       onclick: () => applyConfig(inputs),
     }, t('common.apply'));
-    // Remove the stage (topology edit -- stopped pipelines only).
+    // Remove the stage (topology edit -- stopped pipelines only). Label
+    // only: an icon beside the text makes this button taller than the
+    // plain ones next to it, and a row of header buttons that do not
+    // line up reads as a mistake.
     const removeBtn = el('button', {
       class: 'btn danger mini', disabled: !editable,
       title: editable ? t('pl.remove_stage_title')
                       : t('pl.stop_to_edit'),
       onclick: () => onRemoveStage(),
-    }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
-    cfgHead.append(applyBtn, removeBtn);
+    }, t('common.remove'));
+    cfgHead.append(undoBtn, redoBtn, applyBtn, removeBtn);
 
     // Auto-apply on blur (stopped pipelines only): when a field commits (a
     // text/number box loses focus after an edit), re-POST the whole config
@@ -1661,6 +2003,10 @@ function mountEditor(container, opts = {}) {
       wrap.append(el('div', { class: 'ro-note' },
         t('pl.config_readonly')));
     }
+    // The fields get their own grid so the stage identity above them
+    // stays in normal flow and needs no column span of its own;
+    // layoutCfgColumns fills in how many columns it is given.
+    const fieldsWrap = el('div', { class: 'cfg-fields' });
     for (const f of info.schema) {
       const { field, read } = configField(f, !editable, info.type, commit);
       inputs.push({ key: f.key, type: f.type, read });
@@ -1671,9 +2017,12 @@ function mountEditor(container, opts = {}) {
              'input, select, textarea')) {
         c.dataset.cfgKey = f.key;
       }
-      wrap.append(field);
+      fieldsWrap.append(field);
     }
+    wrap.append(fieldsWrap);
     body.append(wrap);
+    // Now that it is in the document and has a width to measure.
+    layoutCfgColumns(body);
     restore();
   }
 
@@ -2000,6 +2349,29 @@ function mountEditor(container, opts = {}) {
         } });
       emptyMeansUnset();
       syncUnset();
+    } else if (f.type === 'string' && Array.isArray(f.choices)
+               && f.choices.length) {
+      // A CLOSED SET (the schema's `choices`): every value this key
+      // accepts, so offer them instead of a text box the reader has to
+      // guess at. The blank option IS the unset state -- the same one the
+      // Clear button toggles -- so textTriState below drives this exactly
+      // as it drives a text field.
+      input = el('select', { id, disabled });
+      const cur = present ? String(f.current ?? '') : '';
+      input.append(el('option', { value: '' }, t('pl.unset')));
+      for (const c of f.choices) {
+        input.append(el('option', { value: String(c) }, String(c)));
+      }
+      // A value the set does not contain: an older pipeline file, or a
+      // spelling the stage still accepts but no longer advertises
+      // (unload_when_idle's legacy always / never). Keep it, and say so.
+      // A form asked to DISPLAY a config must not quietly rewrite it.
+      if (cur && !f.choices.some((c) => String(c) === cur)) {
+        input.append(el('option', { value: cur },
+                       cur + ' ' + t('pl.choice_unlisted')));
+      }
+      input.value = cur;
+      read = textTriState();
     } else if (f.type === 'string') {
       input = el('input', { type: 'text', id, disabled,
         placeholder,
@@ -2176,16 +2548,33 @@ function mountEditor(container, opts = {}) {
         }) },
         makeIcon('database', 'sm'));
     }
+    const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
+    // The field NAME carries its documentation as a tooltip while the
+    // lines are hidden, so turning them off costs the reader the space
+    // and nothing else. The text is kept on the element because the
+    // toggle flips under forms that are already rendered -- applyDocs
+    // reads it back rather than rebuilding them.
+    const keySpan = el('span', { class: 'key' }, f.key);
+    if (docTxt) {
+      keySpan.dataset.doc = docTxt;
+      if (!showDocs) { keySpan.title = docTxt; }
+    }
+    // A CHECKBOX is one small control and a small button, which is a
+    // whole row of panel for almost no ink -- so a bool field puts its
+    // name, its box and its unset button on ONE line (see .field-bool),
+    // name left and controls right. The type hint goes with it: "bool"
+    // beside a checkbox says nothing the checkbox has not already said.
+    const isBool = f.type === 'bool';
     const label = el('label', { for: id },
-      el('span', { class: 'key' }, f.key),
+      keySpan,
       f.required ? el('span', { class: 'req' }, '*') : null,
-      el('span', { class: 'ty' }, f.type));
+      isBool ? null : el('span', { class: 'ty' }, f.type));
     const inputRow = el('div', { class: 'field-input-row' }, input);
     if (datalist) { inputRow.append(datalist); }
     if (browseBtn) { inputRow.append(browseBtn); }
     if (unsetBtn) { inputRow.append(unsetBtn); }
-    const field = el('div', { class: 'field' }, label, inputRow);
-    const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
+    const field = el('div', { class: 'field' + (isBool ? ' field-bool' : '') },
+                     label, inputRow);
     if (docTxt) { field.append(el('div', { class: 'doc' }, docTxt)); }
     // Auto-apply when a text/number box loses focus after an edit. `change`
     // fires on blur-after-edit (and Enter), so tabbing through untouched
@@ -2224,9 +2613,18 @@ function mountEditor(container, opts = {}) {
       toast(t('pl.bad_config', { msg: e.message }), 'error');
       return;
     }
+    const sid = state.selectedStage;
     try {
       state.detail = await api.setStageConfig(
-        state.selectedId, state.selectedStage, cfg);
+        state.selectedId, sid, cfg);
+      // The pair, recorded only once the server has taken the new config:
+      // an apply that failed changed nothing and must not become the step
+      // Undo walks back to.
+      if (cfgLast && cfgLast.sid === sid) {
+        cfgUndo = { sid, before: cfgLast.cfg, after: cfg, undone: false };
+      }
+      cfgLast = { sid, cfg };
+      syncUndoBtns();
       toast(t('pl.config_applied'), 'ok');
       // `rerender:false` is a promise not to tear down the form the
       // user is still in, and rebuilding the GRAPH broke that promise
@@ -2241,6 +2639,40 @@ function mountEditor(container, opts = {}) {
         state.graphStale = true;
       }
     } catch (e) { toast(t('pl.apply_failed', { msg: e.message }), 'error'); }
+  }
+
+  // Which half of the pair is reachable from here. Read from the slot
+  // rather than tracked beside it, so the buttons cannot disagree with
+  // what pressing them would actually do.
+  function syncUndoBtns() {
+    if (!undoBtns) { return; }
+    const pair = !!cfgUndo && cfgUndo.sid === state.selectedStage
+                 && canEdit();
+    undoBtns.undo.disabled = !(pair && !cfgUndo.undone);
+    undoBtns.redo.disabled = !(pair && cfgUndo.undone);
+  }
+
+  // Walk the single undo pair, in whichever direction it is pointing.
+  // Undo and Redo are the same move: PUT the other half of the pair and
+  // flip the arrow, so a user who undid by accident can put it straight
+  // back. The slot survives the re-render below -- it is keyed by stage,
+  // and renderConfig only reseeds `cfgLast`.
+  async function stepConfigUndo() {
+    if (!cfgUndo || cfgUndo.sid !== state.selectedStage) { return; }
+    if (!canEdit()) { toast(t('pl.stop_to_edit'), 'error'); return; }
+    const back = !cfgUndo.undone;
+    const target = back ? cfgUndo.before : cfgUndo.after;
+    try {
+      state.detail = await api.setStageConfig(
+        state.selectedId, cfgUndo.sid, target);
+      cfgUndo.undone = back;
+      cfgLast = { sid: cfgUndo.sid, cfg: target };
+      toast(t(back ? 'pl.config_undone' : 'pl.config_redone'), 'ok');
+      renderGraphPane();
+      await renderConfig();
+    } catch (e) {
+      toast(t('pl.undo_failed', { msg: e.message }), 'error');
+    }
   }
 
   // --- toolbar actions ----------------------------------------------

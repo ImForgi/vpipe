@@ -65,6 +65,13 @@ double video_phys_margin_()
 // about and dropped there, which is a message rather than a bug.
 constexpr int kH3LoraSlots = 2;
 
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" would land in the `auto` branch and mean
+// something other than what it says, so it is not offered. The legacy
+// "always" / "never" stay accepted and show as unlisted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {"choices", "auto,destroy,keep"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "video model root. The layout is the resident family's own -- an "
@@ -271,8 +278,12 @@ const ConfigKey kAttrs[] = {
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
-          "pipeline's weight bytes; \"always\" / \"never\" force it",
-   .def_str = "auto"},
+          "pipeline's weight bytes; \"destroy\" / \"keep\" force it (legacy "
+          "spellings: \"always\" / \"never\"). \"park\" is NOT implemented "
+          "here and resolves as \"auto\": parking is the manager's to do and "
+          "needs this stage's borrow to end first -- only "
+          "diffusion-conditioner does that today",
+   .def_str = "auto", .extra = kUnloadChoices},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning",

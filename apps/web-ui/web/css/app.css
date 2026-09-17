@@ -590,7 +590,7 @@ svg.sb-spark .line {
 }
 .placeholder h2 { color: var(--fg); font-weight: 600; }
 
-/* ---- Pipeline Manager: three panes ---- */
+/* ---- Pipeline Manager: the list, the canvas and the config pane ---- */
 
 /* Selector (fixed-ish) + the reusable editor (stage canvas : config,
    adjustable split). The standalone editor (.no-sel) drops the selector. */
@@ -617,6 +617,61 @@ svg.sb-spark .line {
    width when its grow factor is a fraction below 1. */
 .pe-editor.pe-narrow > .pe-config,
 .pe-editor.pe-narrow > .pe-divider { display: none; }
+/* THE CONFIGURATION DOCKS BELOW THE CANVAS by default. A pipeline runs
+   left to right, so width is the axis the graph is always short of and
+   height is the one it has to spare -- a pane beside it spends the
+   scarce axis on a column of fields that never needed it. The editor
+   becomes a column, and the divider resizes heights (the drag reads
+   clientY; see applyDock). */
+.pe-editor.dock-bottom { flex-direction: column; }
+.pe-editor.dock-bottom > .pe-divider { cursor: row-resize; }
+.pe-editor.dock-bottom > .pe-config {
+  border-top: 1px solid var(--line);
+}
+/* THE FORM READS DOWN, THEN ACROSS. Multi-column, not grid: a form is a
+   LIST, and a reader goes down it -- so the fields fill column one top
+   to bottom before column two starts, which is also the order the
+   schema declares them in. A row-major grid put field 2 to the right of
+   field 1 and made the eye scan sideways to follow a sequence.
+   The browser decides WHERE each column breaks (it balances the flow),
+   which is the half of this that should not be arithmetic. JS decides
+   only HOW MANY columns -- see layoutCfgColumns -- because the two rules
+   that matter cannot be said in CSS: never more columns than there are
+   fields, and split only when the stack is taller than the panel.
+   `column-rule` then draws the separator for free, centred in the gap so
+   it has equal air either side, and running the full height of the
+   columns rather than stopping at the last field of a short one.
+   Unscoped by dock on purpose -- docked right, or inline under a lane
+   row, the same measurement simply arrives at one column. */
+.cfg-fields {
+  column-count: var(--cols, 1);
+  column-gap: 28px;
+  column-rule: 1px solid var(--accent);
+}
+/* A field is never split across a column break. */
+.cfg-fields > .field {
+  break-inside: avoid;
+  -webkit-column-break-inside: avoid;
+}
+/* Field documentation, toggled from the pane header. On the EDITOR so it
+   reaches the inline form too. */
+.pe-editor.no-docs .field .doc { display: none; }
+/* The three layout toggles, grouped at the right of the configuration
+   header (after Apply/Remove, which take the auto margin). */
+.pe-cfg-tools {
+  display: flex; align-items: center; gap: 2px;
+  flex: 0 0 auto; margin-left: 8px;
+}
+.pe-tool {
+  width: 22px; height: 20px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--fg-dim); font-size: 12px; line-height: 1; cursor: pointer;
+}
+.pe-tool:hover { color: var(--fg); background: var(--bg-3); }
+.pe-tool[aria-pressed="true"] {
+  color: var(--accent); background: var(--bg-3); border-color: var(--line);
+}
 /* Run / pause / stop overlay pinned to the stage canvas top-left. */
 .pe-canvas-ctl {
   position: absolute; top: 8px; left: 8px; z-index: 6;
@@ -876,6 +931,23 @@ svg.graph { display: block; width: 100%; height: 100%;
 }
 .graph-add-stage.show:hover { background: var(--bg-3); color: var(--fg); }
 
+/* The documentation toggle, repeated in this header for the one-column
+   layout -- where the configuration pane, and the toggles in its own
+   header, are hidden. Same show-on-demand pattern as the + above, and
+   the same look as its twin in the pane header (.pe-tool). */
+.graph-head-tool { display: none; }
+.graph-head-tool.show {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin-left: 6px; padding: 0;
+  border: 1px solid transparent; border-radius: 4px;
+  background: transparent; color: var(--fg-dim);
+  font: 12px/1 var(--mono); cursor: pointer;
+}
+.graph-head-tool.show:hover { background: var(--bg-3); color: var(--fg); }
+.graph-head-tool.show[aria-pressed="true"] {
+  color: var(--accent); background: var(--bg-3); border-color: var(--line);
+}
+
 /* The picker. Fixed-position and z-index 60 to match .ctx-menu, which is
    the same kind of thing: a transient overlay anchored to a control in a
    pane that may itself scroll. The opener clamps it to the viewport. */
@@ -1065,16 +1137,18 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   margin: 4px 0 10px;
 }
 .cfg .ro-note { color: var(--warn); font-size: 11px; margin: 4px 0 10px; }
-.field { margin-bottom: 12px; }
+/* One point below the shell's 13px: a configuration form is dense by
+   nature and the fields read better tightened, in every dock. */
+.field { margin-bottom: 12px; font-size: 12px; }
 .field label { display: block; margin-bottom: 3px; }
 .field .key { color: var(--fg); }
 .field .req { color: var(--danger); margin-left: 3px; }
-.field .ty  { color: var(--fg-dim); font-size: 10px; margin-left: 6px; }
-.field .doc { color: var(--fg-dim); font-size: 10.5px; margin-top: 2px; }
+.field .ty  { color: var(--fg-dim); font-size: 9px; margin-left: 6px; }
+.field .doc { color: var(--fg-dim); font-size: 9.5px; margin-top: 2px; }
 .field input[type=text], .field input[type=number], .field textarea {
   width: 100%; padding: 5px 7px; background: var(--bg);
   border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
-  font: inherit; font-size: 12px;
+  font: inherit; font-size: 11px;
 }
 /* Config numeric fields: no up/down spinner buttons (and the wheel is
    blocked in JS), so the value only changes by typing. */
@@ -1084,6 +1158,18 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   -webkit-appearance: none; margin: 0;
 }
 .field textarea { min-height: 54px; resize: vertical; }
+/* A closed-set field (schema `choices`) renders as a dropdown; it should
+   read as the same control as the text boxes above it. */
+.field select {
+  width: 100%; padding: 4px 6px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 11px;
+}
+.field select:focus { outline: none; border-color: var(--accent); }
+.field select:disabled { opacity: .55; }
+/* Unset, i.e. sitting on the blank option: dimmed like an unset text
+   box, so the two states are told apart at a glance. */
+.field select.field-unset { border-style: dashed; color: var(--fg-dim); }
 .field input:focus, .field textarea:focus {
   outline: none; border-color: var(--accent);
 }
@@ -1107,11 +1193,32 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
    let its placeholder advertise the stage default. The set-but-empty box
    keeps normal styling and reads "(empty value)". */
 .field-input-row > .field-unset { border-style: dashed; }
+/* A BOOL FIELD IS ONE LINE. A checkbox and its unset button are two
+   small controls, and giving them a label row of their own spends a
+   whole row of the panel on almost no ink -- which is most visible in
+   the columns, where a stage of flags becomes a column of near-empty
+   rows. Name left, controls hard right, documentation (when it is
+   shown) across both. The type hint is dropped in JS: "bool" beside a
+   checkbox says nothing the checkbox has not. */
+.field.field-bool {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  column-gap: 8px;
+}
+.field.field-bool > label { margin-bottom: 0; }
+.field.field-bool > .field-input-row { justify-content: flex-end; }
+.field.field-bool > .doc { grid-column: 1 / -1; }
 /* Config pane header actions (Apply / Remove): pinned right in the pane
    header so they stay visible above the scrolling form. Reset the header's
    uppercase / letter-spacing so the button labels read normally. */
+/* Shrinkable, and the layout toggles beside it are not: in a panel too
+   narrow for both, the row gives up button labels before it gives up the
+   controls that change the layout -- those are how the operator gets the
+   width back. */
 .pane-head-actions { display: flex; align-items: center; gap: 6px;
-            flex: 0 0 auto; margin-left: auto;
+            flex: 0 1 auto; min-width: 0; overflow: hidden;
+            margin-left: auto;
             text-transform: none; letter-spacing: normal; }
 
 /* ---- Modal ---- */

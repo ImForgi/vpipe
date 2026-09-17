@@ -172,6 +172,63 @@ TEST(stage_config, suggest_db_surfaces_in_schema)
   EXPECT_TRUE(!e1.as_object().contains("suggest_db"));   // unset -> omit
 }
 
+// A key's CLOSED VALUE SET reaches the config schema as an array, so an
+// editor can offer a dropdown instead of a text box.
+//
+// It is declared in the key's `extra` rather than as a ConfigKey member
+// (that aggregate is compiled into plugins, so a new field moves a
+// layout they already built) and split on the way through
+// resolve_config_params, which is the hop where `extra` stops.
+TEST(stage_config, choices_surface_in_schema)
+{
+  static constexpr SpecExtra kAlg[] = {
+    {"choices", "lanczos, bilinear, bicubic"},   // spaces are trimmed
+  };
+  constexpr ConfigKey spec[] = {
+    {.key = "algorithm", .type = ConfigType::String,
+     .def_str = "lanczos", .extra = kAlg},
+    {.key = "plain", .type = ConfigType::String},
+  };
+  FlexData arr = config_params_to_flex(
+      resolve_config_params(spec, FlexData::make_object()));
+  auto av = arr.as_array();
+  EXPECT_TRUE(av.size() == 2u);
+
+  FlexData e0 = av.at(0);
+  auto o0 = e0.as_object();
+  EXPECT_TRUE(o0.contains("choices"));
+  FlexData ch = o0.at("choices");
+  EXPECT_TRUE(ch.is_array());
+  auto cv = ch.as_array();
+  EXPECT_TRUE(cv.size() == 3u);
+  EXPECT_TRUE(cv.at(0).as_string() == "lanczos");
+  EXPECT_TRUE(cv.at(1).as_string() == "bilinear");
+  EXPECT_TRUE(cv.at(2).as_string() == "bicubic");
+
+  // A key with no set declared says nothing, rather than saying "none".
+  FlexData e1 = av.at(1);
+  EXPECT_TRUE(!e1.as_object().contains("choices"));
+}
+
+// The declared set is a HINT for the editor and nothing more: it does
+// not constrain what a config may hold, because the stage's own
+// validation is still the authority (and several stages accept a value
+// their docs do not list -- unload_when_idle's legacy always/never).
+TEST(stage_config, choices_do_not_constrain_the_value)
+{
+  static constexpr SpecExtra kAlg[] = {{"choices", "a,b"}};
+  constexpr ConfigKey spec[] = {
+    {.key = "k", .type = ConfigType::String, .def_str = "a", .extra = kAlg},
+  };
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("k", FlexData::make_string("something-else"));
+  auto params = resolve_config_params(spec, cfg);
+  EXPECT_TRUE(params.size() == 1u);
+  EXPECT_TRUE(params[0].present);
+  EXPECT_TRUE(params[0].current_value.as_string() == "something-else");
+  EXPECT_TRUE(params[0].choices.size() == 2u);
+}
+
 // suggest_db_type (the model_type the suggestion dropdown filters on)
 // surfaces alongside suggest_db, and is omitted when unset.
 TEST(stage_config, suggest_db_type_surfaces_in_schema)

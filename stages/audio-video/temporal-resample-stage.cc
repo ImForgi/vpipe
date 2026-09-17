@@ -42,6 +42,11 @@ sb_num_(const FlexData& sb, const char* key, double* out)
   return false;
 }
 
+// The resampling methods, for the editor's dropdown; the ctor's own
+// branch chain stays the authority.
+constexpr SpecExtra kMethodChoices[] = {
+  {"choices", "nearest,blend,average,motion"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_fps", .type = ConfigType::Real, .required = true,
    .doc = "the frame rate to resample TO. Required and positive -- it is "
@@ -74,7 +79,7 @@ constexpr ConfigKey kAttrs[] = {
           "(`minterpolate`), which is the one that helps going UP in "
           "rate, where there is nothing to average. Cost rises in that "
           "order and `motion` is far the most expensive",
-   .def_str = "nearest"},
+   .def_str = "nearest", .extra = kMethodChoices},
   {.key = "average_frames", .type = ConfigType::Int, .required = false,
    .doc = "the `average` window, in SOURCE frames. 0 (default) derives "
           "it from the ratio -- round(input_fps / output_fps), which is "

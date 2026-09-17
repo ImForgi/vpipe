@@ -19,6 +19,7 @@
 "Allow Access to the Whole Filesystem" = "允許存取整個檔案系統";
 "Allowed Folders" = "允許的資料夾";
 "Anyone who reaches this server and has the access key can start and stop pipelines, browse the sandbox and drive models on this Mac. Only enable it on a network you trust; change it under Settings ▸ Web UI." = "任何能存取該伺服器並持有存取金鑰的人，都可以啟動與停止處理管線、瀏覽沙箱，並驅動本機上的模型。請僅在信任的網路上啟用；可在「設定 ▸ Web 介面」中修改。";
+"Applies to pipelines and the web UI immediately. This app's own menus and windows change after it is relaunched." = "對處理管線與 Web 介面立即生效。本 App 自身的選單與視窗在重新啟動後才會改變。";
 "Authorized." = "已授權。";
 "Automatic (this Mac's LAN address)" = "自動（本機區域網路位址）";
 "Bind To" = "繫結至";
@@ -43,8 +44,8 @@
 "EOF" = "EOF";
 "Edit in TextEdit" = "以文字編輯開啟";
 "FFmpeg" = "FFmpeg";
-"Force Quit" = "強制結束";
 "Force Quit Server" = "強制結束伺服器";
+"Force Quit" = "強制結束";
 "Force-quit automatically after %@s." = "%@ 秒後自動強制結束。";
 "Forget" = "忘記";
 "Full Disk Access" = "完全取用磁碟";
@@ -115,8 +116,8 @@
 "Use Default" = "使用預設值";
 "Version" = "版本";
 "Waiting for the server to shut down. It will be force-quit automatically after %@ seconds." = "正在等待伺服器關閉。%@ 秒後將自動強制結束。";
-"Web UI" = "Web 介面";
 "Web UI File Access" = "Web 介面檔案存取";
+"Web UI" = "Web 介面";
 "Work Directory" = "工作目錄";
 "audio capture, transcription and audio tagging" = "音訊擷取、轉寫與音訊標記";
 "composer" = "組合";

@@ -47,6 +47,10 @@ SaveTextStage::SaveTextStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The separator policy's closed set, for the editor's dropdown.
+constexpr SpecExtra kNewlineChoices[] = {
+  {"choices", "after,before,none"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
    .doc = "output text file path",
@@ -56,7 +60,7 @@ constexpr ConfigKey kAttrs[] = {
    .def_str = "text"},
   {.key = "newline", .type = ConfigType::String,
    .doc = "entry separator policy: after (default) | before | none",
-   .def_str = "after"},
+   .def_str = "after", .extra = kNewlineChoices},
   {.key = "append", .type = ConfigType::Bool,
    .doc = "append to the file (default); false truncates it at start",
    .def_bool = true},

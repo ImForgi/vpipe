@@ -215,9 +215,18 @@ RestClientStage::RestClientStage(const SessionContextIntf* s,
 RestClientStage::~RestClientStage() = default;
 
 namespace {
+// Closed value sets for the editor's dropdowns (SpecExtra "choices"),
+// agreeing with the validation in the ctor above.
+constexpr SpecExtra kMethodChoices[] = {
+  {"choices", "GET,POST,PUT,PATCH,DELETE,HEAD"},
+};
+constexpr SpecExtra kPayloadFormatChoices[] = {
+  {"choices", "json,raw_string,none"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = true,
-   .doc = "HTTP method: GET|POST|PUT|PATCH|DELETE|HEAD"},
+   .doc = "HTTP method: GET|POST|PUT|PATCH|DELETE|HEAD",
+   .extra = kMethodChoices},
   {.key = "url", .type = ConfigType::String, .required = true,
    .doc = "full endpoint URL (http/https)"},
   {.key = "headers", .type = ConfigType::Object,
@@ -226,7 +235,8 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "slash-separated selector into iport0 payload "
           "(empty = use payload verbatim)"},
   {.key = "payload_format", .type = ConfigType::String,
-   .doc = "json | raw_string | none", .def_str = "json"},
+   .doc = "json | raw_string | none", .def_str = "json",
+   .extra = kPayloadFormatChoices},
   {.key = "content_type", .type = ConfigType::String,
    .doc = "explicit Content-Type override"},
   {.key = "timeout_seconds", .type = ConfigType::Uint,

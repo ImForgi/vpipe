@@ -3,6 +3,8 @@
 
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
@@ -66,6 +68,21 @@ class MetalKrea2Transformer {
     // above -- that one chooses how the block's GEMMs are computed and
     // this one how the attention between them is.
     sage::Config sage;
+    // Sol-Attn (LOSSY), from generate-image's `sol_attn*` keys. Off by
+    // default. It routes whole KEY BLOCKS: the ones whose centroid beats
+    // a per-query-block threshold are attended exactly on the flash
+    // kernel, the rest fold in as their centroid.
+    //
+    // Krea-2's joint [text; image] attention is what it needs -- one
+    // self-attention whose keys ARE its queries, at head_dim 128 -- and
+    // the text prefix becomes the exact SINK, because a centroid over
+    // prompt tokens is a prompt half-read. GQA (48 query heads over 12
+    // kv) is why MetalSolAttention grew a kv_heads argument: the key
+    // summaries are per KV head.
+    //
+    // Independent of `sage` beside it: Sol decides WHICH key blocks are
+    // attended, Sage how the ones that are get multiplied.
+    sol::Config sol;
 
     // ---- the ANE tier (LOSSY, opt-in) -------------------------------
     //
@@ -251,6 +268,16 @@ class MetalKrea2Transformer {
   // under-reports is how residency growth eats the room the rest of the
   // forward needs.
   std::size_t scratch_resident_bytes() const;
+
+  // What Sol-Attn holds for a `seq`-token forward AFTER the two buffers
+  // the forward lends it, which is what a residency reserve has to leave
+  // clear. 0 when the tier is off or every layer is dense.
+  //
+  // MOST OF IT IS NOT AN ALLOCATION AT ALL: Sol's scratch lives for one
+  // call, so it carves from memory this forward is not using between the
+  // projection and the output. Only what does not fit is its own. See
+  // MetalSolAttention::private_bytes.
+  std::size_t sol_scratch_bytes(int seq) const;
 
   // Bytes the ANE feed-forward tier holds, for the whole model, for a
   // sequence of `seq` tokens (image plus text; <= 0 books one chunk).
@@ -465,6 +492,9 @@ class MetalKrea2Transformer {
   // The int8 QK prologue. Null when the box has no matrix cores or the
   // config did not ask; every use is guarded.
   std::unique_ptr<MetalSageAttention> _sage;
+  // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
+  // the kernels validated; every use is guarded.
+  std::unique_ptr<MetalSolAttention> _sol;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

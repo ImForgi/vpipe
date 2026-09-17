@@ -184,6 +184,10 @@ resolve_config_params(span<const ConfigKey> spec, const FlexData& config)
     }
     p.need_inputs     = string(k.need_inputs);
     p.need_outputs    = string(k.need_outputs);
+    // The closed value set, if the key declares one. Carried across this
+    // hop because `extra` lives on the plugin-facing ConfigKey and stops
+    // here: everything downstream reads ConfigParam.
+    split_into_(spec_extra(k.extra, "choices"), &p.choices);
     p.is_path         = k.is_path;
     p.path_write      = k.path_write;
     p.path_kind       = string(k.path_kind);
@@ -232,6 +236,17 @@ config_params_to_flex(const vector<ConfigParam>& params)
     }
     if (!p.need_outputs.empty()) {
       ov.insert("need_outputs", FlexData::make_string(p.need_outputs));
+    }
+    // An ARRAY rather than the CSV the spec wrote: the editor renders
+    // one option per entry, and splitting is this side's job.
+    if (!p.choices.empty()) {
+      FlexData ch = FlexData::make_array();
+      auto cv = ch.as_array();
+      cv.reserve(p.choices.size());
+      for (const string& c : p.choices) {
+        cv.push_back(FlexData::make_string(c));
+      }
+      ov.insert("choices", std::move(ch));
     }
     if (p.is_path) {
       ov.insert("is_path", FlexData::make_bool(true));

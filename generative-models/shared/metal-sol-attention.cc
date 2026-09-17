@@ -151,16 +151,23 @@ MetalSolAttention::load(MetalCompute* mc, bool bf16, std::string* err)
 namespace {
 
 void
-sol_scratch_plan_(std::size_t H, std::size_t T, std::size_t D,
-                  std::size_t nq, std::size_t nk, std::size_t tp,
-                  std::size_t bk, bool nax, std::vector<std::size_t>* out)
+sol_scratch_plan_(std::size_t H, std::size_t KVH, std::size_t T,
+                  std::size_t D, std::size_t nq, std::size_t nk,
+                  std::size_t tp, std::size_t bk, bool nax,
+                  std::vector<std::size_t>* out)
 {
   out->clear();
-  out->push_back(H * nq * D * 2);                    // qc
-  out->push_back(H * nk * D * 2);                    // kc
-  out->push_back(H * nk * D * 2);                    // vc
-  out->push_back(H * D * 4);                         // mean
-  out->push_back(H * D * 4);                         // var
+  // WHICH HEAD COUNT EACH BUFFER CARRIES, and it is not one of them.
+  // The routing is decided per QUERY head -- flags, kept, the CSR, both
+  // partial outputs -- while the key centroids and their statistics
+  // summarise K and V, which under GQA have FEWER heads. Sizing the
+  // latter by H is what a caller gets away with at GQA 1 and what
+  // silently reads past the end of K/V at anything else.
+  out->push_back(H * nq * D * 2);                    // qc   (query heads)
+  out->push_back(KVH * nk * D * 2);                  // kc   (kv heads)
+  out->push_back(KVH * nk * D * 2);                  // vc   (kv heads)
+  out->push_back(KVH * D * 4);                       // mean (kv heads)
+  out->push_back(KVH * D * 4);                       // var  (kv heads)
   out->push_back(H * nq * nk);                       // flags
   if (nax) { out->push_back(H * nq * nk * 4); }      // proxy
   out->push_back(H * nq * 4);                        // kept
@@ -188,17 +195,24 @@ sol_scratch_plan_(std::size_t H, std::size_t T, std::size_t D,
 // The geometry the plan is written against, or false when the key block
 // does not divide the exact kernel's.
 bool
-sol_geometry_(int heads, int tokens, int d, int key_block, bool nax,
-              std::size_t* H, std::size_t* T, std::size_t* D,
-              std::size_t* nq, std::size_t* nk, std::size_t* tp,
-              std::size_t* bk)
+sol_geometry_(int heads, int kv_heads, int tokens, int d, int key_block,
+              bool nax, std::size_t* H, std::size_t* KVH, std::size_t* T,
+              std::size_t* D, std::size_t* nq, std::size_t* nk,
+              std::size_t* tp, std::size_t* bk)
 {
   if (heads <= 0 || tokens <= 0 || d <= 0) { return false; }
+  // GQA, refused here rather than mis-indexed later. The group factor
+  // has to divide exactly: every query head belongs to one KV head, and
+  // a ragged last group would have no key centroids to read.
+  if (kv_heads <= 0 || kv_heads > heads || heads % kv_heads != 0) {
+    return false;
+  }
   const int bq = nax ? kNaxBQ : kSteelBQ;
   const int kb = nax ? kNaxBK : kSteelBK;
   const int blk = key_block > 0 ? key_block : sol::kBlock;
   if (blk % kb != 0) { return false; }
   *H = (std::size_t)heads;
+  *KVH = (std::size_t)kv_heads;
   *T = (std::size_t)tokens;
   *D = (std::size_t)d;
   *nq = (std::size_t)((tokens + bq - 1) / bq);
@@ -214,13 +228,20 @@ std::size_t
 MetalSolAttention::scratch_bytes(int heads, int tokens, int d, int key_block,
                                  bool nax)
 {
-  std::size_t H, T, D, nq, nk, tp, bk;
-  if (!sol_geometry_(heads, tokens, d, key_block, nax, &H, &T, &D, &nq, &nk,
-                     &tp, &bk)) {
+  return scratch_bytes(heads, heads, tokens, d, key_block, nax);
+}
+
+std::size_t
+MetalSolAttention::scratch_bytes(int heads, int kv_heads, int tokens, int d,
+                                 int key_block, bool nax)
+{
+  std::size_t H, KVH, T, D, nq, nk, tp, bk;
+  if (!sol_geometry_(heads, kv_heads, tokens, d, key_block, nax, &H, &KVH,
+                     &T, &D, &nq, &nk, &tp, &bk)) {
     return 0;
   }
   std::vector<std::size_t> plan;
-  sol_scratch_plan_(H, T, D, nq, nk, tp, bk, nax, &plan);
+  sol_scratch_plan_(H, KVH, T, D, nq, nk, tp, bk, nax, &plan);
   std::size_t n = 0;
   for (std::size_t b : plan) { n += b; }
   return n;
@@ -231,13 +252,22 @@ MetalSolAttention::private_bytes(int heads, int tokens, int d, int key_block,
                                  bool nax, std::size_t lend_a,
                                  std::size_t lend_b)
 {
-  std::size_t H, T, D, nq, nk, tp, bk;
-  if (!sol_geometry_(heads, tokens, d, key_block, nax, &H, &T, &D, &nq, &nk,
-                     &tp, &bk)) {
+  return private_bytes(heads, heads, tokens, d, key_block, nax, lend_a,
+                       lend_b);
+}
+
+std::size_t
+MetalSolAttention::private_bytes(int heads, int kv_heads, int tokens, int d,
+                                 int key_block, bool nax, std::size_t lend_a,
+                                 std::size_t lend_b)
+{
+  std::size_t H, KVH, T, D, nq, nk, tp, bk;
+  if (!sol_geometry_(heads, kv_heads, tokens, d, key_block, nax, &H, &KVH,
+                     &T, &D, &nq, &nk, &tp, &bk)) {
     return 0;
   }
   std::vector<std::size_t> plan;
-  sol_scratch_plan_(H, T, D, nq, nk, tp, bk, nax, &plan);
+  sol_scratch_plan_(H, KVH, T, D, nq, nk, tp, bk, nax, &plan);
   // THE SAME GREEDY CARVE ensure_scratch_ runs, alignment included --
   // a subtraction would be a lower bound, and a planner wants the other
   // one. Two cursors, first fit, fall through to private.
@@ -346,14 +376,17 @@ MetalSolAttention::set_arena(const SharedBuffer& a, const SharedBuffer& b)
 }
 
 bool
-MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
+MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int tokens, int d,
                                    std::string* err)
 {
   const int blk = _blk;
   const int nq = (tokens + _bq - 1) / _bq;
   const int nk = (tokens + blk - 1) / blk;
-  if (_heads == heads && _tokens == tokens && _d == d && _nk == nk &&
-      _nq == nq && !_qc.empty()) {
+  // `_kv_heads` joins the geometry tag: the key summaries are sized by
+  // it, so a caller that changed only the group factor would otherwise
+  // keep buffers shaped for the previous one.
+  if (_heads == heads && _kv_heads == kv_heads && _tokens == tokens &&
+      _d == d && _nk == nk && _nq == nq && !_qc.empty()) {
     return true;
   }
   // A REBUILD, so the previous geometry's buffers are about to be
@@ -361,6 +394,7 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   // last references to them.
   drop_residency_();
   const std::size_t H = (std::size_t)heads, D = (std::size_t)d;
+  const std::size_t KVH = (std::size_t)kv_heads;
   // WHERE THE SCRATCH COMES FROM. Every buffer below is written and read
   // inside ONE encode -- the summaries, the routing, the CSR and the two
   // partial outputs all die at the merge -- so any memory the caller is
@@ -405,10 +439,13 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
   _nqa = (tokens + kApproxBQ - 1) / kApproxBQ;
   _tpad = _nqa * kApproxBQ;
   _qc = mk(H * (std::size_t)nq * D * 2);
-  _kc = mk(H * (std::size_t)nk * D * 2);
-  _vc = mk(H * (std::size_t)nk * D * 2);
-  _mean = mk(H * D * 4);
-  _var  = mk(H * D * 4);
+  // PER KV HEAD, and the mirror of sol_scratch_plan_ above. K and V have
+  // kv_heads of them; sizing these by the query count is what read past
+  // the end of the summaries on the first GQA caller.
+  _kc = mk(KVH * (std::size_t)nk * D * 2);
+  _vc = mk(KVH * (std::size_t)nk * D * 2);
+  _mean = mk(KVH * D * 4);
+  _var  = mk(KVH * D * 4);
   _flags = mk(H * (std::size_t)nq * (std::size_t)nk);
   if (_fn_proxy.valid() && _fn_route_p.valid()) {
     _proxy = mk(H * (std::size_t)nq * (std::size_t)nk * 4);
@@ -483,7 +520,9 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
 
   auto* p = static_cast<AttnP*>(_params.contents());
   p->B = 1; p->H = heads; p->D = d; p->qL = tokens; p->kL = tokens;
-  p->gqa = 1;
+  // The exact half is steel, which walks K/V with this factor. It was
+  // pinned at 1 because every caller was MHA.
+  p->gqa = heads / kv_heads;
   p->NQ = nq; p->NK = (tokens + _bk - 1) / _bk;
   p->NQa = tokens / _bq; p->NKa = tokens / _bk;
   p->qL_rem = tokens - p->NQa * _bq;
@@ -508,7 +547,10 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
     pa->NK = (nk + _bk - 1) / _bk;
     pa->NKa = nk / _bk;
     pa->kL_rem = nk - pa->NKa * _bk;
-    const std::int64_t sm[3] = {(std::int64_t)heads * nk * d,
+    // The summary sequence is the approximate half's K/V, so its strides
+    // are the KV head count's -- and `pa->gqa` (copied from `p`) is what
+    // makes that kernel read the right group.
+    const std::int64_t sm[3] = {(std::int64_t)kv_heads * nk * d,
                                 (std::int64_t)nk * d, d};
     for (int i = 0; i < 3; ++i) { pa->Ks[i] = sm[i]; pa->Vs[i] = sm[i]; }
   }
@@ -560,7 +602,8 @@ MetalSolAttention::ensure_scratch_(int heads, int tokens, int d,
         _nax ? "attn_steel_nax" : "attn_steel", _bq, _bk,
         _masked ? "block-masked" : "sol_approx_mma"));
   }
-  _heads = heads; _tokens = tokens; _d = d; _nq = nq; _nk = nk;
+  _heads = heads; _kv_heads = kv_heads; _tokens = tokens; _d = d;
+  _nq = nq; _nk = nk;
   // In STEEL key blocks: that is what the route kernel counts, so a
   // fraction against routing blocks would read above 100%.
   _total_blocks = (long long)heads * nq *
@@ -654,11 +697,36 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
                           float scale, const sol::Config& cfg,
                           std::string* err)
 {
+  return encode(enc, q, k, v, out, heads, heads, tokens, d, scale, cfg, err);
+}
+
+bool
+MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
+                          const SharedBuffer& k, const SharedBuffer& v,
+                          SharedBuffer& out, int heads, int kv_heads,
+                          int tokens, int d, float scale,
+                          const sol::Config& cfg, std::string* err)
+{
   auto fail = [&](const char* m) {
     if (err != nullptr) { *err = m; }
     return false;
   };
   if (heads <= 0 || tokens <= 0 || d <= 0) { return fail("empty geometry"); }
+  // GQA, REFUSED RATHER THAN MIS-INDEXED. Every query head has to belong
+  // to exactly one KV head: a ragged last group would read key centroids
+  // that were never summarised, which is a wrong answer and not a crash.
+  if (kv_heads <= 0 || kv_heads > heads || heads % kv_heads != 0) {
+    return fail("sol_attn: kv_heads must be positive and divide heads");
+  }
+  const int gqa = heads / kv_heads;
+  // The simdgroup approximate kernel indexes the summary sequence by the
+  // QUERY head, so under GQA it would read another group's centroids.
+  // It is the bench A/B rather than the default path, so it is refused
+  // here instead of being taught the group factor.
+  if (gqa > 1 && !_masked) {
+    return fail("sol_attn: VPIPE_SOL_NO_MASKED_APPROX is MHA only -- "
+                "sol_approx_mma indexes the summaries by the query head");
+  }
   // HEAD DIM 64 OR 128, which is every width the steel entries are
   // instantiated at. Both flash kernels tile these IDENTICALLY -- ALU
   // 32/16, NAX 64/32 -- so nothing about the routing, the CSR or the
@@ -686,7 +754,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return fail("the Sol key block must be a whole number of the exact "
                 "kernel's key blocks");
   }
-  if (!ensure_scratch_(heads, tokens, d, err)) { return false; }
+  if (!ensure_scratch_(heads, kv_heads, tokens, d, err)) { return false; }
   if (!ensure_steel_(tokens, err)) { return false; }
   // WHAT ACTUALLY HAPPENED, not what was asked: set_sage already
   // dropped the driver on a box with no matrix cores, so this is the
@@ -742,7 +810,10 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(6, tokens); enc.set_constant(7, d);
   enc.set_constant(8, nk); enc.set_constant(9, _blk);
   enc.set_constant(10, kSumKV);
-  enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)nk},
+  // OVER KV HEADS. The kernel takes its head from the grid's y, so the
+  // k/v pass simply runs `kv_heads` of them and writes [KVH, nk, D] --
+  // no kernel change, and the q pass below is untouched at `heads`.
+  enc.dispatch({(unsigned)d, (unsigned)kv_heads, (unsigned)nk},
                {(unsigned)d, 1, 1});
   enc.set_function(_fn_sum);
   enc.set_buffer(0, q); enc.set_buffer(1, q); enc.set_buffer(2, q);
@@ -759,7 +830,8 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_function(_fn_stats);
   enc.set_buffer(0, _kc); enc.set_buffer(1, _mean); enc.set_buffer(2, _var);
   enc.set_constant(3, d); enc.set_constant(4, nk);
-  enc.dispatch({(unsigned)d, (unsigned)heads, 1}, {(unsigned)d, 1, 1});
+  // The spread of the KEY centroids, so per KV head like the centroids.
+  enc.dispatch({(unsigned)d, (unsigned)kv_heads, 1}, {(unsigned)d, 1, 1});
   }
 
   // 3-5. route, scan, emit -- the CSR the steel kernel walks.
@@ -774,6 +846,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_function(_fn_proxy);
   enc.set_buffer(0, _qc); enc.set_buffer(1, _kc); enc.set_buffer(2, _proxy);
   enc.set_constant(3, nq); enc.set_constant(4, nk); enc.set_constant(5, d);
+  enc.set_constant(6, gqa);
   const unsigned mt = (unsigned)((nq + kProxyTile - 1) / kProxyTile);
   const unsigned nt = (unsigned)((nk + kProxyTile - 1) / kProxyTile);
   enc.dispatch({32u * kProxySg * nt, mt, (unsigned)heads},
@@ -790,6 +863,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(15, sink_lo); enc.set_constant(16, sink_hi);
   enc.set_constant(17, per);
   enc.set_constant(18, nks);
+  enc.set_constant(19, gqa);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   } else if ((skip & 4) == 0) {
   enc.set_function(_fn_route);
@@ -803,6 +877,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(15, sink_lo); enc.set_constant(16, sink_hi);
   enc.set_constant(17, per);
   enc.set_constant(18, nks);
+  enc.set_constant(19, gqa);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   }
 

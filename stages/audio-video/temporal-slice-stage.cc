@@ -15,6 +15,11 @@ namespace vpipe {
 
 namespace {
 
+// What the slice can index, for the editor's dropdown; the ctor's own
+// check stays the authority.
+constexpr SpecExtra kSequenceChoices[] = {
+  {"choices", "beats,frames"},
+};
 constexpr ConfigKey kAttrs[] = {
   // All three optional, like every part of a Python slice. With none of
   // them set this is `[:]` -- a pass-through, which is the harmless
@@ -39,7 +44,7 @@ constexpr ConfigKey kAttrs[] = {
           "mode holds nothing (T is known from the beat, so a negative "
           "index resolves at once) and does NOT change the beat rate, so "
           "unlike the stream mode it can sit inside a feedback loop",
-   .def_str = "beats"},
+   .def_str = "beats", .extra = kSequenceChoices},
   {.key = "squeeze", .type = ConfigType::Bool, .required = false,
    .doc = "frames mode only: when the slice selects exactly ONE frame, "
           "drop the time axis and emit [3, H, W] -- a STILL -- instead of "

@@ -30,11 +30,16 @@ canon_sampler_method(const std::string& m)
   return {};
 }
 
+// The integrators this stage can select, for the editor's dropdown.
+constexpr SpecExtra kMethodChoices[] = {
+  {"choices", "euler,heun,dpmpp_2m,dpmpp_sde,dmd"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = false,
    .doc = "sampler method: euler (default) | heun | dpmpp_2m | dpmpp_sde | "
           "dmd (the Boogu-Image Turbo few-step student: jump to x0 then "
-          "re-noise; only meaningful on a DMD-distilled checkpoint)"},
+          "re-noise; only meaningful on a DMD-distilled checkpoint)",
+   .extra = kMethodChoices},
   {.key = "eta", .type = ConfigType::Real, .required = false,
    .doc = "dpmpp_sde stochasticity, 0 = deterministic (default 1.0)"},
   {.key = "s_noise", .type = ConfigType::Real, .required = false,

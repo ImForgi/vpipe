@@ -62,6 +62,11 @@ bf16_to_f32_(std::uint16_t b)
   return f;
 }
 
+// How a reference latent pairs with the conditioning beats -- the
+// ctor's own three, for the editor's dropdown.
+constexpr SpecExtra kReferenceModeChoices[] = {
+  {"choices", "auto,latch,per_beat"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 model dir (text_encoder/, transformer/, "
@@ -174,30 +179,46 @@ const ConfigKey kAttrs[] = {
   // (generative-models/shared/accel-settings.h) and a graph moved from
   // one stage to the other should not have to be re-authored.
   //
-  // NO BUILT-IN IMAGE DiT IMPLEMENTS IT TODAY, and the doc says so
-  // rather than leaving an operator to infer it from an unchanged step
-  // time. That is not a reason to withhold the key: the bag is how a
-  // REGISTERED family learns what the graph asked for, and without
-  // these an out-of-tree image family cannot be told at all -- which is
-  // exactly the coupling the bag exists to remove. The key being inert
-  // for the five built-ins is a fact about them, not about the
-  // interface, and it stops being true the day one of them takes it
-  // with no change here.
+  // KREA-2 TAKES IT, which is the day this comment used to anticipate:
+  // the keys were carried for REGISTERED families, inert for the
+  // built-ins, and the interface needed no change when one of them
+  // implemented the tier -- `kcfg.sol = _sol` is the whole host-side
+  // wiring. The others (flux2, qwen-image-edit, boogu-image) still
+  // ignore it and the stage says so once, per family rather than for
+  // every family as it used to.
+  //
+  // The bag remains how an out-of-tree image family learns what the
+  // graph asked for, which is the coupling it exists to remove.
   {.key = "sol_attn", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated attention (LOSSY): Sol-Attn routes whole key "
           "blocks during the online softmax, attending the ones a proxy "
           "score keeps and standing in for the rest with each block's key "
           "centroid and value sum. Cost falls with the fraction of blocks "
           "kept, which is a property of the DATA and is reported per run. "
-          "NO BUILT-IN IMAGE FAMILY TAKES IT -- flux2, krea2, "
-          "qwen-image-edit and boogu-image all ignore it, and "
-          "the stage says so once when it is set. It is here for "
-          "REGISTERED families (see generative-models/"
-          "image-model-registry.h), which read it out of the acceleration "
-          "bag. MEASURED IN THE MODEL on an M4 Pro, on the video family "
-          "that does take it (minimax-h3 at 20036 rows): a routed block's "
-          "attention goes 3480 -> 1348 ms (2.58x) keeping 26.1% of key "
-          "blocks. An image DiT's sequence is shorter, so expect less. "
+          "Taken by KREA-2 among the built-in image families, over its "
+          "joint [text; image] self-attention: the text prefix is "
+          "attended EXACTLY, because a centroid over prompt tokens is a "
+          "prompt half-read, and the tier declines below 16 routing "
+          "blocks -- under about 512x512 -- where the local band, the "
+          "sink and the always-exact tail already cover the sequence. "
+          "Also taken by FLUX.2, over the same joint self-attention -- "
+          "including reference-image editing, where the references sit "
+          "IN the sequence. The one FLUX.2 shape it declines is "
+          "`klein_kv`, whose cached steps attend the live queries over "
+          "sequence-plus-spliced-reference keys and whose fill steps run "
+          "two query groups: the keys are then not the queries, and a "
+          "centroid would summarise the wrong sequence. Those steps stay "
+          "dense automatically -- the gate is the geometry, not the "
+          "flag. qwen-image-edit and boogu-image ignore it, and the "
+          "stage says so once when it is set. REGISTERED families read it "
+          "out of the acceleration bag (see generative-models/"
+          "image-model-registry.h). MEASURED IN THE MODEL on an M4 Pro, "
+          "on the video family that takes it (minimax-h3 at 20036 rows): "
+          "a routed block's attention goes 3480 -> 1348 ms (2.58x) "
+          "keeping 26.1% of key blocks. KREA-2'S OWN SPEED IS NOT "
+          "MEASURED; its correctness is (routing off and every layer "
+          "dense are byte-identical). An image DiT's sequence is shorter "
+          "than a video one's, so expect less. "
           "INDEPENDENT OF i8_gemm and of sage_attn and settable with "
           "either: i8_gemm chooses how the block's GEMMs are computed, "
           "sage_attn how the kept blocks' QK product is, and this one "
@@ -210,9 +231,27 @@ const ConfigKey kAttrs[] = {
           "block's own proxy-score distribution -- which is what lets one "
           "number serve every head, layer and resolution where a fixed "
           "block count would not. HIGHER keeps fewer blocks: quality falls "
-          "and speed rises, monotonically in both. 1.0 is the default "
-          "because a single value has to be the conservative one",
-   .def_real = 1.0},
+          "and speed rises, monotonically in both.\n"
+          "0.7 IS THE DEFAULT HERE, against 1.0 on generate-video, and the "
+          "difference is measured rather than cautious. MEASURED on "
+          "Krea-2 at 1024^2 (joint 4160 tokens, 65 routing blocks, 8 "
+          "routed layers), velocity rel-L2 against the dense attention: "
+          "0.0529 at tau <= 0.815 and 0.0680 at tau >= 0.82 -- a 29% step "
+          "inside 0.005 of a standard deviation, with flat plateaus on "
+          "both sides. 1.0 sits on the far side of that step, and the "
+          "image it produces is a visibly different sample rather than a "
+          "slightly softer one (PSNR 15.9 dB against dense, where tau 0.7 "
+          "gives 18.9 dB and two dense runs differ by 66.1 dB). 0.7 sits "
+          "mid-plateau, so it is not a knife edge: anything from 0.5 to "
+          "0.815 measures the same.\n"
+          "IT COSTS LITTLE OF THE SPEEDUP, which is why the step is worth "
+          "staying under: on the same box the denoise ran 143 s dense, "
+          "132 s at tau 0.7 and 133 s at tau 1.0 -- single samples with "
+          "~1.4% run-to-run drift, so read the two Sol arms as equal. "
+          "generate-video keeps 1.0 because its sequences are ~5x longer, "
+          "where the published profile's 1.0/1.25/1.5 was measured and "
+          "where the step above has not been re-measured",
+   .def_real = 0.7},
   {.key = "sol_dense_layers", .type = ConfigType::Int, .required = false,
    .doc = "leading transformer blocks left DENSE, untouched by Sol-Attn. "
           "The first blocks are where the residual stream is least "
@@ -298,7 +337,7 @@ const ConfigKey kAttrs[] = {
           "changes every time, and latching it would restore a whole folder "
           "from the first picture without ever saying so. \"auto\" (the "
           "default) is per_beat for a restorer and latch for everything "
-          "else", .def_str = "auto"},
+          "else", .def_str = "auto", .extra = kReferenceModeChoices},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -1549,6 +1588,7 @@ GenerateImageStage::ensure_loaded_()
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
     fcfg.sage = _sage;
+    fcfg.sol  = _sol;
     // The ANE tiers, whose claim declare_resources booked: WHETHER they run
     // is the plan's grant, read here where the grant exists. Sized from the
     // checkpoint's own dims -- klein-4B and -9B differ by ~1.8x -- and a
@@ -1754,6 +1794,7 @@ GenerateImageStage::ensure_loaded_()
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
     kcfg.sage = _sage;
+    kcfg.sol  = _sol;
     apply_ane_(kcfg);
     _dit = genai::MetalKrea2Transformer::load(
         weight_set_(dit_dir), mc, kcfg, stream_blocks,
@@ -1805,12 +1846,18 @@ GenerateImageStage::ensure_loaded_()
   // Reached only on the BUILT-IN path -- the registered-family branch
   // returns above -- so a plugin that implements Sol is never told its
   // own tier is inert.
-  if (_sol.enabled) {
+  // NOT FOR EVERY FAMILY ANY MORE. Krea-2 implements the tier, and this
+  // line would be printed at the moment it is routing -- a log that
+  // contradicts the run is worse than no log, and the transformer emits
+  // its own line when it arms. The others still ignore the key, and a
+  // graph that set it deserves to know the attention it asked to
+  // approximate ran dense anyway.
+  if (_sol.enabled && _family != "krea2" && _family != "flux2") {
     session()->warn(fmt(
         "GenerateImageStage('{}'): sol_attn is set and the built-in '{}' "
         "denoiser does not implement it, so the attention runs dense. It "
-        "reaches a REGISTERED image family through the acceleration bag; "
-        "no built-in image DiT takes it yet", this->id(), _family));
+        "reaches a REGISTERED image family through the acceleration bag",
+        this->id(), _family));
   }
   session()->log_debug(fmt(
       "GenerateImageStage('{}'): {} DiT ready{}",
@@ -1861,6 +1908,10 @@ GenerateImageStage::load_flux2_dit_()
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
   fcfg.sage = _sage;
+  // The RELOAD path too. A tier set here and not there comes back
+  // missing on the generation after a decode-driven free, which is the
+  // quietest way to lose it.
+  fcfg.sol  = _sol;
   _flux2_params.apply_to(fcfg);
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or
@@ -2301,7 +2352,13 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
         ane = bytes;
       }
     }
-    _dit->set_residency_reserve((decode_runs_beside_us ? peak : 0) + ane);
+    // ...and Sol-Attn's scratch, for the same reason: what it could not
+    // carve from the buffers the forward lends it is memory a resident
+    // block must not grow into.
+    const std::size_t sol_b = _dit->sol_scratch_bytes(
+        genai::MetalKrea2Transformer::ane_plan_seq(_width, _height));
+    _dit->set_residency_reserve((decode_runs_beside_us ? peak : 0) + ane +
+                                sol_b);
     // And the RATES for this schedule. Both of BlockResidency's defaults
     // are tuned for a ~30-step run: on a short one the probe would reach
     // full residency only near the end, where nothing is left to use it.
@@ -2611,7 +2668,28 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
     // No budget to read -> the free bails out too, so the DiT survives.
     const bool decode_runs_beside_us =
         mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
-    _flux2_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    // Plus Sol-Attn's scratch, for the same reason the decode peak is
+    // here: what it could not carve from the two buffers the forward
+    // lends it is memory a promoted block must not grow into.
+    //
+    // REFERENCE TOKENS COUNT TOWARD IT. With klein_kv off -- the better-
+    // quality reference path, and the only reference geometry Sol
+    // actually routes -- the references sit IN the joint sequence
+    // (forward_dit: seq = text + generated + refs), so sizing this on
+    // the generated image alone under-books exactly where the tier is
+    // used. Counted with the SAME filter the pack loop below applies, so
+    // the figure tracks the sequence that is really built rather than an
+    // upper bound on it. Only the prompt half is allowed for rather than
+    // measured -- a few hundred rows against thousands -- because
+    // under-booking is the failure that matters.
+    int flux2_ref_rows = 0;
+    for (const auto& r : refs) {
+      if (!r.empty() && r.c == IC) { flux2_ref_rows += r.h * r.w; }
+    }
+    const std::size_t flux2_sol =
+        _flux2_dit->sol_scratch_bytes(img_seq + flux2_ref_rows + 512);
+    _flux2_dit->set_residency_reserve(
+        (decode_runs_beside_us ? peak : 0) + flux2_sol);
     // And the RATES for this schedule. Both of BlockResidency's defaults
     // are tuned for a ~30-step run: on a short one the probe would reach
     // full residency only near the end, where nothing is left to use it.

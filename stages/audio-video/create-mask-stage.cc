@@ -90,6 +90,11 @@ clamp_byte_(float v)
   return static_cast<uint8_t>(lrintf(v));
 }
 
+// The element types this stage emits, for the editor's dropdown; the
+// ctor's own check stays the authority.
+constexpr SpecExtra kOutputDtypeChoices[] = {
+  {"choices", "u8,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "mask_mode", .type = ConfigType::String,
    .doc = "\"binary\" (two-state 0/255), \"alpha\" (soft 0..255 coverage, "
@@ -113,7 +118,8 @@ constexpr ConfigKey kAttrs[] = {
    .def_real = 0.5},
   {.key = "output_dtype", .type = ConfigType::String,
    .doc = "\"u8\" (0..255, or a class index) or \"f32\" (coverage in [0,1]; "
-          "a class index stays an index)", .def_str = "u8"},
+          "a class index stays an index)", .def_str = "u8",
+   .extra = kOutputDtypeChoices},
   {.key = "width", .type = ConfigType::Int,
    .doc = "mask canvas width; 0 infers it from `height` and the reference "
           "image's aspect ratio, or matches the reference image",

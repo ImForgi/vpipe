@@ -268,8 +268,9 @@ struct SettingsPane: View {
                                   + "parked, not refused.")
                 zeroableField("LMDB Map Size (MB)", $model.dbMapSizeMB,
                               hint: "0 = default")
-                // The locales the session actually has translations for
-                // (common/i18n.cc). A free-text field could name one
+                // The locales BOTH sides have translations for -- the
+                // session's (common/i18n.cc) and the app's own
+                // (Localizations/). A free-text field could name one
                 // that does not exist, which silently falls back rather
                 // than reporting anything.
                 Picker("Language", selection: $model.language) {
@@ -277,6 +278,16 @@ struct SettingsPane: View {
                         Text(l.name).tag(l.tag)
                     }
                 }
+                // Said plainly because the two halves land at different
+                // times: a pipeline started after this picks it up at
+                // once, while this window is drawn from a localization
+                // AppKit resolved when the app launched.
+                Text(LocalizedStringKey(
+                     "Applies to pipelines and the web UI immediately. "
+                     + "This app's own menus and windows change after "
+                     + "it is relaunched."))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Section("FFmpeg") {

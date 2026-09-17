@@ -396,6 +396,11 @@ VideoToRgbStage::VideoToRgbStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The element types this stage emits, for the editor's dropdown; the
+// ctor's own check stays the authority.
+constexpr SpecExtra kOutputDtypeChoices[] = {
+  {"choices", "f32,u8"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "normalize", .type = ConfigType::Bool,
    .doc = "F32 only: divide bytes by 255 -> [0,1]", .def_bool = true},
@@ -404,7 +409,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hwaccel", .type = ConfigType::String,
    .doc = "auto | videotoolbox | none", .def_str = "auto"},
   {.key = "output_dtype", .type = ConfigType::String,
-   .doc = "f32 | u8", .def_str = "f32"},
+   .doc = "f32 | u8", .def_str = "f32", .extra = kOutputDtypeChoices},
   {.key = "output_width", .type = ConfigType::Int,
    .doc = "rescale target width; pair w/ output_height", .def_int = 0},
   {.key = "output_height", .type = ConfigType::Int,

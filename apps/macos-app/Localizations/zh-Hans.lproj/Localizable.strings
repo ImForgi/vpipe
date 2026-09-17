@@ -19,6 +19,7 @@
 "Allow Access to the Whole Filesystem" = "允许访问整个文件系统";
 "Allowed Folders" = "允许的文件夹";
 "Anyone who reaches this server and has the access key can start and stop pipelines, browse the sandbox and drive models on this Mac. Only enable it on a network you trust; change it under Settings ▸ Web UI." = "任何能访问该服务器并持有访问密钥的人，都可以启动和停止流水线、浏览沙盒，并驱动本机上的模型。请仅在信任的网络上启用；可在“设置 ▸ Web 界面”中修改。";
+"Applies to pipelines and the web UI immediately. This app's own menus and windows change after it is relaunched." = "对流水线和 Web 界面立即生效。本 App 自身的菜单和窗口在重新启动后才会改变。";
 "Authorized." = "已授权。";
 "Automatic (this Mac's LAN address)" = "自动（本机局域网地址）";
 "Bind To" = "绑定到";
@@ -43,8 +44,8 @@
 "EOF" = "EOF";
 "Edit in TextEdit" = "用文本编辑打开";
 "FFmpeg" = "FFmpeg";
-"Force Quit" = "强制退出";
 "Force Quit Server" = "强制退出服务器";
+"Force Quit" = "强制退出";
 "Force-quit automatically after %@s." = "%@ 秒后自动强制退出。";
 "Forget" = "忘记";
 "Full Disk Access" = "完全磁盘访问权限";
@@ -115,8 +116,8 @@
 "Use Default" = "使用默认值";
 "Version" = "版本";
 "Waiting for the server to shut down. It will be force-quit automatically after %@ seconds." = "正在等待服务器关闭。%@ 秒后将自动强制退出。";
-"Web UI" = "Web 界面";
 "Web UI File Access" = "Web 界面文件访问";
+"Web UI" = "Web 界面";
 "Work Directory" = "工作目录";
 "audio capture, transcription and audio tagging" = "音频采集、转写和音频标注";
 "composer" = "组合";

@@ -68,6 +68,18 @@ std::string_view config_type_name(ConfigType) noexcept;
 //               an enum change (which is an ABI change).
 //   "since"     a version string, for a composer that wants to mark
 //               what is new.
+//   "choices"   on a ConfigKey -- the fixed set of values a String key
+//               accepts, comma-separated (the suggest_db_type spelling).
+//               An editor offers them as a dropdown instead of a text
+//               box; it reaches the config schema as a JSON array.
+//
+//               A HINT, like suggest_db: the stage still validates its
+//               own value, and a key whose set is open (an FFmpeg codec
+//               name, a locale tag) declares nothing here. Where the set
+//               is genuinely closed, this is the ONE place it is written
+//               down for the UI -- but the stage's own accept/reject
+//               code is still the authority, so the two must be kept in
+//               step by whoever edits either.
 struct SpecExtra {
   std::string_view key;
   std::string_view value;
@@ -207,6 +219,12 @@ struct ConfigParam {
   // required I/O modalities the model browser filters on.
   std::string need_inputs;
   std::string need_outputs;
+  // The fixed set of values this key accepts, from its "choices" extra
+  // (empty when it has none). Split and de-duplicated here so every
+  // reader gets the same list rather than re-parsing the CSV. A real
+  // member because ConfigParam is the HOST's own type -- unlike
+  // ConfigKey, which plugins compile against.
+  std::vector<std::string> choices;
   // Mirror ConfigKey's filesystem-path hints (see there). is_path drives
   // the editor's "Browse..." affordance; path_write / path_kind /
   // path_filter shape the file dialog.

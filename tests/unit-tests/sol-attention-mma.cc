@@ -927,6 +927,141 @@ TEST(sol_attention_mma, the_class_reproduces_dense)
   ::unsetenv("VPIPE_SOL_NO_NAX");
 }
 
+// GQA: K AND V CARRY FEWER HEADS THAN Q.
+//
+// Sol summarises K and V, so the centroids and their statistics are per
+// KV head, while the routing decision, the flags, the CSR and both
+// partial softmaxes stay per QUERY head. A query head therefore has to
+// read the group it belongs to, and getting that index wrong is not a
+// crash -- it is a clean-looking answer built from another group's keys.
+//
+// THE CONTROL IS THE SAME CALL WITH K/V EXPANDED. An MHA forward over
+// K/V repeated `gqa` times is the same arithmetic over the same values:
+// identical centroids, thresholds, routing decisions and exact blocks.
+// So the two must agree to rounding and the bar can be TIGHT, rather
+// than an approximation tolerance a wrong group could hide inside. It
+// also needs no new reference -- the MHA arm is the path every caller
+// took before GQA existed, and it is checked against dense above.
+TEST(sol_attention_mma, gqa_matches_mha_with_expanded_kv)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 8, KVH = 2, T = 1024, BLK = 64;
+  const int gqa = H / KVH;
+  const bool bf16 = std::getenv("VPIPE_SOL_BF16") != nullptr;
+  const float scale = 1.0f / std::sqrt((float)kD);
+
+  std::string err;
+  std::unique_ptr<MetalSolAttention> sol =
+      MetalSolAttention::load(mc, bf16, &err);
+  ASSERT_TRUE(sol != nullptr);
+  if (!sol) { std::printf("[sol-mma] %s\n", err.c_str()); return; }
+
+  // q from one draw and k/v from another, so the groups are genuinely
+  // different tensors rather than one tensor read twice.
+  std::vector<float> q, k_ignored, v_ignored;
+  clustered_(q, k_ignored, v_ignored, H, T, 8, 0.35f, 0x50a1b2c3u);
+  std::vector<float> q_ignored, k, v;
+  clustered_(q_ignored, k, v, KVH, T, 8, 0.35f, 0x9e3779b9u);
+
+  // What an MHA caller would have to build: every KV head repeated for
+  // the query heads in its group.
+  const std::size_t hs = (std::size_t)T * kD;
+  std::vector<float> ke((std::size_t)H * hs), ve((std::size_t)H * hs);
+  for (int h = 0; h < H; ++h) {
+    std::memcpy(&ke[(std::size_t)h * hs], &k[(std::size_t)(h / gqa) * hs],
+                hs * sizeof(float));
+    std::memcpy(&ve[(std::size_t)h * hs], &v[(std::size_t)(h / gqa) * hs],
+                hs * sizeof(float));
+  }
+
+  const SharedBuffer bq = up_(mc, q, bf16);
+  const SharedBuffer bke = up_(mc, ke, bf16), bve = up_(mc, ve, bf16);
+  const SharedBuffer bk = up_(mc, k, bf16), bv = up_(mc, v, bf16);
+  if (bq.empty() || bk.empty()) { return; }
+  SharedBuffer o_mha = mc->make_shared_buffer((std::size_t)H * hs * 2);
+  SharedBuffer o_gqa = mc->make_shared_buffer((std::size_t)H * hs * 2);
+  ASSERT_TRUE(!o_mha.empty() && !o_gqa.empty());
+
+  sol::Config cfg;
+  cfg.enabled = true;
+  cfg.tau = 1.0f;
+  cfg.local_radius = 1;
+  cfg.key_block = BLK;
+
+  // The MHA arm goes through the LEGACY overload -- the one the plugins
+  // and H3 call -- so the delegation is covered here too.
+  auto run_mha = [&](SharedBuffer& o) {
+    CommandStream st = mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = sol->encode(e, bq, bke, bve, o, H, T, kD, scale, cfg, &err);
+    }
+    return ok && st.commit().wait_ok(&err);
+  };
+  auto run_gqa = [&](SharedBuffer& o, int kvh) {
+    CommandStream st = mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = sol->encode(e, bq, bk, bv, o, H, kvh, T, kD, scale, cfg, &err);
+    }
+    return ok && st.commit().wait_ok(&err);
+  };
+
+  // The simdgroup approximate kernel indexes the summary sequence by the
+  // QUERY head, so GQA is refused on that arm rather than answered from
+  // the wrong group. It is a bench A/B, and a wrong answer there would
+  // be worse than not having it.
+  if (std::getenv("VPIPE_SOL_NO_MASKED_APPROX") != nullptr) {
+    EXPECT_FALSE(run_gqa(o_gqa, KVH));
+    std::printf("[sol-mma] gqa refused on the simdgroup approx: %s\n",
+                err.c_str());
+    return;
+  }
+
+  // ONE OBJECT FOR BOTH ARMS, which also exercises the rebuild: the key
+  // summaries are sized by the KV head count, so changing only that has
+  // to invalidate the scratch. Until `_kv_heads` joined the geometry
+  // tag it did not, and the second arm would have run against buffers
+  // shaped for the first.
+  ASSERT_TRUE(run_mha(o_mha));
+  ASSERT_TRUE(run_gqa(o_gqa, KVH));
+
+  auto read = [&](const SharedBuffer& b) {
+    std::vector<float> o((std::size_t)H * hs);
+    if (!bf16) {
+      const auto* p = static_cast<const _Float16*>(b.contents());
+      for (std::size_t i = 0; i < o.size(); ++i) { o[i] = (float)p[i]; }
+      return o;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < o.size(); ++i) {
+      const std::uint32_t u = (std::uint32_t)p[i] << 16;
+      std::memcpy(&o[i], &u, 4);
+    }
+    return o;
+  };
+  const double e = rel_(read(o_gqa), read(o_mha));
+  std::printf("[sol-mma] gqa %d/%d vs mha-expanded: rel-L2 %.3e\n", H, KVH,
+              e);
+  EXPECT_TRUE(e >= 0.0 && e < 1e-6);
+
+  // A GROUP FACTOR THAT DOES NOT DIVIDE IS REFUSED, not rounded: the
+  // ragged last group would read key centroids that were never
+  // summarised, which is the failure this whole index exists to avoid.
+  err.clear();
+  {
+    CommandStream st = mc->make_command_stream();
+    ComputeEncoder e2 = st.begin_compute();
+    EXPECT_FALSE(sol->encode(e2, bq, bk, bv, o_gqa, H, 3, T, kD, scale, cfg,
+                             &err));
+  }
+  EXPECT_TRUE(!err.empty());
+}
+
 // THE TWO ROUTING KERNELS MUST KEEP THE SAME BLOCKS.
 //
 // The proxy is the same dot product either way -- accumulated in f32

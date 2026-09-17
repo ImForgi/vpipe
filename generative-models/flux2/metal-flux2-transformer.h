@@ -4,6 +4,8 @@
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/runtime-lora.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
@@ -84,6 +86,23 @@ class MetalFlux2Transformer {
     // beside it -- that one chooses how the block's GEMMs are computed
     // and this one how the attention between them is.
     sage::Config sage;
+    // Sol-Attn (LOSSY block routing), from generate-image's `sol_attn*`
+    // keys. Off by default.
+    //
+    // ROUTED ONLY WHERE THE KEYS ARE THE QUERIES. FLUX.2's joint
+    // attention is self-attention -- [text, generated] and, with
+    // references but WITHOUT `klein_kv`, [text, generated, refs] -- and
+    // that is the shape Sol needs. Under `klein_kv` it is not: a fill
+    // step runs two query groups (reference queries over reference keys
+    // alone) and a cached step attends QA queries over seq + spliced
+    // reference keys, so tq != tkv in both. forward_dit therefore gates
+    // on the GEOMETRY (QA == seq == KL, no split) rather than on the
+    // flag, and those steps stay dense.
+    //
+    // The text prefix is the exact SINK: a centroid over prompt tokens
+    // is a prompt half-read. Reference tokens are image content and are
+    // routed like the generated ones.
+    sol::Config sol;
     // The FLUX.2-klein-9b-kv RECIPE. It is a property of the CHECKPOINT, not
     // an optimization: that DiT is distilled with reference tokens isolated
     // from the rest of the sequence, so running it under the plain
@@ -330,6 +349,17 @@ class MetalFlux2Transformer {
   // forward still needs; 0 (the default) disables growth entirely, which
   // is the pure-streaming behaviour this model had before.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+
+  // What Sol-Attn holds for a `seq`-token forward AFTER the two buffers
+  // the forward lends it, which is what a residency reserve has to leave
+  // clear. 0 when the tier is off or every layer is dense.
+  //
+  // FLUX.2 lends LESS than Krea-2 does -- `nrm` and `ob` are one hidden
+  // width each, where Krea-2's `g` is a feed-forward width -- so most of
+  // Sol's scratch here is its own allocation rather than a carve, and a
+  // reserve that ignored it would let a promoted block grow into memory
+  // the attention is about to want.
+  std::size_t sol_scratch_bytes(int seq) const;
   // Size the residency rates for the schedule that is about to run. The
   // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
   // one in the same direction -- see BlockResidency::set_schedule. Call
@@ -775,6 +805,9 @@ class MetalFlux2Transformer {
   // The int8 QK prologue. Null when the box has no matrix cores or the
   // config did not ask; every use is guarded.
   std::unique_ptr<MetalSageAttention> _sage;
+  // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
+  // the kernels validated; every use is guarded.
+  std::unique_ptr<MetalSolAttention> _sol;
   bool _use_mma2 = false;
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128 tile
   metal_compute::SharedBuffer _w_deq;   // reusable [N,K] f16 dequant scratch

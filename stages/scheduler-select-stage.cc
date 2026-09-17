@@ -14,17 +14,28 @@ namespace vpipe {
 
 namespace {
 
+// Closed value sets for the editor's dropdowns (SpecExtra "choices").
+// They must agree with the ctor's validation above, which stays the
+// authority on what is accepted.
+constexpr SpecExtra kTypeChoices[] = {
+  {"choices", "simple,karras,exponential,boogu_v1"},
+};
+constexpr SpecExtra kShiftTypeChoices[] = {
+  {"choices", "exponential,linear"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "type", .type = ConfigType::String, .required = false,
    .doc = "schedule: simple (default) | karras | exponential | boogu_v1 "
           "(Boogu-Image's logistic time shift; its sigmas ASCEND -- 0 is noise, "
-          "1 is clean -- so it only fits a Boogu DiT)"},
+          "1 is clean -- so it only fits a Boogu DiT)",
+   .extra = kTypeChoices},
   {.key = "steps", .type = ConfigType::Int, .required = false,
    .doc = "override denoising steps (default 8)"},
   {.key = "shift", .type = ConfigType::Real, .required = false,
    .doc = "override mu / time-shift strength (default 1.15)"},
   {.key = "shift_type", .type = ConfigType::String, .required = false,
-   .doc = "time-shift form: exponential (default) | linear"},
+   .doc = "time-shift form: exponential (default) | linear",
+   .extra = kShiftTypeChoices},
   {.key = "rho", .type = ConfigType::Real, .required = false,
    .doc = "karras curvature (default 7)"},
   {.key = "seq_len", .type = ConfigType::Int, .required = false,

@@ -63,6 +63,14 @@ constexpr const char* kRefPortDoc =
     "you say \"nothing this time\", because a silent port would renumber "
     "every reference after it and quietly change the request";
 
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" is doubly wrong here -- it would land in
+// the `auto` branch, and this encoder reads UNCACHED, so parking it
+// would release 0 bytes even if the policy reached it (see the claim
+// comment below). The legacy "always" / "never" stay accepted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {"choices", "auto,destroy,keep"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "references", .type = ConfigType::Any, .required = false,
    .doc = "the reference files IN THE ORDER THE MODEL SHOULD READ THEM: one "
@@ -160,9 +168,12 @@ const ConfigKey kAttrs[] = {
           "and reload them for the next request. The 32B conditioner is the "
           "largest resident block in a ref2va graph and is idle for the whole "
           "denoise, which on this model is minutes. \"auto\" (default) decides "
-          "from physical RAM vs the pipeline's weight bytes; \"always\" / "
-          "\"never\" force it",
-   .def_str = "auto"},
+          "from physical RAM vs the pipeline's weight bytes; \"destroy\" / "
+          "\"keep\" force it (legacy spellings: \"always\" / \"never\"). "
+          "\"park\" is NOT offered: it resolves as \"auto\" here, and this "
+          "encoder reads uncached, so parking it would release 0 bytes and "
+          "leave it entirely resident",
+   .def_str = "auto", .extra = kUnloadChoices},
 };
 
 const PortSpec kIports[] = {

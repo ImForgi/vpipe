@@ -1805,6 +1805,21 @@ Model-holding stages accept `unload_when_idle`:
 `always` and `never` are accepted as legacy spellings of `destroy` and
 `keep`.
 
+**`park` is not implemented by every stage that takes the key.** Today
+only `diffusion-conditioner` acts on it; the others resolve a two-way
+decision (destroy or keep, else from the box) and a `park` reaches their
+`auto` branch, so it means "resolve from the box" rather than "purgeable".
+Their config dropdowns therefore offer `auto` / `destroy` / `keep` only,
+and their key docs say so.
+
+The reason is not an oversight to tidy away. Parking is the **manager's**
+act, not a stage's: it refuses to park a checkpoint anything is still
+borrowing, so a stage has to end its borrow first and then ask — which is
+what `park_encoder_()` does. And a stage whose loader reads uncached
+parks **0 bytes** whatever it asks for (see "Parking cannot reach uncached
+weights"), which is why `video-ref-encoder` would gain nothing from it
+even if the policy reached the call.
+
 `auto` resolves **after the init barrier**, at the first `process()`, when
 every peer has loaded and real bytes are authoritative — not at
 construction, where a stage would size against a half-loaded graph. A text

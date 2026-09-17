@@ -239,8 +239,9 @@ private:
   // Sol-Attn (LOSSY block routing), the third cross-family tier. Kept as
   // a typed member for the same reason the other two are -- it is what
   // the settled values are read back into, so the log line and the bag
-  // cannot disagree -- even though no BUILT-IN image DiT takes one
-  // today. A registered family reads the bag, not this.
+  // cannot disagree. Krea-2 takes it (the config goes onto its Config
+  // beside `sage`); the other built-ins ignore it, and a registered
+  // family reads the bag rather than this member.
   genai::sol::Config _sol{};
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;

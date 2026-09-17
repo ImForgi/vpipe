@@ -19,6 +19,7 @@
 "Allow Access to the Whole Filesystem" = "Allow Access to the Whole Filesystem";
 "Allowed Folders" = "Allowed Folders";
 "Anyone who reaches this server and has the access key can start and stop pipelines, browse the sandbox and drive models on this Mac. Only enable it on a network you trust; change it under Settings ▸ Web UI." = "Anyone who reaches this server and has the access key can start and stop pipelines, browse the sandbox and drive models on this Mac. Only enable it on a network you trust; change it under Settings ▸ Web UI.";
+"Applies to pipelines and the web UI immediately. This app's own menus and windows change after it is relaunched." = "Applies to pipelines and the web UI immediately. This app's own menus and windows change after it is relaunched.";
 "Authorized." = "Authorized.";
 "Automatic (this Mac's LAN address)" = "Automatic (this Mac's LAN address)";
 "Bind To" = "Bind To";
@@ -43,8 +44,8 @@
 "EOF" = "EOF";
 "Edit in TextEdit" = "Edit in TextEdit";
 "FFmpeg" = "FFmpeg";
-"Force Quit" = "Force Quit";
 "Force Quit Server" = "Force Quit Server";
+"Force Quit" = "Force Quit";
 "Force-quit automatically after %@s." = "Force-quit automatically after %@s.";
 "Forget" = "Forget";
 "Full Disk Access" = "Full Disk Access";
@@ -115,8 +116,8 @@
 "Use Default" = "Use Default";
 "Version" = "Version";
 "Waiting for the server to shut down. It will be force-quit automatically after %@ seconds." = "Waiting for the server to shut down. It will be force-quit automatically after %@ seconds.";
-"Web UI" = "Web UI";
 "Web UI File Access" = "Web UI File Access";
+"Web UI" = "Web UI";
 "Work Directory" = "Work Directory";
 "audio capture, transcription and audio tagging" = "audio capture, transcription and audio tagging";
 "composer" = "composer";

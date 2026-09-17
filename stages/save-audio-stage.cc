@@ -134,6 +134,11 @@ struct AudioPlanarFloatFifo {
   }
 };
 
+// The container set, matching is_known_format_() above -- which stays
+// the authority; this is only what the editor offers.
+constexpr SpecExtra kFormatChoices[] = {
+  {"choices", "wav,aac,mp3,m4a"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_path", .type = ConfigType::String, .required = true,
    .doc = "output file path; when it has no extension, one is appended "
@@ -142,7 +147,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "format", .type = ConfigType::String,
    .doc = "wav | aac | mp3 | m4a (m4a => AAC in mp4). Default: inferred "
           "from the output_path extension, else wav",
-   .def_str = ""},
+   .def_str = "", .extra = kFormatChoices},
   {.key = "bitrate", .type = ConfigType::Int,
    .doc = "AAC / MP3 target bitrate (bits/s)", .def_int = 128000},
   {.key = "sample_rate", .type = ConfigType::Int,
