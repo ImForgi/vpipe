@@ -111,7 +111,13 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "file path or network URL (rtsp/http/...)",
    .is_path = true, .path_filter = "video"},
   {.key = "format", .type = ConfigType::String,
-   .doc = "forced demuxer; \"\" = autodetect", .def_str = ""},
+   .doc = "forced demuxer by name, \"\" = autodetect. `concat` reads a "
+          "LIST file of `file` / `inpoint` / `outpoint` lines instead of "
+          "media, which is how a graph joins several clips into one "
+          "stream; it needs `options: {\"safe\": \"0\"}` for absolute "
+          "paths. A name no demuxer answers to is an error, not a silent "
+          "fall back to probing",
+   .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
    .doc = "emit video oport", .def_bool = true},
   {.key = "enable_audio", .type = ConfigType::Bool,
@@ -303,12 +309,26 @@ LoadVideoStage::open_input_()
   }
 
   AVFormatContext* fctx = nullptr;
-  // Forced input format support is intentionally minimal here: we
-  // ignore _format unless explicitly extended later. Demuxer
-  // autodetection covers all the formats the curated symbol set
-  // exercises in practice.
+  // A FORCED demuxer, when `format` names one. Autodetection covers every
+  // ordinary file, and there is one family it cannot cover at all: a
+  // demuxer whose input is a LIST rather than media. `format: "concat"`
+  // over a text file of `file` / `outpoint` lines is how a graph joins
+  // clips without a stage that re-encodes them one by one -- and probing
+  // decides that same file is ANSI art (a 640x400 `tty` stream), because
+  // that is what a text file looks like to a prober. So the key has to
+  // reach the open, and an unknown name is a clean failure here rather
+  // than a mystery stream later.
+  const AVInputFormat* forced = nullptr;
+  if (!_format.empty()) {
+    forced = _libs->avformat().api.find_input_format(_format.c_str());
+    if (forced == nullptr) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): no demuxer named '{}'; leaving the format "
+          "to autodetection", this->id(), _format));
+    }
+  }
   int rc = _libs->avformat().api.open_input(&fctx, _input_url.c_str(),
-                                            nullptr, &opts);
+                                            forced, &opts);
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
     session()->error(fmt(

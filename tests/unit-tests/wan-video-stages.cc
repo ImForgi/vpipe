@@ -1506,3 +1506,61 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
   std::printf("[generate_video] fl2va 1/2 anchors, ref2va 0 and reported, "
               "no keyframe 0 and silent\n");
 }
+
+// A `ref2va` request of stills packs no audio, and its empty audio beat
+// has to reach the DiT as "no rows" rather than as a malformed tensor.
+//
+// It did not: the encoder set a modality's row width only when it packed
+// a row of it, so the empty audio beat went out as [0, 1], and the width
+// check refused it before asking whether there was a row to misread.
+// Every request without a soundtrack or an audio reference generated
+// nothing. The width is checked only where there are rows; the COUNT is
+// still checked against the layout.
+TEST(generate_video, an_empty_reference_row_beat_is_absent_not_malformed)
+{
+  auto rows = [](std::vector<long long> shape) {
+    TensorBeatPayload tb;
+    tb.dtype = TensorBeat::DType::F32;
+    tb.shape = std::move(shape);
+    std::size_t n = 1;
+    for (long long d : tb.shape) { n *= (std::size_t)d; }
+    tb.resize_contiguous(n);
+    return tb;
+  };
+  // Pre-set before each call, so a null afterwards is the helper's.
+  const float sentinel = 0.0f;
+  const float* data = nullptr;
+
+  // The beats the two-still request emitted: 2048 video rows and an
+  // empty audio beat whose width fell back to 1.
+  {
+    auto v = rows({2048, 96});
+    EXPECT_TRUE(GenerateVideoStage::h3_reference_rows(&v, 96, &data) ==
+                2048);
+    EXPECT_TRUE(data == v.as_f32());
+  }
+  for (long long w : {1LL, 32LL, 0LL}) {
+    data = &sentinel;
+    auto a = rows({0, w});
+    EXPECT_TRUE(GenerateVideoStage::h3_reference_rows(&a, 32, &data) == 0);
+    EXPECT_TRUE(data == nullptr);
+  }
+
+  // A beat WITH rows is still held to its width.
+  {
+    auto a = rows({40, 24});
+    data = &sentinel;
+    EXPECT_TRUE(GenerateVideoStage::h3_reference_rows(&a, 32, &data) == -1);
+    EXPECT_TRUE(data == nullptr);
+  }
+  // Unwired, and not a matrix: no rows.
+  EXPECT_TRUE(GenerateVideoStage::h3_reference_rows(nullptr, 32, &data) ==
+              0);
+  {
+    auto a = rows({32});
+    EXPECT_TRUE(GenerateVideoStage::h3_reference_rows(&a, 32, &data) == 0);
+  }
+
+  std::printf("[generate_video] empty reference-row beats read as absent at "
+              "any width; non-empty ones still checked\n");
+}

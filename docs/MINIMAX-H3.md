@@ -1,5 +1,7 @@
 # MiniMax H3 on Apple Silicon
 
+English | [简体中文](MINIMAX-H3-zh-cn.md)
+
 **MiniMax H3 (FL2VA)** is a 33-billion-parameter video model that generates a
 clip **and its soundtrack together**, from a single prompt. vpipe runs it
 on-device through its **metal-compute** backend — its own Metal kernels, no
@@ -13,6 +15,56 @@ it afterwards. Ask for rain and you get rain you can hear.
 It is also **guidance-distilled**, which is what makes it practical here:
 there is no second unconditional forward pass per step, and useful output
 arrives in **8–16 steps** instead of 30+.
+
+## Contents
+
+- [What you need](#what-you-need)
+  - [Disk space](#disk-space)
+- [The pipelines](#the-pipelines)
+- [Step 1 — prepare the model](#step-1--prepare-the-model)
+  - [First, choose a work directory](#first-choose-a-work-directory)
+  - [Then run the pipeline](#then-run-the-pipeline)
+- [Step 2 — text to video and audio](#step-2--text-to-video-and-audio)
+  - [The settings worth knowing](#the-settings-worth-knowing)
+  - [How long it takes](#how-long-it-takes)
+  - [More than text in](#more-than-text-in)
+  - [Conditioning on references (Ref2VA)](#conditioning-on-references-ref2va)
+    - [Two ways to hand it a reference](#two-ways-to-hand-it-a-reference)
+    - [The example](#the-example)
+    - [What it costs](#what-it-costs)
+    - [How a reference is read](#how-a-reference-is-read)
+    - [References that are not files](#references-that-are-not-files)
+    - [Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint)
+  - [Longer clips — one story in four parts](#longer-clips--one-story-in-four-parts)
+    - [Running the chain](#running-the-chain)
+    - [How a part takes its guide](#how-a-part-takes-its-guide)
+    - [Writing the prompts](#writing-the-prompts)
+    - [Joining the parts](#joining-the-parts)
+    - [What the parts cost](#what-the-parts-cost)
+    - [Making it your own](#making-it-your-own)
+  - [The released weights, either partition](#the-released-weights-either-partition)
+  - [Fewer steps — the Turbo LoRA](#fewer-steps--the-turbo-lora)
+    - [Get it](#get-it)
+    - [Run it](#run-it)
+    - [Runtime (recommended)](#runtime-recommended)
+    - [Two at once](#two-at-once)
+    - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
+    - [Which Turbo adapters work](#which-turbo-adapters-work)
+  - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
+    - [Get it and run it](#get-it-and-run-it)
+    - [What it saves](#what-it-saves)
+  - [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk)
+  - [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing)
+    - [What it saves](#what-it-saves-1)
+    - [Against the VDN branch](#against-the-vdn-branch)
+    - [The knobs](#the-knobs)
+  - [The Neural Engine — for M4-family Macs](#the-neural-engine--for-m4-family-macs)
+    - [What it saves on an M4](#what-it-saves-on-an-m4)
+    - [How it behaves](#how-it-behaves)
+- [Memory](#memory)
+- [Troubleshooting](#troubleshooting)
+- [Under the hood](#under-the-hood)
+- [References and licences](#references-and-licences)
 
 ## What you need
 
@@ -97,6 +149,15 @@ you want to see the model work before spending the hours and the 115 GB.
   — the **Ref2VA** partition instead: reference images, clips and soundtracks
   in, `.mp4` out, each one prepared to a size you choose (see
   [Conditioning on references](#conditioning-on-references-ref2va)).
+- **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
+  … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
+  — a **33-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
+  continuations, each carrying on from the last 2.33 s of the part before it
+  (see [Longer clips](#longer-clips--one-story-in-four-parts)). Needs both
+  partitions, and each part applies its partition's own Turbo adapter.
+- **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
+  — joins those four parts into one 33-second file through the concat
+  demuxer, with no model and no hand-written ffmpeg.
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -264,6 +325,7 @@ From the `generate-video` stage:
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
 | `sage_attn` | `false` | An opt-in **lossy** accelerated mode, independent of both `i8_gemm` and `sol_attn` and settable with either — it runs the attention's QK^T product in int8 with a per-block scale, where `sol_attn` decides which blocks are attended at all. 1.20× on the attention at video geometry, at the same cosine the f16 kernel scores. Matrix cores only. See [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk). |
+| `ane_ffn` / `ane_qkv` | `false` | Opt-in **lossy** modes that run part of every block on the **Apple Neural Engine** beside the GPU. Worth it on an **M4-family** Mac, normally not on an M5. See [The Neural Engine](#the-neural-engine--for-m4-family-macs). |
 | `sol_attn` | `false` | Another opt-in **lossy** accelerated mode, and an independent one — it changes how the attention between the GEMMs is computed where `i8_gemm` changes the GEMMs. 1.27× on the wall clock at 124 frames of 832 × 480, with no extra weights; see [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing) for the knobs beside it. |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
@@ -448,6 +510,12 @@ video conditioned on nothing.
 > are mutually exclusive: taking the anchor costs you the reference list.
 > `generate-video` **warns** if you wire a keyframe on a Ref2VA graph rather
 > than dropping it quietly.
+>
+> Continuing a **clip** is a different request, and one Ref2VA does take. A
+> reference video described as the source of a `[video continuation]` is
+> carried on from its end: its motion, its subjects and its sound. That is
+> behaviour the model learned, not a pinned frame; see
+> [Longer clips](#longer-clips--one-story-in-four-parts).
 
 Wire a **`video-ref-encoder`** stage:
 
@@ -848,6 +916,293 @@ inspecting the directory — which matters because the directory holds **both**
 transformers and cannot say which one you meant. Left to guess it picks
 FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
 video conditioned on nothing.
+
+### Longer clips — one story in four parts
+
+A single generation gets expensive fast as it grows: every frame adds rows
+to the packed sequence, and attention pays for rows squared. Four ordinary
+10-second runs are the cheaper way to a **33-second** clip. Each run after
+the first hands the **tail of the one before** to Ref2VA as a clip to
+continue from, so the story is carried forward by the picture and the sound
+rather than by the prompt alone:
+
+- **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
+  — text to video and audio on the **FL2VA** checkpoint, 243 frames
+  (10.125 s). It writes `minimax-h3-extend-part1.mp4`.
+- **[`…-part2`](pipelines/minimax-h3-extend-part2.vpipeline)** /
+  **[`…-part3`](pipelines/minimax-h3-extend-part3.vpipeline)** /
+  **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
+  — **Ref2VA**, each conditioned on the last 2.33 s of the part before it,
+  picture and sound. 243 frames each.
+- **[`…-concat`](pipelines/minimax-h3-extend-concat.vpipeline)** — joins the
+  four into one file, in vpipe rather than by hand. See
+  [Joining the parts](#joining-the-parts).
+
+Every continuation is the same graph with a different prompt and a different
+file to read, so a fifth is a copy of the fourth.
+
+**EACH PARTITION TAKES ITS OWN TURBO ADAPTER, and that is not a detail the
+graphs can hide.** An adapter is distilled for one task, so part 1 applies
+an **FL2VA** one and parts 2 to 4 a **Ref2VA** one; the parent link in the
+catalogue is what keeps each out of the other's graph (see
+[Which Turbo adapters work](#which-turbo-adapters-work)). As shipped:
+
+| | adapter | steps | shifts |
+|---|---|---|---|
+| part 1 | `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` | 8 | 12 / 3 |
+| parts 2–4 | `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | 8 | **6** / 3 |
+
+The Ref2VA adapter is the only one here that needs **`video_shift: 6.0`**,
+and its graphs set it. Applied at RUNTIME rather than fused: the Turbo delta
+is 2–4e-4 against weights whose bf16 step is ~4e-3, so merging rounds most
+of it away. Drop the two `lora` keys and the parts run on the base
+checkpoints at the same step count.
+
+> **A Turbo adapter is a distillation, and it has limits.** Buying the step
+> count costs some of what the base model knows about composition: a part
+> can come back with the subject badly placed, a hand wrong, or a beat the
+> prompt asked for simply missing, where the undistilled model at a higher
+> count would have held it. They are also a MOVING TARGET — both lines above
+> have been re-distilled more than once, and a newer file often just fixes
+> what an older one got wrong, so check the publisher before settling on a
+> copy.
+>
+> When a part comes back with a composition you do not want, two things are
+> worth trying before rewriting the prompt. A **different `seed`** is the
+> cheaper one and is often enough, since what the adapter lost is a sample's
+> worth of structure rather than the prompt's meaning. Failing that, run
+> that part **without the adapter at 16–20 steps**: that is the base
+> model's own quality and the thing to judge the adapter against. Drop its
+> `lora` and `lora_scale` keys and raise `steps`; nothing else in the graph
+> changes, and the parts after it still read only its tail.
+
+The shipped story is *the clockmaker's songbird*:
+
+| part | what happens | ends on |
+|---|---|---|
+| 1 | In a candlelit workshop walled with clocks, an old clockmaker winds a brass songbird, murmurs *"Just one more turn,"* and raises it on her finger. | her holding still, the bird motionless |
+| 2 | The bird wakes, sings, and flies a circle as every clock chimes; she laughs *"You remembered the song!"* It settles on the frosted windowsill. | the bird still on the sill, watching the snow |
+| 3 | She unlatches the window and lifts the sash; snow blows in, the bird hops onto the open frame and looks back. *"Go on, then. It's your sky."* | the bird poised on the frame, wings half-raised |
+| 4 | It springs into the night, climbs past the eaves, and circles once as she watches from the lit window. *"Goodnight, little one."* | — |
+
+#### Running the chain
+
+You need **both** partitions prepared (step 1 and
+[Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint)). Run
+them in order, from the same work directory — each part opens the previous
+part's `.mp4` by its relative name:
+
+```sh
+cd ~/vpipe-work                                    # the work directory again
+cp ~/src/vpipe/docs/pipelines/minimax-h3-extend-part*.vpipeline .
+for n in 1 2 3 4; do
+  ~/src/vpipe/build/apps/vpipe/vpipe \
+    --launch minimax-h3-extend-part$n.vpipeline || break
+done
+```
+
+Run them **one at a time**, never together: each holds a 33B transformer
+(see [Memory](#memory)). The `|| break` matters — a part whose input is
+missing produces nothing, and the next part would then condition on a stale
+file rather than fail.
+
+#### How a part takes its guide
+
+```
+load-video ─> video-to-rgb(u8) ─> temporal-slice(start −56) ─> temporal-stack ─> ref1
+load-audio(start_s 7.7917, duration_s 2.3333) ─> audio-to-pcm(32000, stereo)
+                                              ─> temporal-stack ─────────────> ref2
+```
+
+**The frame cut is `temporal-slice`, not a seek.** `load-video`'s `start_s`
+lands on the keyframe at or before the time asked for, which in a 10-second
+file may be the first frame. A negative `start` holds exactly the last 56
+decoded frames until the stream ends, so the cut is exact to the frame and
+costs one decode of a short file. Audio packets decode independently, so
+`load-audio` can take its window by time. That window is
+`243/24 − 56/24 = 7.7917 s` onward, the same 2.33 s the frames cover.
+
+**`attach_audio: [2]`** folds that soundtrack onto the clip before it, so the
+model reads one `<Video 1>` with its `<Audio 1>` rather than two unrelated
+references (see [Audio that belongs to a clip](#audio-that-belongs-to-a-clip)).
+
+**Why 56 frames and not 48.** Two seconds at 24 fps is 48, but the encoder
+snaps a reference clip down to a whole `17n + 5` chunk count **from the
+start**. Given 48 it keeps 39, and the 9 frames it drops are the last
+ones — the very moment the continuation is supposed to pick up from. 56 is
+`17 × 3 + 5`, so nothing is dropped. The encoder's line confirms it:
+8,670 reference video rows is 17 latent frames of 510 cells. MiniMax
+documents **2 s** as the shortest reference clip, and 2.33 s clears it.
+
+**`reference_video_short_edge: 0`** keeps the guide on its own 960 × 544
+canvas, the output's own size, instead of upscaling it to 1344 × 768. That
+keeps the reference at 8,670 rows rather than roughly twice that. It is the
+trade described under [What it costs](#what-it-costs), and it has not been
+compared side by side on this story.
+
+#### Writing the prompts
+
+The prompts follow MiniMax's own prompt guides, which describe the format
+the model was trained on. This is not decoration: H3's encoder reads the
+prompt verbatim, with no rewriting step in between.
+
+- **Part 1** uses the three fields of the
+  [base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md):
+  `integrated_multimodal_description`, `overall_soundscape` and
+  `non_diegetic_music`. Shots are marked `[Shot N] At MM:SS.mmm`, the
+  speaker has a stable ID, and her line is written as
+  `<d>[English] Just one more turn.</d>`.
+- **Parts 2 to 4** use the six sections of the
+  [reference guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
+  `subject_definitions` names the clockmaker, the bird and the workshop as
+  `<Subject 1..3>` of `<Video 1>`, with `<Audio 1>` as its soundtrack. The
+  `summary` opens with **`[video continuation + audio reference]`**, the task
+  type that says the clip is to be continued, and its sound followed without
+  being copied. `retention_analysis` and a shot-by-shot
+  `detailed_description` follow.
+
+**Every part but the last ends on a held shot, and the next one opens on
+it.** Part 1 closes with six seconds of static medium close-up in which
+nothing moves but the candle flames; part 2 opens on that framing and holds
+it two seconds before the bird wakes; part 2 in turn ends on the bird
+motionless on the sill, and so on down the chain. The guide is always cut
+from inside one of those holds, so every seam falls where the picture is
+still. Plan the story that way from the start: the beats worth generating
+are the ones **between** the seams.
+
+**Carry the subject definitions over word for word.** Parts 2 to 4 describe
+the woman, the bird and the room in identical words, because the clip shows
+them and the text names them — any drift in the wording is drift the model
+is free to apply to the picture. Some drift arrives anyway; see below.
+
+**Ref2VA continues AFTER the clip; it does not replay it.** MEASURED: part
+2's first frame is closest to part 1's **last** frame (31.5 dB PSNR),
+far closer than to the first frame of the guide window (26.3 dB). That is
+continuation the model learned from the task type, not a pinned frame. The
+[caveat above](#conditioning-on-references-ref2va) still stands, which is
+one more reason to meet on a moment that does not move.
+
+#### Joining the parts
+
+Each part's last 2.33 s and the next part's opening hold are the same
+moment, so the cut can fall anywhere inside it.
+
+**In vpipe**, that is
+[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline):
+one `load-video` reading a LIST rather than a file, through the **concat
+demuxer**, with an `outpoint` per part trimming it at its seam.
+
+```text
+file 'minimax-h3-extend-part1.mp4'
+outpoint 7.791667
+file 'minimax-h3-extend-part2.mp4'
+outpoint 7.791667
+file 'minimax-h3-extend-part3.mp4'
+outpoint 7.791667
+file 'minimax-h3-extend-part4.mp4'
+```
+
+```sh
+vpipe --launch minimax-h3-extend-concat.vpipeline
+```
+
+The graph is the ordinary file chain — `load-video → video-to-rgb →
+rgb-to-video → save-video`, with the soundtrack through `audio-to-pcm` — so
+the join is one re-encode at whatever `video_bitrate` the sink is set to,
+and both streams are cut at the same places. Two keys make it work:
+`format: "concat"` (a list file probes as ANSI art otherwise, since that is
+what a text file looks like to a prober) and `options: {"safe": "0"}`, which
+the demuxer wants before it will follow absolute paths.
+
+**By hand**, if the seam wants a cross-fade rather than a cut — the graph
+has no stage for one — the same four files take each part up to where its
+guide starts and fade over five frames:
+
+```sh
+ffmpeg -i minimax-h3-extend-part1.mp4 -i minimax-h3-extend-part2.mp4 \
+       -i minimax-h3-extend-part3.mp4 -i minimax-h3-extend-part4.mp4 \
+  -filter_complex "\
+[0:v]trim=end=8.0,setpts=PTS-STARTPTS[v0];\
+[1:v]trim=end=8.0,setpts=PTS-STARTPTS[v1];\
+[2:v]trim=end=8.0,setpts=PTS-STARTPTS[v2];[3:v]setpts=PTS-STARTPTS[v3];\
+[v0][v1]xfade=transition=fade:duration=0.208:offset=7.792[a01];\
+[a01][v2]xfade=transition=fade:duration=0.208:offset=15.583[a02];\
+[a02][v3]xfade=transition=fade:duration=0.208:offset=23.375,format=yuv420p[v];\
+[0:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t0];\
+[1:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t1];\
+[2:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t2];[3:a]asetpts=PTS-STARTPTS[t3];\
+[t0][t1]acrossfade=d=0.208[s01];[s01][t2]acrossfade=d=0.208[s02];\
+[s02][t3]acrossfade=d=0.208[a]" \
+  -map "[v]" -map "[a]" -c:v libx264 -crf 18 -c:a aac -b:a 192k \
+  minimax-h3-extend.mp4
+```
+
+Each `offset` is where the next part's hold begins on the timeline built so
+far: 7.792, then 7.792 × 2, then 7.792 × 3. The result is **33.5 s** — the
+four parts' 40.5 s less three 2.33 s overlaps. Because every seam sits inside
+a held shot, plain cuts work too: MEASURED, each part's last frame against
+the next part's first lands at **31.4, 29.8 and 32.7 dB** PSNR.
+
+#### What the parts cost
+
+All four graphs ship with **[`sol_attn`](#faster-attention--sol-attn-routing)
+on**, which is most of what makes a clip this long affordable. MEASURED on
+the 24 GB M5 Pro, 8-bit, 960 × 544, 243 frames, 8 steps, with the two Turbo
+adapters above applied at run time:
+
+| | packed rows | denoise | wall clock | peak memory |
+|---|---|---|---|---|
+| part 1 (text) | 38,072 | 9 min 3 s | 10 min 52 s | 18.1 GB |
+| part 2 | 49,152 | 16 min 32 s | 20 min 29 s | 17.0 GB |
+| part 3 | 49,111 | 16 min 28 s | 20 min 24 s | 16.9 GB |
+| part 4 | 49,102 | 16 min 35 s | 20 min 30 s | 17.9 GB |
+| the concat | — | — | **2.1 s** | — |
+
+The whole 33.5-second clip is **1 h 12 min** of generation, and a
+continuation costs the same as its siblings however far down the chain it
+sits — each one reads exactly 2.33 s of video, whatever came before it.
+
+**The adapters here buy quality, not time.** Both are 8-step distillations
+and the runs already used 8 steps, so the LoRA costs what it computes —
+about 3% on the wall clock, against 1 h 10 min for the same four parts
+without them. Their value is at a LOWER count: the 4-step entries in the
+table under [Fewer steps](#fewer-steps--the-turbo-lora) halve this, and the
+Ref2VA line has one.
+
+A continuation costs more than the text run it follows: the guide adds 8,670
+video rows and 190 audio rows, and the conditioning grows to ~2,750 rows
+because the vision tower's reading of the clip is part of the prompt. That is
+1.29× the rows for 1.87× the wall clock — attention pays for rows squared,
+and the reference encode adds about two minutes before the first step.
+
+Sol saves less on a continuation than on the text run: it kept **24%** of
+key blocks exact on part 1 against **41%** on part 2, because reference rows
+are attended from everywhere.
+
+#### Making it your own
+
+- **Keep each part's two `frames` equal**, on its `generate-video` and its
+  `video-ref-encoder`; they are checked against each other. The parts do not
+  have to be the same length as each other.
+- **Change a part's length and the next part's audio window moves.**
+  `start_s` is `previous_part_frames / 24 − 56 / 24`. Leave `duration_s` at
+  2.3333 as long as the slice stays at 56.
+- **A longer guide is `17n + 5` frames**: 73 (3.04 s) or 90 (3.75 s). Change
+  `temporal-slice`'s `start`, and the audio window with it. A longer guide
+  carries more motion and costs about 510 rows per extra latent frame.
+- **Expect identity to drift along the chain**, and write against it. Each
+  part sees only the 2.33 s before it, so a detail the guide does not show
+  is carried by the prompt alone. Keep the descriptions identical between
+  parts, keep distinguishing features in frame near the seams, and check the
+  last part against the first rather than against the one before it.
+- **For a fifth part**, copy part 4, point its two `load-guide*` stages at
+  `…-part4.mp4`, give the new part its own `output_url`, and add it to the
+  concat list.
+- **Swapping a Turbo adapter changes the step count and the shifts with
+  it.** Each one is distilled at a recipe; the table above is what the
+  shipped pair wants, and
+  [Which Turbo adapters work](#which-turbo-adapters-work) lists the rest
+  with theirs. An adapter for the other partition is refused, not applied.
 
 ### The released weights, either partition
 
@@ -1539,6 +1894,115 @@ switching Sol on does not amplify what `i8_gemm` costs.
 > committing a long job to it, and raise `sol_tau` only against output you
 > have looked at.
 
+### The Neural Engine — for M4-family Macs
+
+Every Apple Silicon Mac has a second accelerator beside the GPU, the
+**Apple Neural Engine** (ANE), and a generation normally leaves it idle.
+vpipe can hand it part of every block: the rows of the **feed-forward**,
+and optionally of the **q|k|v projection**, are split between the two
+engines and computed **at the same time**. Rows in those layers are
+independent of each other, so the split is exact; there is no seam.
+
+```json
+"ane_ffn": true,
+"ane_qkv": true
+```
+
+**Use it on an M4-family Mac** (M4, M4 Pro, M4 Max). There the GPU's matrix
+products already run close to what its memory bandwidth allows, so the ANE
+is the only spare compute on the chip, and taking a share of the rows off
+the GPU shortens every block.
+
+**On an M5, it typically does not help — leave it off.** The M5 GPU's matrix
+cores run these layers several times faster than an M4 GPU's do, while the
+ANE is roughly as quick as before, so there is much less for it to take back.
+Both engines also read the same memory, so the GPU's own rate falls while the
+ANE is predicting. What is left is a few percent, and it depends on the
+geometry: MEASURED on the 24 GB M5 Pro at 960 × 544, 243 frames, Sol and
+Sage on, 4 steps, the tier armed and took the denoise **203 s → 189 s
+(1.07×)**.
+
+The case where it could pay on an M5 is the one where the feed-forward and
+projections dominate a block — a **long clip at high resolution** — but that
+is also where the modules compete with the forward pass for memory, and on
+a 24 GB box they lose. At 1344 × 768, 328 frames the plan granted the module
+and the stage then declined it:
+
+```
+the 98887-row forward fits only without the ANE modules' ~2711 MB
+  -- running the GPU alone for this clip
+```
+
+That run matched its GPU-only control to within a second, which is the
+fallback behaving. So on an M5 treat the tier as something to **measure on
+your own clip**, not as a setting to leave on.
+
+**It does not save memory, whatever the process size suggests.** In the M5
+pair above peak RSS fell from 16.0 GB to 12.1 GB, and none of that is a
+saving: the modules' weights are **wired outside the process** (~1134 MB and
+~374 MB, logged), and the DiT answered by keeping **9 of its 50 blocks**
+resident instead of 21. The tier competes for memory with the block
+residency that makes streaming cheap, so on a tight box it can cost more in
+re-read weights than it wins in the feed-forward. The activation scratch is
+unchanged either way — it is sized by the sequence, not by which engine
+computes a row.
+
+#### What it saves on an M4
+
+MEASURED on a **MacBook Pro (M4 Pro), 64 GB**, 8-bit, 960 × 544, 124
+frames, 4 steps, dense attention:
+
+| | denoise | wall clock |
+|---|---|---|
+| GPU alone | 10 min 2 s | 14 min 17 s |
+| `ane_ffn` + `ane_qkv` | **7 min 23 s** | **11 min 46 s** |
+
+**1.36× on the denoise.** The wall clock gains less (1.21×) because it also
+carries the one-time module builds and a VAE decode that the ANE does not
+touch. Per block, the two tiers were measured apart at a larger geometry
+(1344 × 768, 328 frames, Sol routing every block): the feed-forward alone
+took a block from 23.6 s to 19.3 s, and adding q|k|v took it to 17.2 s.
+
+The clip is not bit-identical to the GPU-only one — at the same seed the
+frames land ~35 dB PSNR apart, which is what an fp16 path costs.
+
+#### How it behaves
+
+- **It balances itself.** `ane_rows` 0 (the default) sizes the ANE's share
+  from the two engines' measured speeds. The tier also times a GPU-only block
+  now and then, and **goes back to the GPU alone** when the split measures
+  slower. A wrong guess costs a few percent, not the clip.
+- **It is lossy, like `i8_gemm`.** The ANE computes in fp16, and the rows it
+  takes differ slightly from the GPU's. MEASURED on two blocks of real
+  geometry: relative L2 **0.0035** on the video output and **0.00045** on the
+  audio. An activation that overflows fp16 is detected, and the chunk is
+  recomputed at a smaller scale rather than passed on.
+- **8-bit and 4-bit checkpoints work**, and so do runtime LoRAs: each block's
+  weights are dequantized, with any adapter merged in, into buffers the ANE
+  reads, one block at a time.
+- **It costs memory, planned before the run.** Each tier holds one shared
+  module however many blocks use it, and the resource plan books both
+  together: **1922 MB** at 124 frames of 960 × 544, **2711 MB** at 328 frames
+  of 1344 × 768. If the forward does not fit alongside them, the run says so
+  and uses the **GPU alone** rather than refusing.
+- **The first run pays a one-time build.** macOS compiles each module the
+  first time: about **10 s** for the feed-forward and **5 s** for q|k|v on an
+  M4 Pro, all before the first denoise step. After that it is cached and
+  takes ~50 ms. The cache is kept **per program** (`vpipe` and `vpipe-web-ui`
+  each build once) and **per macOS version**, so an OS update pays it once
+  more. Resolution and clip length never trigger a rebuild.
+
+| key | default | notes |
+|---|---|---|
+| `ane_ffn` | `false` | The feed-forward on the ANE. |
+| `ane_qkv` | `false` | The q\|k\|v projection too, as a second module. **Requires `ane_ffn`**; the two are planned and granted together, so the plan may decline the pair where it would have granted the feed-forward alone. |
+| `ane_rows` | `0` | The ANE's share of the rows, from 0 to 1. `0` balances automatically; a fixed share is for benchmarking. |
+| `ane_layers` | `0` | Cap on how many blocks use it; `0` is all of them. Not a memory setting: every block shares one module. |
+
+The same switch exists on **`vae-decode`**, for H3's video decoder, whose
+feed-forward is most of the decode. `ane_ffn` there is independent of
+`generate-video`'s, and it follows the same M4-yes, M5-no rule.
+
 ## Memory
 
 **16 GB is the floor, and it works** — but only because the two big models are
@@ -1592,6 +2056,14 @@ encoder warns about it and resamples, and the fix is to set the producing
 `audio-to-pcm`'s `output_sample_rate` to **32000**.
 
 **`frames` isn't what you asked for.** Expected — see the table above.
+
+**`ane_ffn` was set but nothing ran on the ANE.** Two lines say why. Either
+the modules did not fit beside the forward pass (*"the N-row forward fits
+only without the ANE modules"*), in which case the clip runs on the GPU
+alone — lower `frames` or the frame size, or turn the tier off; or the tier
+armed and its controller measured the split as slower and went back to the
+GPU, which on an M5 is the expected outcome. See
+[The Neural Engine](#the-neural-engine--for-m4-family-macs).
 
 ## Under the hood
 

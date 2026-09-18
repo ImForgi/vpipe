@@ -189,9 +189,55 @@ class MetalWanVae {
   // is not in it; the band takes whatever headroom this leaves.
   // `frame_split` is whether the post-temporal tail runs a frame at a time
   // (the default; VPIPE_WAN_VAE_NO_FRAME_SPLIT turns it off).
+  //
+  // `tail_frac` is the share of the plane the TILED tail carries at once --
+  // 1.0 untiled, and (tile + halo) / whole for a spatial tiling. It scales
+  // only what runs below the last temporal upsample, because that is what
+  // tiles: the blocks above it, and the mid attention among them, keep the
+  // whole plane. See decode()'s tiling and choose_tail_tiles_().
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
   static std::size_t decode_peak_bytes(const Config& cfg, int h8, int w8,
-                                       bool frame_split = true) noexcept;
+                                       bool frame_split = true,
+                                       double tail_frac = 1.0) noexcept;
+
+  // How many tiles the TAIL (everything below the last temporal upsample)
+  // is split into so a decode fits `headroom`, and the plane share one
+  // tile then holds. {1, 1} when the whole plane already fits, which is
+  // every geometry small enough to have worked before this existed.
+  //
+  // Tiling BELOW the attention is what makes it exact: the mid-block
+  // attention is the only layer here whose receptive field is the whole
+  // plane, and it runs above the split. Everything under it is convs, a
+  // nearest upsample, and a per-pixel RMS over channels -- all local -- so
+  // a tile carrying `halo` pixels of real neighbourhood produces interior
+  // pixels that do not know they were tiled.
+  struct TailTiles {
+    int    ty    = 1;
+    int    tx    = 1;
+    int    bh    = 0;     // tile height in split-plane pixels, a multiple of 8
+    int    bw    = 0;
+    int    halo  = 0;     // split-plane pixels of overlap per side, also 8s
+    double frac  = 1.0;   // (tile + halo) / whole, for decode_peak_bytes
+  };
+  // Tiles and halo are rounded UP TO 8 on purpose. The matrix-core 3x3
+  // convolution tiles its destination 8x8 and declines a plane whose H or
+  // W is not a multiple of 8 -- a tile that misses that is still correct,
+  // because the im2col gather picks it up, but it gives away the ~3x that
+  // path is worth on an M5. The split plane is itself a multiple of 8, so
+  // aligned tiles keep every extent aligned, halo included.
+  static int align8_(int v) { return ((v + 7) / 8) * 8; }
+  // `fits` reports whether the returned grid actually gets under
+  // `headroom`. When nothing does, the FINEST grid tried comes back with
+  // `fits` false -- a refusal can then say what was already attempted
+  // instead of quoting the whole-plane figure nobody was going to use.
+  TailTiles choose_tail_tiles_(int h8, int w8, std::size_t headroom,
+                               bool frame_split,
+                               bool* fits = nullptr) const noexcept;
+  // Pixels of halo one tile needs so its interior is bit-exact: one per
+  // 3x3 conv below the split, each counted at its own resolution.
+  int tail_halo_() const noexcept;
+  // The split-plane size (the tail's input) for a latent of this size.
+  void tail_plane_(int h8, int w8, int* hs, int* ws) const noexcept;
 
   const Config& config() const { return _cfg; }
 
@@ -417,7 +463,8 @@ class MetalWanVae {
   // ---- kernels ---------------------------------------------------------
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_rms, _fn_mul_sigmoid,
-      _fn_residual, _fn_clamp, _fn_sdpa, _fn_upsample, _fn_copy;
+      _fn_residual, _fn_clamp, _fn_sdpa, _fn_upsample, _fn_copy,
+      _fn_copy_rect;
   // The 2D im2col twins (the plain-3x3 resample convs) and the 3D one that
   // is this VAE's addition.
   metal_compute::ComputeFunction _fn_im2col_tiled, _fn_im2col_s2_tiled,

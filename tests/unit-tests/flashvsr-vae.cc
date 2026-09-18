@@ -313,6 +313,121 @@ TEST(flashvsr_vae, frame_split_is_exact_and_bounded)
   EXPECT_TRUE(split.peak < whole.peak);
 }
 
+// The SPATIALLY TILED tail against the whole-plane one, at a size where
+// both fit. The claim tiling rests on is that it is not an approximation:
+// the mid attention -- the only layer here that reads the whole plane --
+// runs above the split, and every layer below it is local, so a tile
+// carrying the receptive field on each interior side reproduces the
+// untiled pixels EXACTLY. Bit-for-bit, not within a tolerance.
+//
+// Env: VPIPE_FLASHVSR_TEST_MODEL_PATH; VPIPE_WAN_VAE_TEST_GRID=<h8>.
+TEST(flashvsr_vae, tiled_tail_is_exact_and_smaller)
+{
+  const char* root = std::getenv("VPIPE_FLASHVSR_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(root, &layout) && !layout.vae.empty());
+  if (layout.vae.empty()) { return; }
+  MetalWanVae::Config cfg;
+  std::string err;
+  const bool have_cfg =
+      MetalWanVae::config_from_json(layout.vae, cfg, &err) ||
+      MetalWanVae::config_for_native_checkpoint(layout.vae, cfg, &err);
+  ASSERT_TRUE(have_cfg);
+  if (!have_cfg) { return; }
+  auto m = MetalWanVae::load(layout.vae, mc, cfg, /*with_encoder=*/false);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  int g = 32;
+  if (const char* e = std::getenv("VPIPE_WAN_VAE_TEST_GRID")) {
+    if (std::atoi(e) > 0) { g = std::atoi(e); }
+  }
+  const int T = 3;                       // one opening chunk plus a steady one
+  const int F = MetalWanVae::video_frames(T);
+  const std::size_t nz = (std::size_t)cfg.z_dim * T * g * g;
+  SharedBuffer z = mc->make_shared_buffer(nz * 2);
+  ASSERT_TRUE(!z.empty());
+  if (z.empty()) { return; }
+  {
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)nd(rng); }
+  }
+
+  const std::size_t hw = (std::size_t)g * 8 * g * 8;
+  struct Arm {
+    std::vector<std::uint16_t> px;
+    std::size_t peak = 0;
+    bool ok = false;
+  };
+  auto run = [&](const char* grid) {
+    Arm a;
+    if (grid == nullptr) {
+      ::unsetenv("VPIPE_WAN_VAE_TILE");
+    } else {
+      ::setenv("VPIPE_WAN_VAE_TILE", grid, 1);
+    }
+    a.px.assign((std::size_t)3 * F * hw, 0);
+    const std::size_t live0 =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    metal_compute::shared_buffer_reset_peak();
+    std::string e;
+    a.ok = m->decode(
+        z, T, g, g,
+        [&](const SharedBuffer& rgb, int frame0, int n) {
+          const auto* s = static_cast<const std::uint16_t*>(rgb.contents());
+          for (int c = 0; c < 3; ++c) {
+            for (int f = 0; f < n; ++f) {
+              std::memcpy(
+                  a.px.data() + ((std::size_t)c * F + frame0 + f) * hw,
+                  s + ((std::size_t)c * n + f) * hw, hw * 2);
+            }
+          }
+          return true;
+        },
+        &e);
+    if (!a.ok) { std::printf("  decode: %s\n", e.c_str()); }
+    const std::size_t pk =
+        metal_compute::shared_buffer_memory_stats().peak_bytes;
+    a.peak = pk > live0 ? pk - live0 : 0;
+    return a;
+  };
+
+  const Arm whole = run(nullptr);
+  const Arm tiled = run("2x2");
+  ::unsetenv("VPIPE_WAN_VAE_TILE");
+  ASSERT_TRUE(whole.ok && tiled.ok);
+  if (!whole.ok || !tiled.ok) { return; }
+
+  const bool exact = std::memcmp(whole.px.data(), tiled.px.data(),
+                                 whole.px.size() * 2) == 0;
+  if (!exact) {
+    // Where it diverges says WHICH boundary leaked: a halo one short
+    // shows up as a seam, not as noise everywhere.
+    std::size_t diff = 0, first = 0;
+    for (std::size_t i = 0; i < whole.px.size(); ++i) {
+      if (whole.px[i] != tiled.px[i]) {
+        if (diff == 0) { first = i; }
+        ++diff;
+      }
+    }
+    std::printf("  tiled differs in %zu of %zu samples, first at %zu\n",
+                diff, whole.px.size(), first);
+  }
+  EXPECT_TRUE(exact);
+  std::printf("  %dx%d: whole %.1f MB, 2x2 tiled %.1f MB\n", g * 8, g * 8,
+              (double)whole.peak / 1048576.0,
+              (double)tiled.peak / 1048576.0);
+  // The point of the exercise: a tile holds less than the whole plane.
+  EXPECT_TRUE(tiled.peak < whole.peak);
+}
+
 // A DECODE BENCH, not a check. VPIPE_WAN_VAE_BENCH="h8,w8,T" decodes a
 // synthetic latent of that size and prints the wall time of every chunk,
 // so a slow decode can be attributed without a denoiser in front of it.

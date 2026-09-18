@@ -232,6 +232,20 @@ public:
   static int h3_anchor_count(bool is_ref2va, bool have_keyframe,
                              int ref_frames, bool* ignored);
 
+  // How many `ref2va` reference rows a row beat carries: its row count,
+  // or -1 when a NON-EMPTY beat is not `want_elems` wide. `*data` points
+  // at the rows when there are any, else null. A missing or non-matrix
+  // beat carries 0.
+  //
+  // An EMPTY beat is 0 whatever its width. It is how video-ref-encoder
+  // says a modality is absent, and with no rows there is nothing a wrong
+  // width could misread; the row COUNT is still checked against the
+  // layout. Public and static for the same reason as the one above: it
+  // is what refused every request of stills, and a test of it needs
+  // neither a model nor a runtime.
+  static int h3_reference_rows(const class TensorBeatPayload* t,
+                               int want_elems, const float** data);
+
   // Test-only accessors.
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }

@@ -5671,8 +5671,14 @@ const STRINGS = {
       '文件路径或网络 URL（rtsp/http/…）',
       '檔案路徑或網路 URL（rtsp/http/…）'],
   'cfg.load-video.format': ['',
-      '强制指定解复用器；"" = 自动检测',
-      '強制指定解多工器；"" = 自動偵測'],
+      '按名称强制指定解复用器；"" = 自动检测。concat 读取的是一个列表文件'
+      + '（由 file / inpoint / outpoint 行组成）而非媒体本身，图就是这样把'
+      + '多个片段接成一条流的；绝对路径需配合 options: {"safe": "0"}。若指'
+      + '定的名称没有对应的解复用器，会报错，而不会悄悄回退到自动探测',
+      '按名稱強制指定解多工器；"" = 自動偵測。concat 讀取的是一個清單檔'
+      + '（由 file / inpoint / outpoint 行組成）而非媒體本身，圖就是這樣把'
+      + '多個片段接成一條串流的；絕對路徑需搭配 options: {"safe": "0"}。若'
+      + '指定的名稱沒有對應的解多工器，會回報錯誤，而不會悄悄退回自動偵測'],
   'cfg.load-video.enable_video': ['', '发出视频输出端口', '發出視訊輸出埠'],
   'cfg.load-video.enable_audio': ['', '发出音频输出端口', '發出音訊輸出埠'],
   'cfg.load-video.video_stream_index': ['',

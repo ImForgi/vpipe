@@ -242,6 +242,17 @@ encode_references(const std::vector<MediaReference>& refs,
   }
 
   EncodedReferences r;
+  // The row WIDTHS belong to the models, not to the request, so they are
+  // set before any reference is read. A modality with no rows still has
+  // a width: a request of stills packs no audio, and its empty audio
+  // beat has to say [0, 32] rather than [0, 1] for the DiT to take it.
+  if (models.video_vae != nullptr) {
+    r.video_row_elems = models.video_vae->config().z_channels *
+                        plan.patch_h * plan.patch_w;
+  }
+  if (models.audio_vae != nullptr) {
+    r.audio_row_elems = models.audio_vae->config().latent_channels;
+  }
   // The tower results are held for the whole traversal: the
   // presentation points INTO them (one buffer per reference, indexed by
   // temporal cell), so they have to outlive the conditioner call.
@@ -298,7 +309,6 @@ encode_references(const std::vector<MediaReference>& refs,
       }
       const auto& ac = models.audio_vae->config();
       const int AC = ac.latent_channels;
-      r.audio_row_elems = AC;
       const bool whiten = (int)ac.latents_mean.size() == AC &&
                           (int)ac.latents_std.size() == AC;
       const std::size_t base = r.audio_rows.size();
@@ -446,7 +456,6 @@ encode_references(const std::vector<MediaReference>& refs,
                       std::to_string(plan.patch_w) + " patch does not "
                       "divide");
         }
-        r.video_row_elems = vc.z_channels * plan.patch_h * plan.patch_w;
         pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
                              plan.patch_w, vc.latents_mean, vc.latents_std,
                              &r.video_rows);

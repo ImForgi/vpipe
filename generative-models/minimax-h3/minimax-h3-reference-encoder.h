@@ -195,6 +195,9 @@ struct EncodedReferences {
   // The reference AUDIO rows: [rows, audio_latent_channels] f32,
   // whitened, channel-major within a reference (the stereo pair is the
   // outer axis) and concatenated in reference order.
+  //
+  // Both widths come from the loaded VAE, so they are set even when a
+  // modality packed no rows. 0 only when that VAE was not passed.
   std::vector<float> audio_rows;
   int                audio_row_elems = 0;
 

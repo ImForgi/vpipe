@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -582,6 +584,7 @@ MetalWanVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_residual    = m->_lib_elt.function("residual_add_f16");
   m->_fn_clamp       = m->_lib_elt.function("clamp_f16");
   m->_fn_copy        = m->_lib_elt.function("copy_f16");
+  m->_fn_copy_rect   = m->_lib_elt.function("copy_rect_f16");
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
   m->_fn_im2col_tiled = m->_lib_elt.function("im2col_hwc_3x3_tiled_f16");
@@ -594,7 +597,8 @@ MetalWanVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_upsample    = m->_lib_elt.function("upsample_nearest2x_hwc_f16");
   if (!m->_fn_gemm_bias.valid() || !m->_fn_rms.valid() ||
       !m->_fn_mul_sigmoid.valid() || !m->_fn_residual.valid() ||
-      !m->_fn_clamp.valid() || !m->_fn_copy.valid() || !m->_fn_sdpa.valid() ||
+      !m->_fn_clamp.valid() || !m->_fn_copy.valid() ||
+      !m->_fn_copy_rect.valid() || !m->_fn_sdpa.valid() ||
       !m->_fn_im2col_tiled.valid() || !m->_fn_im2col_s2_tiled.valid() ||
       !m->_fn_im2col3d_tiled.valid() || !m->_fn_concat3.valid() ||
       !m->_fn_time_unshuffle.valid() || !m->_fn_upsample.valid()) {
@@ -1477,7 +1481,8 @@ std::size_t
 MetalWanVae::decode_peak_bytes(int h8, int w8) const noexcept
 {
   return decode_peak_bytes(
-      _cfg, h8, w8, std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr);
+      _cfg, h8, w8, std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr,
+      1.0);
 }
 
 // Walks decode()'s topology for a STEADY chunk -- four output frames; the
@@ -1501,7 +1506,7 @@ MetalWanVae::decode_peak_bytes(int h8, int w8) const noexcept
 // The OUTPUT: the chunk's RGB twice, the pool's and the sink's.
 std::size_t
 MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
-                               bool frame_split) noexcept
+                               bool frame_split, double tail_frac) noexcept
 {
   if (h8 <= 0 || w8 <= 0) { return 0; }
   constexpr std::size_t kSlots = 2;
@@ -1516,6 +1521,15 @@ MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
   for (int i = 0; i < 3; ++i) {
     if (tup[i]) { split_at = i; }
   }
+
+  // Below the split the tail may run on TILES, so everything there holds
+  // one tile's plane (plus its halo) rather than the whole one. Above it
+  // -- conv_in, the mid block with its whole-plane attention, and the
+  // blocks up to the split -- nothing tiles and the share is 1.
+  const double frac = (tail_frac > 0.0 && tail_frac < 1.0) ? tail_frac : 1.0;
+  auto tiled = [&](std::size_t hw) {
+    return (std::size_t)((double)hw * frac + 0.5);
+  };
 
   std::size_t carries = 0, pool = 0;
   auto keep = [&](std::size_t hw, std::size_t cin) {
@@ -1535,11 +1549,14 @@ MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
   for (int i = 0; i < 4; ++i) {
     const std::size_t in = (i > 0) ? d[i] / 2 : d[i];
     const std::size_t out = d[i + 1];
+    // The tail begins at the split block's SPATIAL half, so that block's
+    // resnets are still whole-plane and everything after them is not.
+    const std::size_t rhw = (i > split_at) ? tiled(hw) : hw;
     for (int r = 0; r <= cfg.num_res_blocks; ++r) {
-      keep(hw, r == 0 ? in : out);
-      keep(hw, out);
+      keep(rhw, r == 0 ? in : out);
+      keep(rhw, out);
     }
-    level = std::max(level, nt * hw * std::max(in, out));
+    level = std::max(level, nt * rhw * std::max(in, out));
     if (i == 3) { break; }                   // the last block has no resample
     if (tup[i]) {
       keep(hw, out);                         // its time_conv
@@ -1547,12 +1564,117 @@ MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
       t *= 2;
       nt = (frame_split && i >= split_at) ? 1 : t;
     }
-    next_level(nt * 4 * hw * out);
+    const std::size_t uhw = (i >= split_at) ? tiled(hw) : hw;
+    next_level(nt * 4 * uhw * out);
     hw *= 4;
   }
-  keep(hw, d[4]);                            // conv_out
+  keep(tiled(hw), d[4]);                     // conv_out
   next_level(0);
-  return carries + pool + 2 * t * hw * 3 * 2;
+  // The chunk's RGB twice: the tile's (pooled) and the whole frame's, which
+  // the tiles are assembled into and the sink reads. Untiled the two are
+  // the same size, which is the `2 x` this term has always carried.
+  const std::size_t rgb_whole = 2 * t * hw * 3;
+  const std::size_t rgb_tile =
+      (std::size_t)((double)rgb_whole * frac + 0.5);
+  return carries + pool + rgb_whole + rgb_tile;
+}
+
+// Pixels of real neighbourhood a tile must carry on each side so its
+// INTERIOR is what an untiled decode would have produced. One per 3x3
+// conv below the split, each counted at its own resolution and brought
+// back to the split plane -- a conv at 4x costs a quarter of a
+// split-plane pixel, because four of its pixels fit in one of ours.
+//
+// Exact rather than generous on purpose: the halo is the tiling's only
+// overhead, and at 1920x1152 a pixel of it is 480 latent cells.
+int
+MetalWanVae::tail_halo_() const noexcept
+{
+  std::size_t split_at = 0;
+  for (std::size_t i = 0; i < _up_blocks.size(); ++i) {
+    if (_up_blocks[i].up.present && _up_blocks[i].up.temporal) {
+      split_at = i;
+    }
+  }
+  double halo = 0.0, scale = 1.0;
+  for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
+    const UpBlock& ub = _up_blocks[i];
+    if (i != split_at) {
+      // Every resblock is two 3x3 convs; the temporal taps add no
+      // spatial reach.
+      halo += 2.0 * (double)ub.resnets.size() / scale;
+    }
+    if (ub.up.present) {
+      scale *= 2.0;                    // nearest upsample: no reach of its own
+      halo += 1.0 / scale;             // the block's spatial conv, after it
+    }
+  }
+  halo += 1.0 / scale;                 // conv_out
+  return (int)std::ceil(halo);
+}
+
+// The tail's input plane: the latent, doubled by every spatial upsample
+// that runs ABOVE the split.
+void
+MetalWanVae::tail_plane_(int h8, int w8, int* hs, int* ws) const noexcept
+{
+  std::size_t split_at = 0;
+  for (std::size_t i = 0; i < _up_blocks.size(); ++i) {
+    if (_up_blocks[i].up.present && _up_blocks[i].up.temporal) {
+      split_at = i;
+    }
+  }
+  int h = h8, w = w8;
+  for (std::size_t i = 0; i < split_at; ++i) {
+    if (_up_blocks[i].up.present) { h *= 2; w *= 2; }
+  }
+  if (hs != nullptr) { *hs = h; }
+  if (ws != nullptr) { *ws = w; }
+}
+
+MetalWanVae::TailTiles
+MetalWanVae::choose_tail_tiles_(int h8, int w8, std::size_t headroom,
+                                bool frame_split, bool* fits) const noexcept
+{
+  TailTiles t;
+  if (fits != nullptr) { *fits = true; }
+  if (headroom == 0) { return t; }             // nothing to size against
+  if (decode_peak_bytes(_cfg, h8, w8, frame_split, 1.0) <= headroom) {
+    return t;                                  // the whole plane fits
+  }
+  TailTiles finest;                            // the last grid that is legal
+  int hs = 0, ws = 0;
+  tail_plane_(h8, w8, &hs, &ws);
+  const int halo = align8_(tail_halo_());
+  // Candidate grids in order of TILE COUNT, because the count is what the
+  // tiling costs: every tile re-runs the tail's dispatch chain over a
+  // smaller plane. MEASURED at 1920x1152 on the M5 Pro, one chunk:
+  // 2x2 is 3% slower than whole and 5x5 is 26%, for 8.1 GB and 3.9 GB of
+  // footprint against 8.9. So take the COARSEST grid that fits and stop --
+  // a finer one buys memory nobody asked for at a price in time.
+  static const int kGrids[][2] = {{1, 2}, {2, 1}, {2, 2}, {2, 3}, {3, 2},
+                                  {3, 3}, {3, 4}, {4, 3}, {4, 4}, {4, 5},
+                                  {5, 4}, {5, 5}, {6, 6}, {7, 7}, {8, 8}};
+  for (const auto& g : kGrids) {
+    const int bh = align8_((hs + g[0] - 1) / g[0]);
+    const int bw = align8_((ws + g[1] - 1) / g[1]);
+    // A tile smaller than its own halo is all overhead; skip rather than
+    // grind the plane into borders.
+    if (bh <= halo || bw <= halo) { continue; }
+    const int ty = (hs + bh - 1) / bh, tx = (ws + bw - 1) / bw;
+    if (ty <= 1 && tx <= 1) { continue; }
+    const double frac = (double)(bh + 2 * halo) * (double)(bw + 2 * halo)
+                      / ((double)hs * (double)ws);
+    if (frac >= 1.0) { continue; }
+    finest.ty = ty; finest.tx = tx; finest.bh = bh; finest.bw = bw;
+    finest.halo = halo; finest.frac = frac;
+    if (decode_peak_bytes(_cfg, h8, w8, frame_split, frac) <= headroom) {
+      return finest;
+    }
+  }
+  // Nothing fit. The finest grid tried is what the caller reports.
+  if (fits != nullptr) { *fits = false; }
+  return finest;
 }
 
 bool
@@ -1585,6 +1707,32 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
   // The band's share is bounded by both: whatever this decode leaves of
   // the smaller of the two. Sized from the working set alone it took RAM
   // the box did not have.
+  const bool frame_split_on =
+      std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr;
+  // Spatial tiling of the tail, decided by the preflight below: {1,1}
+  // unless the whole plane does not fit.
+  TailTiles tiles;
+  {
+    // Test hook: force a grid so the tiled path can be held against the
+    // whole-plane one at a size where both fit. "2x2", or "0" for off.
+    const char* e = std::getenv("VPIPE_WAN_VAE_TILE");
+    int ty = 0, tx = 0;
+    if (e != nullptr && std::sscanf(e, "%dx%d", &ty, &tx) == 2 &&
+        ty >= 1 && tx >= 1 && (ty > 1 || tx > 1)) {
+      int hs = 0, ws = 0;
+      tail_plane_(h8, w8, &hs, &ws);
+      const int halo = align8_(tail_halo_());
+      const int bh = align8_((hs + ty - 1) / ty);
+      const int bw = align8_((ws + tx - 1) / tx);
+      if (bh > halo && bw > halo) {
+        tiles.ty = (hs + bh - 1) / bh;
+        tiles.tx = (ws + bw - 1) / bw;
+        tiles.bh = bh; tiles.bw = bw; tiles.halo = halo;
+        tiles.frac = (double)(bh + 2 * halo) * (double)(bw + 2 * halo)
+                   / ((double)hs * (double)ws);
+      }
+    }
+  }
   std::size_t headroom = 0;
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
@@ -1592,7 +1740,7 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     if (headroom != 0 && mb.available_physical != 0) {
       headroom = std::min(headroom, mb.available_physical);
     }
-    const std::size_t need = decode_peak_bytes(h8, w8);
+    std::size_t need = decode_peak_bytes(h8, w8);
     // NO MARGIN on top. fits_physical's default 10% is for a guess, and
     // this is not one: the carries are exact and the pool term is
     // calibrated 3-4% ABOVE a measured peak, so a margin counts the same
@@ -1608,21 +1756,105 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     // 1920x1152 decode in one process sampled an 11106 MB footprint over
     // 278 MB of live buffers and was refused against 6945 MB
     // "reclaimable" before this term existed.
-    const std::size_t live =
+    std::size_t live =
         metal_compute::shared_buffer_memory_stats().live_bytes;
-    const std::size_t reusable =
+    std::size_t reusable =
         mb.self_graphics > live ? mb.self_graphics - live : 0;
-    if (mb.available_physical != 0 &&
-        need > mb.available_physical + reusable) {
+    // TILE THE TAIL BEFORE REFUSING. The whole-plane figure above is what
+    // an untiled decode holds; below the mid attention everything is local,
+    // so the same decode can run on tiles and hold a fraction of it. A
+    // geometry that fits whole still runs whole -- tiles are the answer to
+    // a box that would otherwise be told no.
+    MetalCompute::MemoryBudget cur = mb;
+    std::size_t have = (cur.available_physical != 0)
+                           ? cur.available_physical + reusable
+                           : 0;
+    if (tiles.ty > 1 || tiles.tx > 1) {
+      need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
+    }
+    // AND WAIT FOR THE DENOISER'S PAGES BEFORE REFUSING. A decode runs
+    // right behind the forward that produced its latent, and that forward's
+    // buffers are wired: they are neither free, purgeable nor file-backed,
+    // so `available_physical` reads a few GB while they are held and tens
+    // of GB a moment later. MEASURED on a 24 GB box at 1920x1152: the same
+    // clip that was refused against 1.8 GB had 13 GB a second later, and
+    // three of 38 clips were lost to that window alone.
+    //
+    // So a shortfall is a QUESTION about timing, not an answer. Re-sample
+    // for a bounded spell, and take the geometry the box can hold when it
+    // settles -- tiles included, since a smaller tiling may fit before the
+    // whole plane does. Bounded because a box that is genuinely too small
+    // must still say so rather than hang the pipeline.
+    constexpr int    kWaitSteps = 12;         // x 250 ms = 3 s
+    constexpr double kWaitMs    = 250.0;
+    int waited = 0;
+    for (int i = 0; i < kWaitSteps && have != 0 && need > have; ++i) {
+      bool fits = false;
+      const TailTiles t =
+          choose_tail_tiles_(h8, w8, have, frame_split_on, &fits);
+      if (fits && (t.ty > 1 || t.tx > 1)) {
+        tiles = t;
+        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
+        if (need <= have) { break; }
+      }
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds((int)kWaitMs));
+      ++waited;
+      cur = mc->memory_budget();
+      live = metal_compute::shared_buffer_memory_stats().live_bytes;
+      reusable = cur.self_graphics > live ? cur.self_graphics - live : 0;
+      have = (cur.available_physical != 0)
+                 ? cur.available_physical + reusable
+                 : 0;
+      // The whole plane may be affordable again now, and it is both faster
+      // and simpler than any tiling.
+      if (decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0) <= have) {
+        tiles = TailTiles{};
+        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0);
+      }
+    }
+    if (waited > 0 && need <= have && mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "MetalWanVae: waited {} ms for the forward's pages before a {}x{} "
+          "decode -- {} MB free now against {} MB needed",
+          (int)(waited * kWaitMs), Wout, Hout, have >> 20, need >> 20));
+    }
+    if (have != 0 && need > have) {
+      // Nothing fits even tiled: name the finest grid tried, so a box that
+      // is too small for this geometry reads differently from a moment
+      // that was.
+      const TailTiles finest =
+          choose_tail_tiles_(h8, w8, have, frame_split_on);
+      if (finest.ty > 1 || finest.tx > 1) {
+        tiles = finest;
+        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, finest.frac);
+      }
       // Who holds the rest, since "not enough" alone cannot say whether
-      // the box is full or this process is.
+      // the box is full or this process is. The tile count says whether
+      // this is a box too small for the geometry at all, or one that was
+      // asked at a bad moment: tiles are already the smallest this decode
+      // can be made.
+      const std::string how =
+          (tiles.ty > 1 || tiles.tx > 1)
+              ? fmt(" even with the tail tiled {}x{}", tiles.ty, tiles.tx)()
+              : std::string();
       return fail(fmt(
-          "insufficient free RAM for a {}x{} video decode: need ~{} MB, "
+          "insufficient free RAM for a {}x{} video decode{}: need ~{} MB, "
           "~{} MB reclaimable and ~{} MB held for freed GPU buffers; this "
           "process holds ~{} MB, ~{} MB of it in live GPU buffers", Wout,
-          Hout, need >> 20, mb.available_physical >> 20, reusable >> 20,
+          Hout, how, need >> 20, mb.available_physical >> 20, reusable >> 20,
           mb.self_footprint >> 20, live >> 20)());
     }
+  }
+
+  if ((tiles.ty > 1 || tiles.tx > 1) && mc->session() != nullptr) {
+    mc->session()->log_normal(fmt(
+        "MetalWanVae: {}x{} decode runs the tail in {}x{} tiles (halo {} px, "
+        "~{} MB against ~{} MB whole) -- exact, the mid attention stays "
+        "whole-plane",
+        Wout, Hout, tiles.ty, tiles.tx, tiles.halo,
+        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac) >> 20,
+        decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0) >> 20));
   }
 
   // The im2col band. At 27 taps the full [H*W, 27*cin] of a top-level conv
@@ -1633,7 +1865,11 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
   const std::size_t full_band = (std::size_t)Hout * Wout * widest;
   std::size_t col_cap = full_band;
   if (headroom > 0) {
-    const std::size_t reserve = decode_peak_bytes(h8, w8);
+    // What the decode itself will hold -- the TILED figure when the
+    // preflight chose tiles, or the band is sized against a reserve this
+    // decode is not going to take and starves for room that is free.
+    const std::size_t reserve =
+        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
     const std::size_t avail = headroom > reserve ? (headroom - reserve) / 2 : 0;
     col_cap = std::min(full_band, std::max(floor_band, avail));
   }
@@ -1796,10 +2032,110 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
         return &out;
       };
 
+      // ---- the tail over spatial TILES ---------------------------------
+      //
+      // Only what runs below this point tiles, and that is the point: the
+      // mid-block attention above it is the one layer whose receptive
+      // field is the whole plane. Everything here is 3x3 convs, a nearest
+      // upsample and a per-pixel RMS over channels, so a tile that carries
+      // `halo` pixels of real neighbourhood on each interior side produces
+      // an interior identical to the untiled decode's -- the zero padding
+      // a tile edge would otherwise invent never reaches it.
+      //
+      // Each tile keeps its OWN carries: a carry holds the last two input
+      // frames at that conv's plane, so tiles sharing one would overwrite
+      // each other's temporal history (and `save_carry_` would reallocate
+      // on every size change, silently dropping it).
+      const int up_mult = [&] {
+        int m = 1;
+        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
+          if (_up_blocks[i].up.present) { m *= 2; }
+        }
+        return m;
+      }();
+      const std::size_t ci_tail0 = ci;
+      std::size_t tail_stride = 0;
+      auto tail_tiled_one = [&](const SharedBuffer& in, int hin, int win,
+                                int& oh, int& ow) -> SharedBuffer* {
+        const int C = _up_blocks[split_at].up_dim;
+        oh = hin * up_mult;
+        ow = win * up_mult;
+        SharedBuffer& out = cx.alloc(mc, (std::size_t)oh * ow * 3);
+        if (!cx.alloc_ok) { return nullptr; }
+        const int bh = tiles.bh > 0 ? tiles.bh
+                                    : (hin + tiles.ty - 1) / tiles.ty;
+        const int bw = tiles.bw > 0 ? tiles.bw
+                                    : (win + tiles.tx - 1) / tiles.tx;
+        int idx = 0;
+        for (int gy = 0; gy < tiles.ty; ++gy) {
+          for (int gx = 0; gx < tiles.tx; ++gx, ++idx) {
+            const int y0 = gy * bh, y1 = std::min(hin, y0 + bh);
+            const int x0 = gx * bw, x1 = std::min(win, x0 + bw);
+            if (y0 >= y1 || x0 >= x1) { continue; }
+            const int ey0 = std::max(0, y0 - tiles.halo);
+            const int ey1 = std::min(hin, y1 + tiles.halo);
+            const int ex0 = std::max(0, x0 - tiles.halo);
+            const int ex1 = std::min(win, x1 + tiles.halo);
+            const int th0 = ey1 - ey0, tw0 = ex1 - ex0;
+            SharedBuffer& tile =
+                cx.alloc(mc, (std::size_t)th0 * tw0 * (std::size_t)C);
+            if (!cx.alloc_ok) { return nullptr; }
+            enc.set_function(_fn_copy_rect);
+            enc.set_buffer(0, in);
+            enc.set_buffer(1, tile);
+            enc.set_constant(2, (int)(((std::size_t)ey0 * win + ex0) * C));
+            enc.set_constant(3, 0);
+            enc.set_constant(4, th0);
+            enc.set_constant(5, tw0 * C);
+            enc.set_constant(6, win * C);
+            enc.set_constant(7, tw0 * C);
+            enc.dispatch({(unsigned)((std::size_t)th0 * tw0 * C), 1, 1},
+                         {256, 1, 1});
+
+            // This tile's carry block. The stride is the tail's own carry
+            // count, learned from the first tile and identical for every
+            // one after it -- the topology does not vary with the plane.
+            ci = ci_tail0 + (std::size_t)idx * tail_stride;
+            int th = th0, tw = tw0;
+            SharedBuffer* o = tail(tile, 1, th, tw);
+            if (o == nullptr) { return nullptr; }
+            if (tail_stride == 0) { tail_stride = ci - ci_tail0; }
+
+            const int iy = (y0 - ey0) * up_mult, ix = (x0 - ex0) * up_mult;
+            const int rows = (y1 - y0) * up_mult;
+            const int cols = (x1 - x0) * up_mult;
+            enc.set_function(_fn_copy_rect);
+            enc.set_buffer(0, *o);
+            enc.set_buffer(1, out);
+            enc.set_constant(2, (int)(((std::size_t)iy * tw + ix) * 3));
+            enc.set_constant(
+                3, (int)(((std::size_t)y0 * up_mult * ow + x0 * up_mult) * 3));
+            enc.set_constant(4, rows);
+            enc.set_constant(5, cols * 3);
+            enc.set_constant(6, tw * 3);
+            enc.set_constant(7, ow * 3);
+            enc.dispatch({(unsigned)((std::size_t)rows * cols * 3), 1, 1},
+                         {256, 1, 1});
+            cx.release(*o);
+            cx.release(tile);
+          }
+        }
+        return &out;
+      };
+      const bool tiled = tiles.ty > 1 || tiles.tx > 1;
+
       const bool split =
           t > 1 && std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr;
       if (!split) {
-        rgb = tail(*x, t, H, W);
+        if (tiled) {
+          // One frame in this chunk (the clip's first), so the same
+          // per-frame tiling serves; `t` > 1 always takes the split path.
+          int oh = 0, ow = 0;
+          rgb = tail_tiled_one(*x, H, W, oh, ow);
+          H = oh; W = ow;
+        } else {
+          rgb = tail(*x, t, H, W);
+        }
         cx.release(*x);
       } else {
         // The chunk's frames at the split, and where each one's RGB lands.
@@ -1824,7 +2160,14 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
           enc.set_constant(3, (int)fel);
           enc.dispatch({(unsigned)fel, 1, 1}, {256, 1, 1});
           H = H0; W = W0;
-          SharedBuffer* o = tail(one, 1, H, W);
+          SharedBuffer* o = nullptr;
+          if (tiled) {
+            int oh = 0, ow = 0;
+            o = tail_tiled_one(one, H, W, oh, ow);
+            H = oh; W = ow;
+          } else {
+            o = tail(one, 1, H, W);
+          }
           ok = o != nullptr;
           if (!ok) { break; }
           enc.set_function(_fn_copy);

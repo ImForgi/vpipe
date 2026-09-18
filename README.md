@@ -19,7 +19,7 @@
 **[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
 · **[Run the first example](#first-example)**
 · **[Try image editing](docs/KLEIN.md)** ([简体中文](docs/KLEIN-zh-cn.md))
-· **[Try MiniMax H3 video](docs/MINIMAX-H3.md)**
+· **[Try MiniMax H3 video](docs/MINIMAX-H3.md)** ([简体中文](docs/MINIMAX-H3-zh-cn.md))
 · **[Try Krea-2 images](docs/KREA-2.md)**
 
 For the easiest install, choose the largest `.dmg` in the latest release.
@@ -39,6 +39,7 @@ preview panels, profiler, and reproducible model configuration.*
   generating video **and its soundtrack together**, on as little as 16 GB.
   Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
+  ([简体中文](docs/MINIMAX-H3-zh-cn.md))
 
   * 5s @ 0.5 MP 24p, 6 steps takes **~11 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]

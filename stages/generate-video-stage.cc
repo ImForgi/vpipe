@@ -627,6 +627,21 @@ GenerateVideoStage::h3_anchor_count(bool is_ref2va, bool have_keyframe,
   return ref_frames >= 2 ? 2 : 1;
 }
 
+// See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count: it is a property of the port contract.
+int
+GenerateVideoStage::h3_reference_rows(const TensorBeatPayload* t,
+                                      int want_elems, const float** data)
+{
+  *data = nullptr;
+  if (t == nullptr || t->shape.size() != 2 || t->shape[0] <= 0) {
+    return 0;
+  }
+  if ((int)t->shape[1] != want_elems) { return -1; }
+  *data = t->as_f32();
+  return (int)t->shape[0];
+}
+
 int
 GenerateVideoStage::latent_frames() const noexcept
 {
@@ -2561,22 +2576,16 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
     }
   }
 
-  auto rows_of = [](const TensorBeatPayload* t, int want_elems,
-                    const float** data) -> int {
-    *data = nullptr;
-    if (t == nullptr || t->shape.size() != 2) { return 0; }
-    if ((int)t->shape[1] != want_elems) { return -1; }
-    if (t->shape[0] > 0) { *data = t->as_f32(); }
-    return (int)t->shape[0];
-  };
   const int PE = _h3_cfg.video_patch_elems();
   const int AC = _h3_cfg.audio_channels;
-  const int vr = rows_of(video_rows, PE, &out->video_rows);
-  const int ar = rows_of(audio_rows, AC, &out->audio_rows);
+  const int vr = h3_reference_rows(video_rows, PE, &out->video_rows);
+  const int ar = h3_reference_rows(audio_rows, AC, &out->audio_rows);
   if (vr < 0 || ar < 0) {
+    const TensorBeatPayload* bad = vr < 0 ? video_rows : audio_rows;
     session()->warn(fmt(
-        "GenerateVideoStage('{}'): the reference rows are not [n, {}] / "
-        "[n, {}]; skipping", this->id(), PE, AC));
+        "GenerateVideoStage('{}'): the reference {} rows are [{}, {}], not "
+        "[n, {}]; skipping", this->id(), vr < 0 ? "video" : "audio",
+        bad->shape[0], bad->shape[1], vr < 0 ? PE : AC));
     return false;
   }
   out->n_video_rows = vr;

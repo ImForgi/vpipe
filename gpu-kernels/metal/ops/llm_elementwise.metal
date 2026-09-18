@@ -2271,6 +2271,34 @@ kernel void copy_f16(
   out[off + (int)gid] = src[gid];
 }
 
+// Rect copy between two row-major planes with independent row strides:
+// out[dst_off + r*dst_stride + c] = src[src_off + r*src_stride + c].
+//
+// The Wan VAE's spatially TILED decode moves a tile (plus its halo) out of
+// a frame and its restored interior back in, and both are sub-rectangles
+// of a larger plane -- a 1-D copy cannot express either without one
+// dispatch per row. `row_elems` counts ELEMENTS, so a channel-last plane
+// passes width*channels and the kernel never needs to know which is which.
+// 0:src 1:out 2:src_off 3:dst_off 4:rows 5:row_elems 6:src_stride
+// 7:dst_stride
+kernel void copy_rect_f16(
+    const device VPIPE_ELT* src        [[buffer(0)]],
+    device VPIPE_ELT*       out        [[buffer(1)]],
+    constant int&           src_off    [[buffer(2)]],
+    constant int&           dst_off    [[buffer(3)]],
+    constant int&           rows       [[buffer(4)]],
+    constant int&           row_elems  [[buffer(5)]],
+    constant int&           src_stride [[buffer(6)]],
+    constant int&           dst_stride [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const uint n = (uint)rows * (uint)row_elems;
+  if (gid >= n) { return; }
+  const int r = (int)(gid / (uint)row_elems);
+  const int c = (int)(gid % (uint)row_elems);
+  out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
+}
+
 // Diagnostic-only no-op carrying a REALISTIC dispatch arg load (8 read buffers
 // + 4 constants + 1 write), so VPIPE_GEMMA_DUMMY_DISP measures true per-launch
 // cost (arg-binding + command-processor setup + dependent-chain bubble) rather
