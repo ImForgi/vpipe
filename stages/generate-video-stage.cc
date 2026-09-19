@@ -364,6 +364,28 @@ const PortSpec kIports[] = {
           "context",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
+  {.name = "h3_context",
+   .doc = "OPTIONAL MiniMax-H3 continuation context from a "
+          "minimax-h3-context-import: f32 [z, n, H/16, W/16], the last n "
+          "latent frames (5n+2) of a previous clip, with {context_frames, "
+          "start_frame, duration_mode} on the sideband. Pinned as CLEAN "
+          "rows on this clip's own timeline -- over its first "
+          "context_frames when start_frame is 0 -- so the model continues "
+          "the motion rather than imitating it. FL2VA and Ref2VA alike, "
+          "with or without a LoRA. A head context takes the first-frame "
+          "anchor's slot (a last-frame anchor still applies). Ignored by "
+          "other families",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "minimax-h3-context-video", .clock_group = 0},
+  {.name = "h3_context_audio",
+   .doc = "OPTIONAL audio half of the same context: f32 [2, 32, a], the "
+          "last a audio latents of the previous clip, with {audio_offset} "
+          "on the sideband so they END where the carried picture ends. "
+          "Pinned clean on this clip's timeline, which is what makes the "
+          "model continue the sound (same phrase, same beat) rather than "
+          "produce a sound-alike. 0 latents = no audio context",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "minimax-h3-context-audio", .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
@@ -374,6 +396,8 @@ const PortSpec kIports[] = {
 [[maybe_unused]] constexpr unsigned kRefAudioRowsPort = 8;
 [[maybe_unused]] constexpr unsigned kModelCfgPort     = 9;
 [[maybe_unused]] constexpr unsigned kAudioCondPort    = 10;
+[[maybe_unused]] constexpr unsigned kCtxPort          = 11;
+[[maybe_unused]] constexpr unsigned kCtxAudioPort     = 12;
 
 // The keys that MOVED to the per-family config stages. Named here so a
 // pipeline written against the old union says what to do instead of
@@ -2596,8 +2620,96 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
 // The minimax-h3 denoise: one packed sequence carrying both modalities,
 // so this produces two latents where the Wan path produces one.
 bool
+GenerateVideoStage::parse_h3_context_(const TensorBeatPayload* video,
+                                      const TensorBeatPayload* audio,
+                                      H3Context* out) const
+{
+  *out = H3Context{};
+  const bool has_video = video != nullptr && video->shape.size() == 4 &&
+                         video->shape[1] > 0;
+  const bool has_audio = audio != nullptr && audio->shape.size() == 3 &&
+                         audio->shape[2] > 0;
+  if (!has_video && !has_audio) { return true; }
+
+  const int lh = _height / 16, lw = _width / 16;
+  if (has_video) {
+    if (video->dtype != TensorBeat::DType::F32 ||
+        (int)video->shape[0] != _h3_cfg.video_channels ||
+        (int)video->shape[2] != lh || (int)video->shape[3] != lw) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the continuation context is {} but this "
+          "clip needs f32 [{}, n, {}, {}] -- the previous clip must have the "
+          "same width and height ({}x{}); skipping", this->id(),
+          video->describe(), _h3_cfg.video_channels, lh, lw, _width,
+          _height));
+      return false;
+    }
+    const int n = (int)video->shape[1];
+    if (h3ctx::frames_for_latents(n) <= 0) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): a {}-latent context does not start on a "
+          "VAE cycle boundary (it must be 5k + 2 latents: 17k + 5 frames); "
+          "skipping", this->id(), n));
+      return false;
+    }
+    out->video = video->as_f32();
+    out->video_latents = n;
+    out->context_frames = h3ctx::frames_for_latents(n);
+  }
+  if (has_audio) {
+    if (audio->dtype != TensorBeat::DType::F32 ||
+        (int)audio->shape[0] != genai::minimax_h3::kAudioChannels ||
+        (int)audio->shape[1] != _h3_cfg.audio_channels) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the continuation audio context is {} but "
+          "MiniMax-H3 needs f32 [{}, {}, a]; skipping", this->id(),
+          audio->describe(), genai::minimax_h3::kAudioChannels,
+          _h3_cfg.audio_channels));
+      return false;
+    }
+    out->audio = audio->as_f32();
+    out->audio_latents = (int)audio->shape[2];
+  }
+
+  // The plan rides on the sidebands: where the video block starts, how
+  // long to generate around it, and where the carried audio begins.
+  if (has_video && video->sideband.is_object()) {
+    FlexData sb = video->sideband;        // as_object() is a view: keep it
+    const auto o = sb.as_object();
+    if (o.contains("start_frame")) {
+      out->start_frame =
+          (int)std::max<std::int64_t>(0, o.at("start_frame").as_int(0));
+    }
+    if (o.contains("duration_mode")) {
+      const std::string m(o.at("duration_mode").as_string(""));
+      if (!h3ctx::parse_duration_mode(m, &out->duration)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): unknown context duration_mode '{}'; "
+            "using 'clip'", this->id(), m));
+        out->duration = h3ctx::DurationMode::kClip;
+      }
+    }
+  }
+  // Default audio placement when the importer did not say: END-aligned
+  // with the video block, ignoring the sub-latent overhang.
+  out->audio_offset =
+      h3ctx::kFrameRescale * (double)(out->start_frame + out->context_frames) -
+      (double)out->audio_latents;
+  if (has_audio && audio->sideband.is_object()) {
+    FlexData sb = audio->sideband;
+    const auto o = sb.as_object();
+    if (o.contains("audio_offset")) {
+      const double v = o.at("audio_offset").as_real(out->audio_offset);
+      if (std::isfinite(v)) { out->audio_offset = v; }
+    }
+  }
+  return true;
+}
+
+bool
 GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
-                            int ref_frames, const H3References* r2v,
+                            int ref_frames, bool anchor_last_only,
+                            const H3References* r2v, const H3Context* context,
                             std::vector<float>* video_out,
                             std::vector<int>* video_shape,
                             std::vector<float>* audio_out,
@@ -2618,14 +2730,50 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // changed them would want them read from video_vae/config.json rather
   // than assumed here.
   constexpr int kFramesPerChunk = 17, kLatentsPerChunk = 5;
+  // A continuation context may ask for a LONGER clip, so that the footage
+  // kept after trimming its regenerated overlap is what was configured
+  // (duration_mode new_footage / new_footage_min). `clip` keeps `_frames`.
+  int gen_frames = _frames;
+  _h3_last_overlap = 0;
+  if (context != nullptr) {
+    h3ctx::DurationPlan dp;
+    std::string derr;
+    if (!h3ctx::resolve_duration(_frames, context->context_frames,
+                                 context->start_frame, context->duration,
+                                 &dp, &derr)) {
+      session()->warn(fmt("GenerateVideoStage('{}'): continuation context: "
+                          "{}; skipping", this->id(), derr));
+      return false;
+    }
+    if (dp.capped) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): duration_mode '{}' wants more than the "
+          "{} frames MiniMax-H3 was trained on; generating {} frames ({} "
+          "new after the {}-frame overlap)", this->id(),
+          h3ctx::duration_mode_name(context->duration),
+          h3ctx::kMaxTrainedFrames, dp.generated_frames, dp.new_frames,
+          dp.overlap_frames));
+    }
+    gen_frames = dp.generated_frames;
+    _h3_last_overlap = dp.overlap_frames;
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): continuation context of {} frames at frame "
+        "{} (+{} audio latents, offset {:.3f}); duration_mode '{}': "
+        "generating {} frames, {} new after the overlap", this->id(),
+        context->context_frames, context->start_frame,
+        context->audio_latents, context->audio_offset,
+        h3ctx::duration_mode_name(context->duration), dp.generated_frames,
+        dp.new_frames));
+  }
   const int aligned =
-      h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
+      h3::align_num_frames(gen_frames, kFramesPerChunk, kLatentsPerChunk);
+  _h3_last_frames = aligned;
   const int lt =
       h3::video_latent_num_frames(aligned, kFramesPerChunk, kLatentsPerChunk);
   if (lh <= 0 || lw <= 0 || lt <= 0) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): {}x{}x{} does not give a usable "
-        "MiniMax-H3 latent grid", this->id(), _width, _height, _frames));
+        "MiniMax-H3 latent grid", this->id(), _width, _height, gen_frames));
     return false;
   }
   // Audio latents are counted from the VIDEO frames and fps, so the two
@@ -2665,8 +2813,13 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   const int n_anchor = h3_anchor_count(r2v != nullptr, ref != nullptr,
                                        ref_frames, &kf_ignored);
   std::vector<h3::Anchor> anchors;
-  if (n_anchor >= 1) { anchors.push_back(h3::Anchor::kFirst); }
-  if (n_anchor >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  if (anchor_last_only) {
+    // A head context took the first frame; `ref` holds the last alone.
+    if (n_anchor >= 1) { anchors.push_back(h3::Anchor::kLast); }
+  } else {
+    if (n_anchor >= 1) { anchors.push_back(h3::Anchor::kFirst); }
+    if (n_anchor >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  }
   if (kf_ignored && !_kf_on_ref2va_said) {
     _kf_on_ref2va_said = true;
     session()->warn(fmt(
@@ -2686,19 +2839,30 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // the model was trained with; every one of them is a real row that the
   // 33B forward pays for, and the result still decodes, just as a
   // soundtrack whose two "channels" are slices of one 32-way split.
+  // The continuation context, in the layout's own terms. Empty when there
+  // is none, and the builders then make exactly the layout they always did.
+  h3::ContextGuide guide;
+  if (context != nullptr) {
+    guide.num_latent_frames = context->video_latents;
+    guide.start_frame       = context->start_frame;
+    guide.num_audio_latents = context->audio_latents;
+    guide.audio_offset      = context->audio_offset;
+  }
   const bool packed =
       r2v != nullptr
           ? h3::build_ref2va_packed_sequence(tags, r2v->refs, lt, lh, lw,
                                              alat, c.patch_h, c.patch_w,
-                                             h3::kAudioChannels, &L)
+                                             h3::kAudioChannels, guide, &L)
           : h3::build_packed_sequence(tags, lt, lh, lw, alat, c.patch_h,
                                       c.patch_w, h3::kAudioChannels, anchors,
-                                      &L);
+                                      guide, &L);
   if (!packed) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): could not pack a {}x{}x{} latent with {} "
-        "audio latents{}", this->id(), lt, lh, lw, alat,
-        r2v != nullptr ? " and the request's references" : ""));
+        "audio latents{}{}", this->id(), lt, lh, lw, alat,
+        r2v != nullptr ? " and the request's references" : "",
+        context != nullptr ? " and the continuation context (does it fit "
+                             "inside the clip?)" : ""));
     return false;
   }
   // The sequence length is known now and nothing large has been allocated
@@ -2767,15 +2931,19 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // were encoded at is the encoder's, so a graph whose two `frames`
   // disagree lands here with a real mismatch. Left alone it would
   // surface as a shape error 50 layers down.
+  const int ctx_video_rows = guide.num_latent_frames * (lh / c.patch_h) *
+                             (lw / c.patch_w);
+  const int ctx_audio_rows = guide.num_audio_latents * h3::kAudioChannels;
   if (r2v != nullptr) {
-    if (r2v->n_video_rows != L.num_condition_video_rows ||
-        r2v->n_audio_rows != L.num_condition_audio_rows) {
+    if (r2v->n_video_rows != L.num_condition_video_rows - ctx_video_rows ||
+        r2v->n_audio_rows != L.num_condition_audio_rows - ctx_audio_rows) {
       session()->warn(fmt(
           "GenerateVideoStage('{}'): the layout reserves {} reference video "
           "and {} reference audio rows but the encoder packed {} and {}. The "
           "video-ref-encoder's `frames` and this stage's do not agree; "
-          "skipping", this->id(), L.num_condition_video_rows,
-          L.num_condition_audio_rows, r2v->n_video_rows, r2v->n_audio_rows));
+          "skipping", this->id(), L.num_condition_video_rows - ctx_video_rows,
+          L.num_condition_audio_rows - ctx_audio_rows, r2v->n_video_rows,
+          r2v->n_audio_rows));
       return false;
     }
     if (r2v->video_rows != nullptr && r2v->n_video_rows > 0) {
@@ -2832,6 +3000,54 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
                       (std::size_t)(by + y) * lw + (bx + x)];
             }
           }
+        }
+      }
+    }
+  }
+
+  // Patchify the continuation context into the conditioning rows that
+  // follow the anchors (FL2VA) or the references (Ref2VA), one latent
+  // frame per rows_per_frame in the generated frames' own cell order --
+  // the layout put them on the same coordinates as the first generated
+  // latents, so the cells have to line up too. Its audio goes channel-
+  // major after any reference audio, the inverse of the output transpose
+  // below.
+  if (context != nullptr && guide.num_latent_frames > 0) {
+    const int gh0 = lh / c.patch_h, gw0 = lw / c.patch_w;
+    const int rows_per_frame = gh0 * gw0;
+    const std::size_t plane = (std::size_t)lh * lw;
+    const int ZCc = c.video_channels;
+    const int n = guide.num_latent_frames;
+    const int base = L.num_condition_video_rows - ctx_video_rows;
+    const float* src = context->video;
+    for (int f = 0; f < n; ++f) {
+      for (int cell = 0; cell < rows_per_frame; ++cell) {
+        float* row = vid.data() +
+                     ((std::size_t)base + (std::size_t)f * rows_per_frame +
+                      cell) * PE;
+        const int by = (cell / gw0) * c.patch_h;
+        const int bx = (cell % gw0) * c.patch_w;
+        for (int ch = 0; ch < ZCc; ++ch) {
+          for (int y = 0; y < c.patch_h; ++y) {
+            for (int x = 0; x < c.patch_w; ++x) {
+              row[((std::size_t)ch * c.patch_h + y) * c.patch_w + x] =
+                  src[((std::size_t)ch * n + f) * plane +
+                      (std::size_t)(by + y) * lw + (bx + x)];
+            }
+          }
+        }
+      }
+    }
+  }
+  if (context != nullptr && guide.num_audio_latents > 0) {
+    const int a = guide.num_audio_latents;
+    const int base = L.num_condition_audio_rows - ctx_audio_rows;
+    const float* src = context->audio;
+    for (int ch = 0; ch < h3::kAudioChannels; ++ch) {
+      for (int i = 0; i < a; ++i) {
+        float* row = aud.data() + ((std::size_t)base + ch * a + i) * AC;
+        for (int k = 0; k < AC; ++k) {
+          row[k] = src[((std::size_t)ch * AC + k) * a + i];
         }
       }
     }
@@ -3112,6 +3328,25 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   }
   const auto* act =
       acb ? dynamic_cast<const TensorBeatPayload*>(acb.get()) : nullptr;
+  // The continuation context. Read unconditionally when wired, like the
+  // reference rows: an importer emits BOTH beats per context (0 audio
+  // latents when there is no soundtrack), so a poll would be a race.
+  std::unique_ptr<BeatPayloadIntf> cxb, cab;
+  if (ctx.num_iports() > kCtxPort && ctx.iport_connected(kCtxPort)) {
+    cxb = co_await ctx.read(kCtxPort);
+  }
+  if (ctx.num_iports() > kCtxAudioPort && ctx.iport_connected(kCtxAudioPort)) {
+    cab = co_await ctx.read(kCtxAudioPort);
+  }
+  // Wired but closed without a beat: the importer failed (and said why)
+  // or has no context left for this clip. Generating anyway would spend a
+  // whole clip on something that does not join the previous one.
+  const bool ctx_port_dry = ctx.num_iports() > kCtxPort &&
+                            ctx.iport_connected(kCtxPort) && !cxb;
+  const auto* cxt =
+      cxb ? dynamic_cast<const TensorBeatPayload*>(cxb.get()) : nullptr;
+  const auto* cat =
+      cab ? dynamic_cast<const TensorBeatPayload*>(cab.get()) : nullptr;
   const auto* rvt =
       rvb ? dynamic_cast<const TensorBeatPayload*>(rvb.get()) : nullptr;
   const auto* rat =
@@ -3121,6 +3356,14 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     session()->warn(fmt(
         "GenerateVideoStage('{}'): no DiT; skipping", this->id()));
     co_return;
+  }
+  if ((cxt != nullptr || cat != nullptr) && _family != "minimax-h3" &&
+      !_ctx_ignored_said) {
+    _ctx_ignored_said = true;
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): an H3 continuation context is wired on "
+        "iport {} but the resident family is '{}'; only MiniMax-H3 reads "
+        "it, so it is ignored", this->id(), kCtxPort, _family));
   }
 
   // ---- a plugin family: it owns the whole generation ------------------
@@ -3282,6 +3525,25 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           "skipping", this->id(), _root));
       co_return;
     }
+    // ---- continuation context, off iports 11/12 -------------------
+    if (ctx_port_dry) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): iport {} (h3_context) is wired but its "
+          "source ended without a context for this clip; skipping rather "
+          "than generating a clip that does not continue the previous one",
+          this->id(), kCtxPort));
+      co_return;
+    }
+    H3Context h3c;
+    if (!parse_h3_context_(cxt, cat, &h3c)) {
+      co_return;   // already warned
+    }
+    const bool have_ctx = h3c.video_latents > 0 || h3c.audio_latents > 0;
+    // A HEAD context sits on frame 0, which is the first-frame anchor's
+    // own coordinate: the two cannot both pin it. The context is the
+    // more specific request -- it carries motion, the anchor one still --
+    // so it wins, and a last-frame anchor still applies on its own.
+    const bool head_ctx = h3c.video_latents > 0 && h3c.start_frame == 0;
     // The keyframe anchor arrives on the SAME port Wan's i2v latent
     // does, from a vae-encode over the keyframe image -- so a graph
     // changes checkpoints without being rewired.
@@ -3310,7 +3572,29 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // are concatenated here, on the frame axis, into the [z, k, lh, lw]
     // block run_h3_ patchifies (anchor k -> conditioning frame k).
     std::vector<float> stacked;
-    if (ref1 != nullptr) {
+    bool anchor_last_only = false;
+    if (head_ctx && !have_r2v && (refp != nullptr || ref1 != nullptr)) {
+      if (refp != nullptr && !_ctx_anchor_said) {
+        _ctx_anchor_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): a continuation context sits on the "
+            "first frames, which is the first-frame anchor's slot, so the "
+            "anchor on iport{} is ignored{}", this->id(), kRefPort,
+            ref1 != nullptr && anchor_ok(ref1)
+                ? "; the last-frame anchor still applies" : ""));
+      }
+      // Continue from the previous clip AND land on a keyframe: the one
+      // pairing where a LAST frame without a first is meaningful, so it
+      // is accepted here rather than refused as below.
+      if (ref1 != nullptr && anchor_ok(ref1)) {
+        refp = ref1->as_f32();
+        ref_frames = 1;
+        anchor_last_only = true;
+      } else {
+        refp = nullptr;
+        ref_frames = 0;
+      }
+    } else if (ref1 != nullptr) {
       if (refp == nullptr) {
         // Dropping it silently would run a plain t2v while the graph
         // says otherwise. L2V is not a partition this model was
@@ -3353,7 +3637,8 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
     const bool ok_h3 =
         run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
-                have_r2v ? &r2v : nullptr,
+                anchor_last_only, have_r2v ? &r2v : nullptr,
+                have_ctx ? &h3c : nullptr,
                 &vlat, &vshape, &alat_out, &ashape);
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
     // What the adaptive residency actually reached. This is the number
@@ -3418,8 +3703,19 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     {
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      // What was GENERATED, which a context in a new_footage mode makes
+      // longer than the configured count -- and the head overlap a
+      // minimax-h3-context-trim downstream drops.
       sb.as_object().insert_or_assign(
-          "frames", FlexData::make_int((std::int64_t)_frames));
+          "frames", FlexData::make_int((std::int64_t)(
+                        _h3_last_frames > 0 ? _h3_last_frames : _frames)));
+      if (have_ctx) {
+        sb.as_object().insert_or_assign(
+            "context_frames",
+            FlexData::make_int((std::int64_t)h3c.context_frames));
+        sb.as_object().insert_or_assign(
+            "trim_frames", FlexData::make_int((std::int64_t)_h3_last_overlap));
+      }
       vout->sideband = std::move(sb);
     }
     ++_emitted;

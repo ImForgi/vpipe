@@ -32,6 +32,7 @@
 #include "pipeline/stage-registry.h"
 #include "pipeline/stage-spec.h"
 #include "pipeline/typed-stage.h"
+#include "stages/minimax-h3-context.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -159,6 +160,29 @@ wav_path_()
   return p;
 }
 
+// A minimal MiniMax-H3 continuation-context file for
+// minimax-h3-context-import:
+// 7 latent frames (22 pixel frames, the default context) of a 2x2 latent
+// plus a matching soundtrack. Written with the stage's own writer, so the
+// sweep keeps no fixture on disk.
+string
+h3ctx_path_()
+{
+  const string p = tmpdir_() + "/vpipe-sweep.h3ctx.safetensors";
+  h3ctx::ContextFile f;
+  f.video_shape = {24, 7, 2, 2};
+  f.video.assign(24 * 7 * 2 * 2, 0.25f);
+  f.audio_shape = {2, 32, 37};
+  f.audio.assign(2 * 32 * 37, -0.25f);
+  f.metadata["format"] = h3ctx::kFormat;
+  f.metadata["frames"] = "22";
+  string err;
+  if (!h3ctx::write_context_file(p, f, &err)) {
+    std::printf("[relaunch_sweep] h3 context fixture: %s\n", err.c_str());
+  }
+  return p;
+}
+
 }  // namespace
 
 // Launch `type` twice over ONE stage object and report the beats each
@@ -275,6 +299,9 @@ sweep_table_(size_t* n)
   static const string wav = wav_path_();
   static const string load_audio_cfg =
       "{\"input_url\":\"" + wav + "\"}";
+  static const string h3ctx_file = h3ctx_path_();
+  static const string h3_context_import_cfg =
+      "{\"input_url\":\"" + h3ctx_file + "\"}";
 
   static const SweepEntry kSweep[] = {
     {"chrono", "{\"frequency_hz\":200,\"count\":3}", false, nullptr},
@@ -286,6 +313,10 @@ sweep_table_(size_t* n)
     {"load-image", load_image_cfg.c_str(), false, nullptr},
     {"load-text", load_text_cfg.c_str(), false, nullptr},
     {"load-audio", load_audio_cfg.c_str(), false, nullptr},
+    // One context per launch from its file, gated by a `_file_done`
+    // flag that reset_run_state() clears.
+    {"minimax-h3-context-import", h3_context_import_cfg.c_str(), false,
+     nullptr},
 
     // The per-family model-config sources. One-shot emitters gated by a
     // `_done` flag, which is the exact shape this test exists for --

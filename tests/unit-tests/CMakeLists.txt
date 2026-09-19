@@ -6,6 +6,8 @@ set(LOCAL_TEST_SOURCES
   call-stage.cc
   chrono-shell-stages.cc
   save-text-stage.cc
+  minimax-h3-context.cc
+  minimax-h3-context-stages.cc
   shipped-pipelines.cc
   clock-domain.cc
   console-writer.cc
@@ -188,6 +190,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-lora.cc
         minimax-h3-comfy.cc
         minimax-h3-layout.cc
+        minimax-h3-layout-context.cc
         vdn-geometry.cc
         vdn-delta-solve.cc
         vdn-linear-features.cc

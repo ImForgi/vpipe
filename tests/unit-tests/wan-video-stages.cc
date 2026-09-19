@@ -610,7 +610,9 @@ TEST(generate_video, family_generic_surface)
   EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_audio_rows");
   EXPECT_TRUE(std::string(sp.iports[9].name) == "model_config");
   EXPECT_TRUE(std::string(sp.iports[10].name) == "audio_conditioning");
-  EXPECT_TRUE(sp.iports.size() == 11);
+  EXPECT_TRUE(std::string(sp.iports[11].name) == "h3_context");
+  EXPECT_TRUE(std::string(sp.iports[12].name) == "h3_context_audio");
+  EXPECT_TRUE(sp.iports.size() == 13);
   // The tag is the whole compatibility check between a config source and
   // this port: the composer offers a source only if it matches.
   EXPECT_TRUE(port_tags_compatible("model-config",

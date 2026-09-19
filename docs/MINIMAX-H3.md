@@ -42,6 +42,12 @@ arrives in **8–16 steps** instead of 30+.
     - [Joining the parts](#joining-the-parts)
     - [What the parts cost](#what-the-parts-cost)
     - [Making it your own](#making-it-your-own)
+  - [Continuing a clip from its own latents](#continuing-a-clip-from-its-own-latents)
+    - [The chain](#the-chain)
+    - [The settings](#the-settings)
+    - [The flash at the join](#the-flash-at-the-join)
+    - [What the context costs](#what-the-context-costs)
+    - [The context file](#the-context-file)
   - [The released weights, either partition](#the-released-weights-either-partition)
   - [Fewer steps — the Turbo LoRA](#fewer-steps--the-turbo-lora)
     - [Get it](#get-it)
@@ -158,6 +164,14 @@ you want to see the model work before spending the hours and the 115 GB.
 - **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
   — joins those four parts into one 33-second file through the concat
   demuxer, with no model and no hand-written ffmpeg.
+- **[`minimax-h3-reference-to-video-chain-start.vpipeline`](pipelines/minimax-h3-reference-to-video-chain-start.vpipeline)**
+  / **[`…-chain-next`](pipelines/minimax-h3-reference-to-video-chain-next.vpipeline)**
+  and **[`minimax-h3-first-last-to-video-chain-start.vpipeline`](pipelines/minimax-h3-first-last-to-video-chain-start.vpipeline)**
+  / **[`…-chain-next`](pipelines/minimax-h3-first-last-to-video-chain-next.vpipeline)**
+  — the same job from the **latents** instead: a clip's own sampled latents are
+  saved and pinned over the next clip's opening frames, which are then trimmed,
+  so the join is exact rather than learned (see
+  [Continuing a clip from its own latents](#continuing-a-clip-from-its-own-latents)).
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -1203,6 +1217,143 @@ are attended from everywhere.
   shipped pair wants, and
   [Which Turbo adapters work](#which-turbo-adapters-work) lists the rest
   with theirs. An adapter for the other partition is refused, not applied.
+- **For a join that is exact rather than learned**, the same story can be
+  carried in the latent domain instead — see
+  [Continuing a clip from its own latents](#continuing-a-clip-from-its-own-latents).
+
+### Continuing a clip from its own latents
+
+[Longer clips](#longer-clips--one-story-in-four-parts) above carries a story
+across parts by handing the **decoded tail** of one part to Ref2VA as a clip
+to continue from. That is the model's own trained behaviour, and it is the
+place to start. This section is the other half of the same problem: the same
+clip carried in the **latent domain** and pinned rather than referenced.
+
+| | the reference guide, above | the latents, here |
+|---|---|---|
+| what crosses the join | the tail decoded, written to `.mp4`, read back and re-encoded by the VAE | the sampled latents, byte for byte, no round trip |
+| where the rows go | a reference block on the reference clock | clean conditioning rows on the NEW clip's own timeline |
+| the join | continuation the model learned; part 2 opens *near* part 1's last frame | the previous frames themselves, re-rendered and then trimmed |
+| rows added at 960×544 | 8,670 for a 56-frame guide | 3,570 + 74 audio for a 22-frame context |
+| partitions | Ref2VA | FL2VA and Ref2VA |
+| seams | plan each one on a held shot | a moving seam is fine |
+| cost | none in code; a graph does it | three stages and a layout that knows about them |
+
+They compose: references on iports 7/8 carry identity, a context on 11/12
+carries the motion, and one graph can wire both.
+
+Three stages **continue** a clip instead of cutting to a new one:
+
+| stage | what it does |
+|---|---|
+| `minimax-h3-context-export` | saves a clip's **sampled** video and audio latents to a `.safetensors` file — whole, with no decode/re-encode |
+| `minimax-h3-context-import` | takes the **last `context_frames` frames** of that clip (and the matching audio) and hands them to `generate-video` iports **11** and **12** |
+| `minimax-h3-context-trim` | after decoding, drops the frames the new clip re-rendered over that context, from the picture and the sound together |
+
+`generate-video` pins the imported latents as **clean conditioning rows placed
+on the new clip's own timeline**, over its first frames — not before it, where
+a reference goes. The model then reads them as *the clip so far* and continues
+the motion, the camera move and the soundtrack, rather than making something
+that merely looks and sounds similar. It works on **both partitions**
+(after the keyframe anchors on FL2VA, after the references on Ref2VA), with
+or without a LoRA, and changes nothing when iports 11/12 are unwired. VDN
+does not know these rows (it says so) — leave it off for continued clips.
+
+#### The chain
+
+1. Run [`…-chain-start`](pipelines/minimax-h3-reference-to-video-chain-start.vpipeline):
+   an ordinary Ref2VA clip, plus a `minimax-h3-context-export` fanned out from
+   `generate-video`'s two outputs → `minimax-h3-chain-01.h3ctx.safetensors`.
+2. Run [`…-chain-next`](pipelines/minimax-h3-reference-to-video-chain-next.vpipeline)
+   with the **next prompt**, importing `chain-01` and exporting `chain-02`.
+3. Repeat step 2, bumping both file names. Join the clips the way
+   [Joining the parts](#joining-the-parts) does it — the same
+   `load-video` concat list, without the `outpoint` lines, since the
+   trim has already removed each clip's overlap.
+
+Keep **the same references, resolution and `fps`** on every clip — the context
+is refused if the canvas differs — and repeat the character and place
+descriptions word for word in each prompt: the context carries motion and
+sound, the references carry identity. On FL2VA the same wiring applies
+([`…-chain-start`](pipelines/minimax-h3-first-last-to-video-chain-start.vpipeline)
+/ [`…-chain-next`](pipelines/minimax-h3-first-last-to-video-chain-next.vpipeline));
+a **last-frame** anchor (iport 6) still works beside a context, which is how
+a continued clip can also be made to land on a chosen keyframe. A first-frame
+anchor cannot — the context occupies its slot, and is preferred with a warning.
+With a `new_footage` mode and **video** references, set `video-ref-encoder`'s
+`frames` to the length actually generated (the `generate-video` log line
+says it), since that is the duration a video reference is truncated to;
+image references do not care.
+
+The whole chain can also live in **one graph**: wire a previous
+`generate-video`'s outputs straight into `minimax-h3-context-import`'s iports
+0/1 instead of setting `input_url`, and no file is written.
+
+#### The settings
+
+| `minimax-h3-context-import` key | default | |
+|---|---|---|
+| `context_frames` | `22` | frames carried, on the VAE's grid: 5, 22, 39, 56 … (about 0.9 s at 22). Longer carries more motion and costs more rows |
+| `audio_context_frames` | `0` | audio carried, in frames: `0` = same as the video, `-1` = none, longer reaches further back for sound only |
+| `duration_mode` | `clip` | what `generate-video`'s `frames` means: `clip` = the generated clip (a 124-frame clip keeps 102 new frames); `new_footage` = the footage **kept** after the trim, the clip lengthened to the nearest valid count (120 → 141 generated, 119 kept); `new_footage_min` = the same rounded up (120 → 158, 136 kept). The footage modes cap at the 362 frames the model was trained on, with a warning |
+| `start_frame` | `0` | `0` continues the clip. Anything else pins the context *inside* the new clip as a guide, and nothing is trimmed |
+| `audio_align` | `exact` | the carried audio ends exactly where the carried picture does, including H3's sub-latent rounding of its 40 Hz grid; `round` snaps it to the generated audio's grid |
+
+Wire `minimax-h3-context-import`'s **oport 2** (`info`) to
+`minimax-h3-context-trim`'s iport 2 and the trim follows the import; otherwise
+set `trim_frames` to the same `context_frames`. The trim also **conforms** the
+soundtrack to exactly the kept frames (`conform_audio`), absorbing the ±8 ms
+by which H3's audio grid over- or under-shoots a clip — invisible once,
+audible after twenty joins.
+
+#### The flash at the join
+
+The first frames a clip delivers after its pinned context come out at the
+**context's** exposure rather than the one the clip settles at a few frames
+later — the first free latent step is decoded with the pinned step as its
+temporal neighbour. Measured on a 1280×704 chain: one frame 15 % bright, the
+next 5 %, then back to the clip's own level. On a hard cut that reads as a
+flash. It is a property of the pinned construction, not of the prompt, the
+sampler or a LoRA — the same measurement with a softened pin is worse, and
+without the Turbo adapter the tail is longer.
+
+`minimax-h3-context-trim` corrects it at the cut, where the join is:
+
+| key | default | |
+|---|---|---|
+| `luma_match` | `true` | put those frames back on the level this clip settles at |
+| `luma_match_frames` | `6` | how far in the correction reaches, released linearly across them |
+| `declick_ms` | `12` | fade the PCM in over this many milliseconds, so the soundtrack does not start mid-waveform |
+
+The target is **this clip's own body** — the level of the frames just past the
+head, fitted as a line so a shot whose exposure is genuinely moving keeps its
+trend — and never the previous clip's tail, which the pinning has already
+matched and correcting against a second time shows up as a ramp over the
+following frames. A frame already sitting on that level is multiplied by 1.0
+and delivered untouched, so `luma_match_frames` only bounds how far in the
+correction may reach; it cannot grade the clip. Gains are clamped to −18 %/+22 %,
+and a `luma_match_frames` beyond 10 is not useful: the level it aims at is read
+from frames 2–10.
+(ComfyUI's H3Studio found the same artifact in its own chains and corrects it
+the same way, in its reel export.)
+
+#### What the context costs
+
+The context is extra rows in every step's sequence: at 960×544 a 22-frame
+context adds 7 latent frames of 510 rows plus 74 audio rows — about **+18 %
+sequence on a 124-frame clip** (+19–41 % per step, as attention is quadratic),
+and **+7 %** on a 362-frame one. The 22 re-rendered frames are then trimmed.
+Longer clips amortise it best.
+
+#### The context file
+
+One `.safetensors`: `video` F32 `[24, T, H/16, W/16]` and, when wired, `audio`
+F32 `[2, 32, A]` — the latents exactly as `generate-video` emitted them — plus
+string metadata (`format: minimax-h3-context/1`, `frames`, `fps`, `width`,
+`height`, `audio_latents`, `model`). A 5 s clip at 960×544 is ~7 MB. The whole
+clip is kept, so the context length is chosen at import, and the file can
+still be decoded later — the importer reads the header, plans the tail from
+it, and then reads only that tail, so a long clip costs it nothing.
 
 ### The released weights, either partition
 
@@ -2064,6 +2215,19 @@ alone — lower `frames` or the frame size, or turn the tier off; or the tier
 armed and its controller measured the split as slower and went back to the
 GPU, which on an M5 is the expected outcome. See
 [The Neural Engine](#the-neural-engine--for-m4-family-macs).
+
+**A continued clip is skipped with "iport 11 (h3_context) is wired but its
+source ended".** `minimax-h3-context-import` could not read its file (its own
+warning says why), or a file-sourced import was asked for a second clip — it
+provides one context per launch.
+
+**"the continuation context is [24, 7, …] but this clip needs …".** The
+previous clip was generated at a different `width`/`height`; a context only
+continues a clip of the same size.
+
+**The join jumps.** Check the trim is dropping `context_frames` (the import's
+`info` wired, or `trim_frames` set to match) and that both clips use the same
+`fps`. A longer `context_frames` (39) gives the model more motion to continue.
 
 ## Under the hood
 

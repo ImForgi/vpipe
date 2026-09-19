@@ -19,6 +19,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
+#include "stages/minimax-h3-context.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #endif
@@ -465,6 +466,39 @@ private:
     // prompt's can.
     std::vector<int> text_tags;
   };
+  // A CONTINUATION CONTEXT from a `minimax-h3-context-import`
+  // (iports 11/12):
+  // the tail of a previous clip's sampled latents, pinned as clean rows
+  // on this clip's own timeline so the model continues it. Works on both
+  // partitions -- the rows follow the keyframe anchors (FL2VA) or the
+  // references (Ref2VA) -- and is independent of any LoRA. Borrowed from
+  // the two beats, which outlive the forward.
+  struct H3Context {
+    const float* video         = nullptr;  // f32 [z, video_latents, lh, lw]
+    int          video_latents = 0;
+    const float* audio         = nullptr;  // f32 [2, audio_channels, audio_latents]
+    int          audio_latents = 0;
+    int          context_frames = 0;       // pixel frames the video block covers
+    int          start_frame    = 0;       // where it sits on this clip's timeline
+    double       audio_offset   = 0.0;     // rotary time of audio latent 0, from origin
+    h3ctx::DurationMode duration = h3ctx::DurationMode::kClip;
+  };
+  // Validate the two context beats against this stage's canvas and fill
+  // `out`. Returns true with `out->video_latents == 0` when neither port
+  // carried a context (unwired, or an importer with nothing to give);
+  // false after warning on a context that IS present and does not fit.
+  bool parse_h3_context_(const class TensorBeatPayload* video,
+                         const class TensorBeatPayload* audio,
+                         H3Context* out) const;
+  // What the last H3 generation actually produced, for the output
+  // sideband: the generated frame count (a context in a `new_footage`
+  // mode lengthens the clip) and the head overlap that
+  // minimax-h3-context-trim drops.
+  int _h3_last_frames = 0;
+  int _h3_last_overlap = 0;
+  // Said once per stage, like _kf_on_ref2va_said.
+  bool _ctx_anchor_said  = false;
+  bool _ctx_ignored_said = false;
   // The minimax-h3 branch of process(): builds the packed layout, runs
   // genai::denoise, and unpatchifies both modalities back to latents.
   // Returns false when it warned and produced nothing.
@@ -501,8 +535,12 @@ private:
                             const class TensorBeatPayload* audio_rows,
                             H3References* out) const;
 
+  // `anchor_last_only`: `ref` carries ONE anchor and it is the LAST frame
+  // -- a head context took the first frame's slot. `context` is the
+  // continuation context, or null.
   bool run_h3_(const void* cond, int text_rows, const float* ref,
-               int ref_frames, const H3References* r2v,
+               int ref_frames, bool anchor_last_only,
+               const H3References* r2v, const H3Context* context,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape);
 
