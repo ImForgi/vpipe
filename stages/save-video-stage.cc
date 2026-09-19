@@ -455,6 +455,13 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
   _venc->width     = p.width;
   _venc->height    = p.height;
   _venc->pix_fmt   = static_cast<AVPixelFormat>(p.pix_fmt);
+  // TAG the stream with what the producer says it wrote. Untagged, the
+  // file is read by convention, and a convention that disagrees with
+  // the producer costs 219/255 of the contrast plus a hue tilt -- which
+  // is invisible on one decode and compounds in a graph that re-reads
+  // its own output.
+  _venc->color_range = static_cast<AVColorRange>(p.color_range);
+  _venc->colorspace  = static_cast<AVColorSpace>(p.colorspace);
   _venc->bit_rate  = _video_bitrate;
   _venc->gop_size  = _video_gop_size;
 
@@ -542,15 +549,59 @@ SaveVideoStage::init_audio_encoder_(const AudioStreamParams& p)
     _aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   }
 
-  AVDictionary* opts = nullptr;
-  fill_dict_from_options_(_audio_options, _libs->avutil(), &opts);
-
-  int rc = _libs->avcodec().api.open2(_aenc, codec, &opts);
-  _libs->avutil().api.dict_free(&opts);
-  if (rc < 0) {
-    session()->error(fmt(
-        "SaveVideoStage('{}'): avcodec_open2 (audio) failed: "
-        "{}", this->id(), av_err_(rc)));
+  // ASK THE ENCODER which sample format it takes, by trying. The PCM
+  // arrives planar f32 and AAC accepts that as it stands, so this stage
+  // handed the incoming format straight over -- and every LOSSLESS codec
+  // then failed the open with a bare EINVAL, because ALAC and FLAC want
+  // s16/s32. A table of what each codec accepts is the other way to do
+  // it, but FFmpeg 8 removed `AVCodec::sample_fmts` in favour of a
+  // query, so trying is both simpler and more honest than a list this
+  // file would have to keep true. It costs one open per candidate, once
+  // per run, and only when the first choice is refused.
+  static constexpr AVSampleFormat kCandidates[] = {
+    AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_S32,
+    AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S16,
+    AV_SAMPLE_FMT_FLT,
+  };
+  int rc = 0;
+  for (int attempt = 0; ; ++attempt) {
+    AVDictionary* opts = nullptr;
+    fill_dict_from_options_(_audio_options, _libs->avutil(), &opts);
+    rc = _libs->avcodec().api.open2(_aenc, codec, &opts);
+    _libs->avutil().api.dict_free(&opts);
+    if (rc >= 0) { break; }
+    if (attempt >= (int)(sizeof kCandidates / sizeof *kCandidates)) {
+      session()->error(fmt(
+          "SaveVideoStage('{}'): avcodec_open2 (audio) failed for every "
+          "sample format '{}' was offered: {}", this->id(), _audio_codec,
+          av_err_(rc)));
+      break;
+    }
+    // A refused open can leave the context unusable, so each attempt
+    // gets a fresh one carrying the same stream parameters.
+    _libs->avcodec().api.free_context(&_aenc);
+    _aenc = _libs->avcodec().api.alloc_context3(codec);
+    if (!_aenc) {
+      session()->error(fmt(
+          "SaveVideoStage('{}'): alloc_context3 (audio) failed",
+          this->id()));
+      break;
+    }
+    _aenc->sample_rate = p.sample_rate;
+    _aenc->sample_fmt  = kCandidates[attempt];
+    _aenc->ch_layout   = p.ch_layout;
+    _aenc->bit_rate    = _audio_bitrate;
+    _aenc->time_base   = AVRational{1, p.sample_rate};
+    if (_ofctx->oformat
+        && (_ofctx->oformat->flags & AVFMT_GLOBALHEADER)) {
+      _aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+  }
+  if (rc >= 0 && _aenc->sample_fmt != (AVSampleFormat)p.sample_fmt) {
+    session()->info(fmt(
+        "SaveVideoStage('{}'): '{}' takes {}, converting the planar f32 "
+        "PCM into it", this->id(), _audio_codec,
+        _libs->avutil().api.get_sample_fmt_name(_aenc->sample_fmt)));
   }
 
   _astream = _libs->avformat().api.new_stream(_ofctx, codec);
@@ -678,18 +729,89 @@ SaveVideoStage::encode_pcm_(const TensorBeatPayload& t)
   for (int64_t off = 0; off < samples; off += frame_size) {
     const int n =
       static_cast<int>(std::min<int64_t>(frame_size, samples - off));
-    for (int c = 0; c < channels; ++c) {
-      auto* dst = reinterpret_cast<float*>(_apcm_frame->data[c]);
-      const float* s = src + static_cast<size_t>(c) * samples + off;
-      std::memcpy(dst, s, static_cast<size_t>(n) * sizeof(float));
-      if (n < frame_size) {
-        std::memset(dst + n, 0,
-                    static_cast<size_t>(frame_size - n) * sizeof(float));
-      }
-    }
+    // TELL THE ENCODER how many samples are real. This used to hand it a
+    // full frame every time, zero-filling the tail of the last one, and
+    // those zeros are audible: a clip of 324000 samples became 317 AAC
+    // blocks of 1024 = 324608, i.e. 19 ms of silence welded onto the end
+    // of the track. Harmless at the end of a lone clip, but a multi-part
+    // graph JOINS these files and every seam then carries that silence
+    // -- a pause just under half a video frame. A lossless codec would
+    // store the zeros outright.
+    _apcm_frame->nb_samples = n;
+    write_pcm_frame_(src, samples, channels, off, n);
     _apcm_frame->pts = _audio_pts;
     _audio_pts += n;
     encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+  }
+}
+
+// Planar f32 -- the layout every generative graph in this tree carries
+// PCM in -- into whatever the chosen encoder accepts. AAC takes fltp as
+// it stands; the LOSSLESS codecs do not, and they are the reason a
+// multi-part graph can join its parts without a seam.
+void
+SaveVideoStage::write_pcm_frame_(const float* src, std::int64_t samples,
+                                 int channels, std::int64_t off, int n)
+{
+  const auto fmt = static_cast<AVSampleFormat>(_apcm_frame->format);
+  auto ch_src = [&](int c) { return src + (size_t)c * samples + off; };
+  // Scale to the integer range as FFmpeg does: full-scale float 1.0 maps
+  // to the type's maximum, and everything is clamped rather than wrapped
+  // -- a sample a hair over 1.0 must clip, not invert.
+  auto clampf = [](float v, double peak) {
+    const double x = (double)v * peak;
+    return x >  peak - 1 ?  peak - 1 : (x < -peak ? -peak : x);
+  };
+  switch (fmt) {
+  case AV_SAMPLE_FMT_FLTP:
+    for (int c = 0; c < channels; ++c) {
+      std::memcpy(_apcm_frame->data[c], ch_src(c), (size_t)n * sizeof(float));
+    }
+    break;
+  case AV_SAMPLE_FMT_S32P:
+    for (int c = 0; c < channels; ++c) {
+      auto* d = reinterpret_cast<std::int32_t*>(_apcm_frame->data[c]);
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[i] = (std::int32_t)clampf(s[i], 2147483648.0); }
+    }
+    break;
+  case AV_SAMPLE_FMT_S16P:
+    for (int c = 0; c < channels; ++c) {
+      auto* d = reinterpret_cast<std::int16_t*>(_apcm_frame->data[c]);
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[i] = (std::int16_t)clampf(s[i], 32768.0); }
+    }
+    break;
+  case AV_SAMPLE_FMT_FLT: {
+    auto* d = reinterpret_cast<float*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[(size_t)i * channels + c] = s[i]; }
+    }
+    break;
+  }
+  case AV_SAMPLE_FMT_S32: {
+    auto* d = reinterpret_cast<std::int32_t*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) {
+        d[(size_t)i * channels + c] = (std::int32_t)clampf(s[i], 2147483648.0);
+      }
+    }
+    break;
+  }
+  case AV_SAMPLE_FMT_S16: {
+    auto* d = reinterpret_cast<std::int16_t*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) {
+        d[(size_t)i * channels + c] = (std::int16_t)clampf(s[i], 32768.0);
+      }
+    }
+    break;
+  }
+  default:
+    break;   // refused at open, so unreachable
   }
 }
 

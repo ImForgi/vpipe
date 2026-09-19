@@ -183,7 +183,9 @@ dispatch_nv12_kernel_(MetalCompute&            mc,
                       int                      src_height,
                       int                      out_width,
                       int                      out_height,
-                      const SessionContextIntf* session)
+                      const SessionContextIntf* session,
+                      bool                     src_full_range,
+                      bool                     src_bt709)
 {
   CVPixelBufferRef pb =
       static_cast<CVPixelBufferRef>(cv_pixel_buffer);
@@ -236,7 +238,8 @@ dispatch_nv12_kernel_(MetalCompute&            mc,
   uint32_t params2[4] = {
       static_cast<uint32_t>(out_width),
       static_cast<uint32_t>(out_height),
-      0u, 0u,
+      src_full_range ? 1u : 0u,      // the kernel's range select
+      src_bt709 ? 1u : 0u,           // ... and its matrix select
   };
   float params3[4] = {
       static_cast<float>(cc.crop_left),
@@ -273,7 +276,8 @@ nv12_to_planar_rgb_u8(
     MetalCompute& mc, void* cv_pixel_buffer,
     uint8_t* dst_bytes, size_t dst_capacity_bytes,
     int src_width, int src_height, int out_width, int out_height,
-    const SessionContextIntf* session)
+    const SessionContextIntf* session, bool src_full_range,
+    bool src_bt709)
 {
   if (!mc.valid() || !cv_pixel_buffer || !dst_bytes
       || src_width <= 0 || src_height <= 0
@@ -296,7 +300,8 @@ nv12_to_planar_rgb_u8(
   }
   const bool ok = dispatch_nv12_kernel_(
       mc, cv_pixel_buffer, out_buf.mtl_buffer(),
-      src_width, src_height, out_width, out_height, session);
+      src_width, src_height, out_width, out_height, session,
+      src_full_range, src_bt709);
   if (ok) {
     std::memcpy(dst_bytes, out_buf.contents(), need);
   }
@@ -308,7 +313,8 @@ nv12_to_planar_rgb_u8_shared(
     MetalCompute& mc, void* cv_pixel_buffer,
     const ExternalStorageHandle& dst,
     int src_width, int src_height, int out_width, int out_height,
-    const SessionContextIntf* session)
+    const SessionContextIntf* session, bool src_full_range,
+    bool src_bt709)
 {
   if (!mc.valid() || !cv_pixel_buffer
       || src_width <= 0 || src_height <= 0
@@ -324,7 +330,8 @@ nv12_to_planar_rgb_u8_shared(
   }
   return dispatch_nv12_kernel_(
       mc, cv_pixel_buffer, dst_buf,
-      src_width, src_height, out_width, out_height, session);
+      src_width, src_height, out_width, out_height, session,
+      src_full_range, src_bt709);
 }
 
 bool

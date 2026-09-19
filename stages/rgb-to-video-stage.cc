@@ -35,6 +35,18 @@ const ConfigKey kAttrs[] = {
    .doc = "pixel format of the emitted frames: \"yuv420p\" (what H.264 "
           "wants) or \"rgb24\" (no conversion, for a lossless codec)",
    .def_str = "yuv420p"},
+  {.key = "color_range", .type = ConfigType::String, .required = false,
+   .doc = "the YUV swing this stage writes, and TAGS the file with. "
+          "\"limited\" (the default) is 16..235 studio swing, what every "
+          "player assumes of an SDR H.264 clip and therefore the safe "
+          "delivery choice. \"full\" is 0..255: it keeps all 256 code "
+          "values instead of 219, which is worth having on an "
+          "INTERMEDIATE this graph will read back itself -- a multi-part "
+          "video chain handing each clip to the next -- but a player that "
+          "ignores the range tag renders it with crushed blacks. Either "
+          "way the file says which it is, so vpipe reads it back "
+          "unchanged; the choice is about what ELSE opens it",
+   .def_str = "limited"},
 };
 const PortSpec kIports[] = {
   {.name = "image", .doc = "planar U8 RGB TensorBeat [3, H, W], one per frame "
@@ -71,6 +83,19 @@ rgb_to_yuv_(float r, float g, float b, float& y, float& u, float& v)
   v = 128.0f + 0.439216f * r - 0.367788f * g - 0.071427f * b;
 }
 
+// BT.601 FULL swing: all 256 code values, no 16..235 remap. Right for a
+// file this tree will read back itself -- an intermediate in a
+// multi-part chain -- where nothing has to guess and the extra 37 levels
+// are free. Wrong as a delivery default: a player that ignores the range
+// tag renders it with crushed blacks and blown highlights.
+inline void
+rgb_to_yuv_full_(float r, float g, float b, float& y, float& u, float& v)
+{
+  y =          0.299000f * r + 0.587000f * g + 0.114000f * b;
+  u = 128.0f - 0.168736f * r - 0.331264f * g + 0.500000f * b;
+  v = 128.0f + 0.500000f * r - 0.418688f * g - 0.081312f * b;
+}
+
 inline std::uint8_t
 clamp_u8_(float v)
 {
@@ -95,6 +120,12 @@ RgbToVideoStage::RgbToVideoStage(const SessionContextIntf* s,
   if (!(_fps > 0.0)) { _fps = 16.0; }
   _pix_fmt_name = attr_str("pix_fmt");
   if (_pix_fmt_name.empty()) { _pix_fmt_name = "yuv420p"; }
+  const std::string cr = attr_str("color_range");
+  _full_range = (cr == "full");
+  if (!cr.empty() && cr != "full" && cr != "limited") {
+    fail_config(fmt("RgbToVideoStage('{}'): color_range '{}' is neither "
+                    "\"limited\" nor \"full\"", this->id(), cr));
+  }
   if (_pix_fmt_name == "yuv420p") {
     _pix_fmt = AV_PIX_FMT_YUV420P;
   } else if (_pix_fmt_name == "rgb24") {
@@ -174,6 +205,14 @@ RgbToVideoStage::process(RuntimeContext& ctx)
     p.width = W;
     p.height = H;
     p.pix_fmt = _pix_fmt;
+    // DECLARE what rgb_to_yuv_ actually wrote, so the sink can tag the
+    // file and no reader has to fall back on convention. This stage
+    // emits BT.601 studio swing; saying so is what lets a decode come
+    // back with the contrast and hue it went in with.
+    if (_pix_fmt != AV_PIX_FMT_RGB24) {
+      p.color_range = _full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+      p.colorspace  = AVCOL_SPC_SMPTE170M;   // BT.601 either way
+    }
     // A rational rate from the double, denominator 1000, so 16 stays 16/1
     // and 23.976 survives as 23976/1000 rather than becoming 24.
     const long long num = (long long)std::llround(fps * 1000.0);
@@ -245,7 +284,11 @@ RgbToVideoStage::process(RuntimeContext& ctx)
       for (int x = 0; x < W; ++x) {
         const std::size_t i = (std::size_t)y * W + x;
         float yy, uu, vv;
-        rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i], yy, uu, vv);
+        _full_range
+          ? rgb_to_yuv_full_((float)rp[i], (float)gp[i], (float)bp[i],
+                             yy, uu, vv)
+          : rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i],
+                        yy, uu, vv);
         yr[x] = clamp_u8_(yy);
       }
     }
@@ -258,7 +301,11 @@ RgbToVideoStage::process(RuntimeContext& ctx)
           for (int dx = 0; dx < 2; ++dx) {
             const std::size_t i = (std::size_t)(y + dy) * W + (x + dx);
             float yy, uu, vv;
-            rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i], yy, uu, vv);
+            _full_range
+          ? rgb_to_yuv_full_((float)rp[i], (float)gp[i], (float)bp[i],
+                             yy, uu, vv)
+          : rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i],
+                        yy, uu, vv);
             su += uu;
             sv += vv;
           }

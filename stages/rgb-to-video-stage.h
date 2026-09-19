@@ -81,6 +81,7 @@ private:
   double        _fps = 16.0;
   std::string   _pix_fmt_name;
   int           _pix_fmt = 0;
+  bool          _full_range = false;   // config `color_range`
   std::uint64_t _frames = 0;
   bool          _header_sent = false;
   int           _w = 0, _h = 0;

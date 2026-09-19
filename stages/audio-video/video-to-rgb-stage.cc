@@ -1147,6 +1147,23 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
       // alloc + readback if Shared allocation or kernel dispatch
       // fails. The single Metal kernel handles NV12 -> centered-
       // crop -> bilinear-rescale -> planar RGB in one compute pass.
+      // THE SOURCE'S COLOUR RANGE, read off the frame rather than
+      // assumed. Most encoded video is limited (16..235) and this path
+      // used to convert every frame as if it were full, which costs
+      // 219/255 = 0.859 of the contrast and lifts black to 16. It is
+      // invisible on a single decode -- the picture is merely a little
+      // flat -- and compounds in a graph that re-reads its own output.
+      // AVCOL_RANGE_UNSPECIFIED means limited for YUV, which is the
+      // convention every decoder applies to an untagged stream.
+      const bool src_full_range =
+          (_yuv_in->color_range == AVCOL_RANGE_JPEG);
+      // The MATRIX, likewise. Untagged falls back on the size
+      // convention every decoder uses: BT.709 for HD and above, BT.601
+      // below it -- which is also what this tree's own writer emits.
+      const bool src_bt709 =
+          (_yuv_in->colorspace == AVCOL_SPC_BT709) ||
+          (_yuv_in->colorspace == AVCOL_SPC_UNSPECIFIED &&
+           _yuv_in->height > 576);
       auto shared =
           metal_compute::make_shared_storage(*_mc, need, session());
       bool mok = false;
@@ -1157,7 +1174,7 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
             *shared,
             _yuv_in->width,
             _yuv_in->height,
-            out_w, out_h, session());
+            out_w, out_h, session(), src_full_range, src_bt709);
         if (mok) {
           tb.external = std::move(shared);
         }
@@ -1173,7 +1190,7 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
             tb.data.size(),
             _yuv_in->width,
             _yuv_in->height,
-            out_w, out_h, session());
+            out_w, out_h, session(), src_full_range, src_bt709);
       }
       if (mok) {
         if (!_metal_logged) {

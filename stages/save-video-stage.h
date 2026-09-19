@@ -97,6 +97,10 @@ private:
   void ensure_output_format_();
   void init_video_encoder_(const VideoStreamParams& p);
   void init_audio_encoder_(const AudioStreamParams& p);
+  // Write `n` samples starting at `off` of the planar-f32 PCM `src` into
+  // `_apcm_frame`, in whatever sample format the audio encoder accepted.
+  void write_pcm_frame_(const float* src, std::int64_t samples,
+                        int channels, std::int64_t off, int n);
   void open_output_and_write_header_();
   // Record what generated this clip in the container's metadata, and
   // ask the muxer for a form that can carry it. Called with the muxer

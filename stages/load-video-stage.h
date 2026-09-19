@@ -125,16 +125,40 @@ private:
   std::string av_err_(int rc) const;
   // The configured window, for the open log; empty when there is none.
   std::string window_doc_() const;
+  // The source for a log line, already quoted: the one URL, or how many
+  // inputs were joined and which they run between. Logging `_input_url`
+  // alone would name only the first of them.
+  std::string input_doc_() const;
   // Have all the ENABLED streams passed the end of the window?
   bool all_past_end_() const noexcept;
 
   // Build one segment from the packet currently in `_pkt`.
   std::unique_ptr<EncodedSegmentPayload> segment_(bool video);
 
+  // Refuse a join whose inputs decode differently -- see the definition.
+  void check_inputs_agree_();
+
+  // Feed `_concat_list` to the concat demuxer as if it were a file, so
+  // joining several inputs writes nothing to disk. `opaque` is the
+  // stage; static so they carry the AVIO C signatures while still
+  // reaching the members.
+  static int          concat_read_(void* opaque, std::uint8_t* buf,
+                                   int size);
+  static std::int64_t concat_seek_(void* opaque, std::int64_t offset,
+                                   int whence);
+
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _input_url;
   std::string _format;
+  // Every configured input, sandbox-confined and in order. One entry is
+  // the ordinary case and opens exactly as it always did; two or more
+  // are JOINED, and `_concat_list` then holds the list the concat
+  // demuxer reads (through `_avio`, so nothing is written to disk).
+  std::vector<std::string> _inputs;
+  std::string              _concat_list;
+  std::size_t              _concat_pos = 0;
+  AVIOContext*             _avio       = nullptr;
   bool        _enable_video{};
   bool        _enable_audio{};
   int         _video_stream_index{};

@@ -205,3 +205,85 @@ TEST(load_video, a_negative_window_is_refused)
       &sess, "lv2", std::vector<InEdge>{}, cfg2);
   EXPECT_FALSE(s2->config_error().empty());
 }
+
+// SEVERAL inputs are JOINED, in order, into one stream. Two WAVs of
+// DIFFERENT lengths make the arithmetic unambiguous: a join that dropped
+// one, replayed one, or ran them in the wrong order lands on a byte
+// count this cannot.
+//
+// This is also the UI contract. The composer decides a path field is
+// multi-select from the key's declared TYPE alone (anything but
+// `string`), so `input_url` going back to String would silently cost the
+// file browser its multi-pick with nothing else failing -- hence the
+// schema assertion at the end.
+TEST(load_video, an_array_of_inputs_is_joined_in_order)
+{
+  const int kRate = 16000;
+  const std::string a =
+      write_wav_(kRate, kRate * 2, "vpipe-ut-load-video-join-a.wav");
+  const std::string b =
+      write_wav_(kRate, kRate * 1, "vpipe-ut-load-video-join-b.wav");
+  if (a.empty() || b.empty()) { return; }
+
+  auto run = [&](FlexData input_url) {
+    Session sess;
+    auto pl = std::make_unique<Pipeline>("p", &sess);
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("input_url", std::move(input_url));
+    cfg.as_object().insert_or_assign("enable_video",
+                                     FlexData::make_bool(false));
+    cfg.as_object().insert_or_assign("enable_audio",
+                                     FlexData::make_bool(true));
+    auto lv_u = std::make_unique<LoadVideoStage>(
+        &sess, "lv", std::vector<InEdge>{}, cfg);
+    auto* lv = static_cast<LoadVideoStage*>(pl->insert_stage(std::move(lv_u)));
+    auto sink_u = std::make_unique<SegSink>(&sess, "sink",
+                                            std::vector<InEdge>{{lv, 0}},
+                                            FlexData::make_object());
+    auto* sink = static_cast<SegSink*>(pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    if (!rt.launch()) { return (std::size_t)0; }
+    rt.wait_idle();
+    rt.stop();
+    return sink->total_bytes;
+  };
+
+  const std::size_t bytes_a = run(FlexData::make_string(a));
+  const std::size_t bytes_b = run(FlexData::make_string(b));
+  EXPECT_TRUE(bytes_a == (std::size_t)kRate * 2 * 2);
+  EXPECT_TRUE(bytes_b == (std::size_t)kRate * 1 * 2);
+
+  auto arr = FlexData::make_array();
+  arr.as_array().push_back(FlexData::make_string(a));
+  arr.as_array().push_back(FlexData::make_string(b));
+  const std::size_t joined = run(std::move(arr));
+  std::printf("[load_video] joined %zu + %zu -> %zu B\n",
+              bytes_a, bytes_b, joined);
+  EXPECT_TRUE(joined == bytes_a + bytes_b);
+
+  // ONE entry is the single-file path, unchanged -- it must not reach
+  // the concat demuxer or the byte count would not match `bytes_a`.
+  auto one = FlexData::make_array();
+  one.as_array().push_back(FlexData::make_string(a));
+  EXPECT_TRUE(run(std::move(one)) == bytes_a);
+
+  // The schema still says `any` + is_path, which is what makes the
+  // browser offer several files.
+  Session sess;
+  auto probe_cfg = FlexData::make_object();
+  probe_cfg.as_object().insert_or_assign("input_url",
+                                         FlexData::make_string(a));
+  auto probe = std::make_unique<LoadVideoStage>(
+      &sess, "probe", std::vector<InEdge>{}, probe_cfg);
+  bool saw = false;
+  for (const auto& k : probe->spec().attrs) {
+    if (k.key != "input_url") { continue; }
+    saw = true;
+    EXPECT_TRUE(k.type == ConfigType::Any);
+    EXPECT_TRUE(k.is_path);
+  }
+  EXPECT_TRUE(saw);
+
+  std::filesystem::remove(a);
+  std::filesystem::remove(b);
+}
