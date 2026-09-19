@@ -154,6 +154,17 @@ const ConfigKey kAttrs[] = {
           "timestamped vision blocks. Not the rate the VAE encodes it at, "
           "which is the full 24",
    .def_real = 2.0},
+  {.key = "condition_noise_aug", .type = ConfigType::Real, .required = false,
+   .doc = "how much of a video condition row SURVIVES the augmentation: a "
+          "row is packed as this*z + (1-this)*noise. The checkpoint was "
+          "trained with its anchors very slightly noised, so handing them "
+          "over exactly clean is off-distribution -- the reference "
+          "implementations noise them and 0.999 is the number they use. "
+          "1.0 disables it. This is the SAME quantity as the denoise's "
+          "`condition_timestep` (rows placed at t are correspondingly "
+          "noised), so the two must AGREE; they are separate keys only "
+          "because the packing and the denoise are separate stages",
+   .def_real = 0.999},
   {.key = "max_prompt_tokens", .type = ConfigType::Int, .required = false,
    .doc = "the conditioner's sequence pool. A ref2va presentation is FAR "
           "longer than a text-only prompt -- a single 2048-short-edge image "
@@ -365,6 +376,7 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
   _video_sample_fps = attr_real("video_sample_fps");
+  _cond_noise_aug   = attr_real("condition_noise_aug");
   _max_prompt_tokens = attr_int("max_prompt_tokens");
   _vid_short_edge   = attr_int("reference_video_short_edge");
   _vid_max_pixels   = attr_int("reference_video_max_pixels");
@@ -1341,6 +1353,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   plan.canvas_max_pixels = (std::int64_t)_vid_max_pixels;
   plan.reference_image_max_pixels = (std::int64_t)_img_max_pixels;
   plan.video_sample_fps = _video_sample_fps;
+  plan.condition_noise_aug = _cond_noise_aug;
   {
     // The DiT's patch, from the checkpoint rather than assumed: the
     // rows this stage packs are read by a transformer that reshapes

@@ -23,10 +23,17 @@ const ConfigKey kAttrs[] = {
    .doc = "sigma shift for the AUDIO schedule, stepped in lockstep with the "
           "video one over the same step count", .def_real = 3.0},
   {.key = "condition_timestep", .type = ConfigType::Real, .required = false,
-   .doc = "the level the pinned keyframe rows are conditioned at; 1.0 is "
-          "CLEAN in this model's t = 1 - sigma convention. Lower it only for "
-          "a checkpoint trained with noise-augmented anchors",
-   .def_real = 1.0},
+   .doc = "the level the pinned conditioning rows are held at, in this "
+          "model's t = 1 - sigma convention. **0.999, not 1.0**: the "
+          "released checkpoint was trained with its anchors very slightly "
+          "noised, so conditioning at exactly clean is OFF-DISTRIBUTION. "
+          "The reference implementations agree on the number -- ComfyUI's "
+          "`VISUAL_COND_TIMESTEP = 0.999` and diffusers' "
+          "`keyframe_noise_aug` -- and both also mix the rows themselves "
+          "`0.999*z + 0.001*noise` to match. Raising it to 1.0 is the "
+          "kind of error that looks harmless and shows up as structure "
+          "the model never learned to remove",
+   .def_real = 0.999},
   {.key = "condition_audio_timestep", .type = ConfigType::Real,
    .required = false,
    .doc = "the same, for a Ref2VA reference SOUNDTRACK's rows. Separate "

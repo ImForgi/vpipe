@@ -69,6 +69,47 @@ to_vae_input_(metal_compute::MetalCompute* mc, const std::uint8_t* rgb,
   return buf;
 }
 
+// The CONDITION NOISE AUGMENTATION the released checkpoint was trained
+// with: `0.999*z + 0.001*noise` on every visual conditioning row.
+//
+// It is not a denoising step and not a regulariser -- it is the
+// distribution the anchors were trained in, so rows handed over exactly
+// clean are off-distribution. ComfyUI applies it in `_cond_video_rows`
+// (`VISUAL_COND_TIMESTEP = 0.999`) and diffusers documents the same
+// number as `keyframe_noise_aug`, saying so outright: "the released
+// model was trained with its anchors very slightly noised, so
+// conditioning on exactly t = 1.0 is off-distribution".
+//
+// A deliberately NON variance-preserving lerp, matching the reference:
+// the magnitude lands at 0.999x rather than being sqrt-corrected. The
+// stream restarts per condition, as ComfyUI's does, so a reference
+// packs the same rows wherever it sits in the request.
+//
+// AUDIO rows are left alone: the reference holds them at 1.0.
+void
+augment_condition_rows_(std::vector<float>* rows, std::size_t from,
+                        double aug, std::uint64_t seed)
+{
+  if (rows == nullptr || !(aug < 1.0) || aug <= 0.0) { return; }
+  std::uint64_t s = seed + 0x9e3779b97f4a7c15ull;
+  auto next_normal = [&]() {
+    auto u = [&]() {
+      std::uint64_t z = (s += 0x9e3779b97f4a7c15ull);
+      z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+      z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+      z ^= (z >> 31);
+      return ((double)(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    };
+    const double u1 = u(), u2 = u();
+    return std::sqrt(-2.0 * std::log(u1)) *
+           std::cos(6.283185307179586 * u2);
+  };
+  const float a = (float)aug, b = (float)(1.0 - aug);
+  for (std::size_t i = from; i < rows->size(); ++i) {
+    (*rows)[i] = a * (*rows)[i] + b * (float)next_normal();
+  }
+}
+
 // The MEAN half of the VAE's moments, whitened and packed into DiT rows.
 //
 // Two deliberate departures from the reference, both shared with the
@@ -456,9 +497,13 @@ encode_references(const std::vector<MediaReference>& refs,
                       std::to_string(plan.patch_w) + " patch does not "
                       "divide");
         }
+        const std::size_t before = r.video_rows.size();
         pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
                              plan.patch_w, vc.latents_mean, vc.latents_std,
                              &r.video_rows);
+        augment_condition_rows_(&r.video_rows, before,
+                                plan.condition_noise_aug,
+                                plan.condition_noise_seed);
         L.num_latent_frames = lf;
         L.latent_height     = lh;
         L.latent_width      = lw;

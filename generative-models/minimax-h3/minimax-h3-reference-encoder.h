@@ -178,6 +178,15 @@ struct ReferencePlan {
   // The DiT's spatial patch, for packing latents into rows.
   int patch_h = 2;
   int patch_w = 2;
+
+  // The CONDITION NOISE AUGMENTATION every visual conditioning row is
+  // mixed with: `aug*z + (1-aug)*noise`. 0.999 is the released
+  // checkpoint's -- it was trained with slightly noised anchors, so
+  // exactly 1.0 is off-distribution. 1.0 disables the mix.
+  // `condition_noise_seed` restarts the stream per reference, as the
+  // reference implementation's does.
+  double        condition_noise_aug  = 0.999;
+  std::uint64_t condition_noise_seed = 0;
 };
 
 // What the encoders produced, in packed order.

@@ -336,6 +336,7 @@ private:
   // the reference before it. A beat's own `attach` sideband overrides.
   std::vector<int> _attach_audio;
   double        _video_sample_fps = 2.0;
+  double        _cond_noise_aug   = 0.999;
   int           _max_prompt_tokens = 16384;
   std::uint64_t _emitted = 0;
 
