@@ -183,6 +183,42 @@ struct Reference {
   bool has_audio() const { return num_audio_latents > 0; }
 };
 
+// A CONTINUATION CONTEXT: clean latents carried over from a previous
+// clip and pinned ON THE TARGET'S OWN TIMELINE, so the model reads them
+// as "the clip so far" and continues their motion and sound instead of
+// imitating them the way it imitates a reference.
+//
+// Both blocks are conditioning rows -- never stepped, read at the
+// condition timestep -- exactly like a keyframe anchor; what differs is
+// only WHERE they sit on the rotary clock:
+//
+//   video  `num_latent_frames` latent frames on the TARGET spatial grid,
+//          the first one at `origin + 5/3 * start_frame`, then advancing
+//          5/3 * (1, 4, 4, 4, 4) like any clip. With `start_frame` 0 and
+//          a block cut at VAE-cycle phase 0 (5n + 2 latents, i.e. 17n + 5
+//          pixel frames), its coordinates coincide with the first target
+//          latents -- which is what makes it a continuation.
+//   audio  `num_audio_latents` latents per stereo channel, the first at
+//          `origin + audio_offset`, one unit per latent, pinned to the
+//          target width grid's extremes. The caller END-aligns them with
+//          the video block, correcting for the ±1/3-latent rounding of
+//          H3's 40 Hz grid, so the carried sound ends where the carried
+//          picture ends.
+//
+// `origin` is the target's clock origin: the text length for `t2va` /
+// `fl2va`, the clock after the last reference for `ref2va`.
+//
+// All zero (the default) is "no context", and the builders then produce
+// byte-identical layouts to the overloads without this argument.
+struct ContextGuide {
+  int    num_latent_frames = 0;
+  int    start_frame       = 0;   // pixel frame on the target timeline
+  int    num_audio_latents = 0;   // per channel
+  double audio_offset      = 0.0; // rotary time of audio latent 0, from origin
+
+  bool empty() const { return num_latent_frames <= 0 && num_audio_latents <= 0; }
+};
+
 // Build the `[text | keyframe conditions | target audio | target video]`
 // layout of the `t2va` / `fl2va` tasks.
 //
@@ -200,6 +236,22 @@ bool build_packed_sequence(const std::vector<int>& text_token_tags,
                            int patch_h, int patch_w, int audio_channels,
                            const std::vector<Anchor>& keyframe_anchors,
                            PackedLayout* out);
+
+// The same, with an optional continuation `context` (see ContextGuide).
+// The packed order becomes
+//   [text | keyframe conditions | context video | context audio |
+//    target audio | target video]
+// so every conditioning row still LEADS its modality's index vector --
+// the invariant the denoise loop steps "only the tail" by -- and
+// `num_condition_video_rows` / `num_condition_audio_rows` count the
+// context rows too. False additionally on a context that is negative or
+// whose video block does not fit inside the target clip.
+bool build_packed_sequence(const std::vector<int>& text_token_tags,
+                           int num_latent_frames, int latent_height,
+                           int latent_width, int num_audio_latents,
+                           int patch_h, int patch_w, int audio_channels,
+                           const std::vector<Anchor>& keyframe_anchors,
+                           const ContextGuide& context, PackedLayout* out);
 
 // Build the `[text | reference blocks | target audio | target video]`
 // layout of the `ref2va` task.
@@ -227,6 +279,27 @@ bool build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
                                   int latent_width, int num_audio_latents,
                                   int patch_h, int patch_w, int audio_channels,
                                   PackedLayout* out);
+
+// The same, with an optional continuation `context`. The context blocks
+// are packed after the last reference and before the generated rows:
+//   [text | reference blocks | context video | context audio |
+//    target audio | target video]
+// and are placed from the TARGET origin (the clock the references left
+// behind), not on the reference clock -- they are the start of this clip,
+// not one more thing to imitate. The references' own rows and positions
+// are unchanged by a context.
+bool build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
+                                  const std::vector<Reference>& references,
+                                  int num_latent_frames, int latent_height,
+                                  int latent_width, int num_audio_latents,
+                                  int patch_h, int patch_w, int audio_channels,
+                                  const ContextGuide& context,
+                                  PackedLayout* out);
+
+// Pixel frames covered by `num_latent_frames` latents counted from VAE
+// cycle phase 0: 1 + 4 + 4 + 4 + 4 per group of five (so 2 -> 5, 7 -> 22,
+// 37 -> 124). The inverse of what a 17n + 5 clip packs into.
+int pixel_frames_for_latents(int num_latent_frames);
 
 // Assign a timestep to every row and reduce it to the transformer's
 // `(distinct timesteps, per-row index)` pair.

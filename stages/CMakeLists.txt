@@ -24,6 +24,10 @@ set(LOCAL_SOURCES
   generate-video-stage.cc
   wan2-model-config-stage.cc
   minimax-h3-model-config-stage.cc
+  minimax-h3-context.cc
+  minimax-h3-context-export-stage.cc
+  minimax-h3-context-import-stage.cc
+  minimax-h3-context-trim-stage.cc
   flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
   krea2-model-config-stage.cc
@@ -94,6 +98,10 @@ set(LOCAL_HEADERS
   generate-video-stage.h
   wan2-model-config-stage.h
   minimax-h3-model-config-stage.h
+  minimax-h3-context.h
+  minimax-h3-context-export-stage.h
+  minimax-h3-context-import-stage.h
+  minimax-h3-context-trim-stage.h
   flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
   krea2-model-config-stage.h

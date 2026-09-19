@@ -123,6 +123,39 @@ temporal_position_grid(int num_latent_frames, double origin)
   return grid;
 }
 
+int
+pixel_frames_for_latents(int num_latent_frames)
+{
+  int frames = 0;
+  for (int i = 0; i < num_latent_frames; ++i) {
+    frames += kRopeFramesPerLatent[i % 5];
+  }
+  return frames;
+}
+
+namespace {
+
+// A context the target can hold: nothing negative, a finite audio offset,
+// and a video block that ends inside the generated clip. Audio is not
+// bounded here -- an audio window longer than the video one legitimately
+// reaches back before the target origin.
+bool
+context_fits_(const ContextGuide& ctx, int num_latent_frames)
+{
+  if (ctx.num_latent_frames < 0 || ctx.num_audio_latents < 0 ||
+      ctx.start_frame < 0 || !std::isfinite(ctx.audio_offset)) {
+    return false;
+  }
+  if (ctx.num_latent_frames > 0 &&
+      ctx.start_frame + pixel_frames_for_latents(ctx.num_latent_frames) >
+          pixel_frames_for_latents(num_latent_frames)) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool
 build_packed_sequence(const std::vector<int>& text_token_tags,
                       int num_latent_frames, int latent_height,
@@ -131,7 +164,22 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
                       const std::vector<Anchor>& keyframe_anchors,
                       PackedLayout* out)
 {
+  return build_packed_sequence(text_token_tags, num_latent_frames,
+                               latent_height, latent_width, num_audio_latents,
+                               patch_h, patch_w, audio_channels,
+                               keyframe_anchors, ContextGuide{}, out);
+}
+
+bool
+build_packed_sequence(const std::vector<int>& text_token_tags,
+                      int num_latent_frames, int latent_height,
+                      int latent_width, int num_audio_latents, int patch_h,
+                      int patch_w, int audio_channels,
+                      const std::vector<Anchor>& keyframe_anchors,
+                      const ContextGuide& context, PackedLayout* out)
+{
   if (out == nullptr) { return false; }
+  if (!context_fits_(context, num_latent_frames)) { return false; }
   if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
       patch_h <= 0 || patch_w <= 0 || audio_channels <= 0 ||
       num_audio_latents < 0) {
@@ -146,17 +194,25 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   const int rows_per_frame = ph * pw;
   const int num_text = (int)text_token_tags.size();
   const int num_cond = (int)keyframe_anchors.size() * rows_per_frame;
+  // The continuation context, if any: its video rows extend the keyframe
+  // block (so all conditioning video stays one contiguous run) and its
+  // audio rows sit immediately before the generated audio.
+  const int num_ctx_video = context.num_latent_frames * rows_per_frame;
+  const int num_ctx_audio = context.num_audio_latents * audio_channels;
   const int num_audio_rows = num_audio_latents * audio_channels;
   const int num_video_rows = num_latent_frames * rows_per_frame;
-  const int seq = num_text + num_cond + num_audio_rows + num_video_rows;
+  const int seq = num_text + num_cond + num_ctx_video + num_ctx_audio +
+                  num_audio_rows + num_video_rows;
   if (seq <= 0) { return false; }
+  const int ctx_video_start = num_text + num_cond;
+  const int ctx_audio_start = ctx_video_start + num_ctx_video;
 
   PackedLayout L;
   L.seq_len            = seq;
   L.num_text_rows      = num_text;
   L.condition_start    = num_text;
-  L.num_condition_rows = num_cond;
-  L.audio_start        = num_text + num_cond;
+  L.num_condition_rows = num_cond + num_ctx_video;
+  L.audio_start        = ctx_audio_start + num_ctx_audio;
   L.num_audio_rows     = num_audio_rows;
   L.video_start        = L.audio_start + num_audio_rows;
   L.num_video_rows     = num_video_rows;
@@ -212,6 +268,31 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
     }
   }
 
+  // 3b. The continuation context, placed from the target origin (the
+  // text length here). Video on the target's own spatial grid and
+  // temporal rule; audio channel-major, pinned to the width extremes
+  // like the generated audio it continues into.
+  if (num_ctx_video > 0) {
+    const std::vector<double> ct_grid = temporal_position_grid(
+        context.num_latent_frames,
+        (double)num_text + kRopeFrameRescale * (double)context.start_frame);
+    for (int f = 0; f < context.num_latent_frames; ++f) {
+      for (int r = 0; r < rows_per_frame; ++r) {
+        const int row = ctx_video_start + f * rows_per_frame + r;
+        pos(row, 0) = ct_grid[(std::size_t)f];
+        pos(row, 1) = frame_h(r);
+        pos(row, 2) = frame_w(r);
+      }
+    }
+  }
+  for (int c = 0; c < audio_channels; ++c) {
+    for (int i = 0; i < context.num_audio_latents; ++i) {
+      const int row = ctx_audio_start + c * context.num_audio_latents + i;
+      pos(row, 0) = (double)num_text + context.audio_offset + (double)i;
+      pos(row, 2) = (c == 0) ? w_grid.front() : w_grid.back();
+    }
+  }
+
   // 4. Audio rows are CHANNEL-MAJOR and share the video's rotary clock --
   // one unit per latent, since 40 latents/s is exactly 24 fps * 5/3. They
   // carry NO height coordinate and are pinned to the two extremes of the
@@ -244,11 +325,15 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   for (int i = 0; i < num_text; ++i) {
     L.token_tags[(std::size_t)i] = text_token_tags[(std::size_t)i];
   }
+  for (int i = 0; i < num_ctx_audio; ++i) {
+    L.token_tags[(std::size_t)(ctx_audio_start + i)] = kAudioTag;
+  }
   for (int i = 0; i < num_audio_rows; ++i) {
     L.token_tags[(std::size_t)(L.audio_start + i)] = kAudioTag;
   }
-  L.video_indices.reserve((std::size_t)(num_cond + num_video_rows));
-  for (int i = 0; i < num_cond; ++i) {
+  L.video_indices.reserve(
+      (std::size_t)(num_cond + num_ctx_video + num_video_rows));
+  for (int i = 0; i < num_cond + num_ctx_video; ++i) {
     L.video_indices.push_back(L.condition_start + i);
   }
   for (int i = 0; i < num_video_rows; ++i) {
@@ -260,21 +345,27 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   // have to know which task built the layout. Here every modality is
   // one range (video two), which is exactly what `ref2va` stops being
   // true.
-  L.audio_indices.reserve((std::size_t)num_audio_rows);
+  L.audio_indices.reserve((std::size_t)(num_ctx_audio + num_audio_rows));
+  for (int i = 0; i < num_ctx_audio; ++i) {
+    L.audio_indices.push_back(ctx_audio_start + i);
+  }
   for (int i = 0; i < num_audio_rows; ++i) {
     L.audio_indices.push_back(L.audio_start + i);
   }
-  if (num_cond > 0) {
-    L.video_runs.push_back({L.condition_start, num_cond});
+  if (num_cond + num_ctx_video > 0) {
+    L.video_runs.push_back({L.condition_start, num_cond + num_ctx_video});
   }
   if (num_video_rows > 0) {
     L.video_runs.push_back({L.video_start, num_video_rows});
   }
+  if (num_ctx_audio > 0) {
+    L.audio_runs.push_back({ctx_audio_start, num_ctx_audio});
+  }
   if (num_audio_rows > 0) {
     L.audio_runs.push_back({L.audio_start, num_audio_rows});
   }
-  L.num_condition_video_rows = num_cond;
-  L.num_condition_audio_rows = 0;
+  L.num_condition_video_rows = num_cond + num_ctx_video;
+  L.num_condition_audio_rows = num_ctx_audio;
 
   *out = std::move(L);
   return true;
@@ -288,7 +379,23 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
                              int patch_h, int patch_w, int audio_channels,
                              PackedLayout* out)
 {
+  return build_ref2va_packed_sequence(text_token_tags, references,
+                                      num_latent_frames, latent_height,
+                                      latent_width, num_audio_latents,
+                                      patch_h, patch_w, audio_channels,
+                                      ContextGuide{}, out);
+}
+
+bool
+build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
+                             const std::vector<Reference>& references,
+                             int num_latent_frames, int latent_height,
+                             int latent_width, int num_audio_latents,
+                             int patch_h, int patch_w, int audio_channels,
+                             const ContextGuide& context, PackedLayout* out)
+{
   if (out == nullptr || references.empty()) { return false; }
+  if (!context_fits_(context, num_latent_frames)) { return false; }
   if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
       patch_h <= 0 || patch_w <= 0 || audio_channels <= 0 ||
       num_audio_latents < 0) {
@@ -339,8 +446,10 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
     if (r.kind != Reference::Kind::kAudio) { num_ref_video += ref_video_rows(r); }
     if (r.has_audio()) { num_ref_audio += r.num_audio_latents * audio_channels; }
   }
-  const int seq = num_text + num_ref_video + num_ref_audio + num_target_audio +
-                  num_target_video;
+  const int num_ctx_video = context.num_latent_frames * target_rows_per_frame;
+  const int num_ctx_audio = context.num_audio_latents * audio_channels;
+  const int seq = num_text + num_ref_video + num_ref_audio + num_ctx_video +
+                  num_ctx_audio + num_target_audio + num_target_video;
   if (seq <= 0) { return false; }
 
   PackedLayout L;
@@ -455,6 +564,33 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
     }
   }
 
+  // 2b. The continuation context. Packed after the references but placed
+  // from the TARGET origin -- the clock the references left behind --
+  // because it is the beginning of this clip rather than one more block
+  // on the reference clock. The clock itself does NOT advance past it:
+  // the generated rows start at the same origin they would without one.
+  if (num_ctx_video > 0) {
+    const std::vector<double> ct_grid = temporal_position_grid(
+        context.num_latent_frames,
+        clock + kRopeFrameRescale * (double)context.start_frame);
+    for (int f = 0; f < context.num_latent_frames; ++f) {
+      for (int i = 0; i < target_rows_per_frame; ++i) {
+        const int row = cursor + f * target_rows_per_frame + i;
+        pos(row, 0) = ct_grid[(std::size_t)f];
+        pos(row, 1) = target_h[(std::size_t)(i / tpw)];
+        pos(row, 2) = target_w[(std::size_t)(i % tpw)];
+      }
+    }
+    L.video_runs.push_back({cursor, num_ctx_video});
+    cursor += num_ctx_video;
+  }
+  if (num_ctx_audio > 0) {
+    fill_audio(cursor, context.num_audio_latents,
+               clock + context.audio_offset, target_w);
+    L.audio_runs.push_back({cursor, num_ctx_audio});
+    cursor += num_ctx_audio;
+  }
+
   // 3. The generated rows share the origin the references left behind.
   const int audio_start = cursor;
   const int video_start = audio_start + num_target_audio;
@@ -466,7 +602,7 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
   // not exist here; the reference blocks are what a `ref2va` request
   // conditions on and they are addressed through the runs.
   L.condition_start    = num_text;
-  L.num_condition_rows = num_ref_video;
+  L.num_condition_rows = num_ref_video + num_ctx_video;
 
   if (num_target_audio > 0) {
     fill_audio(audio_start, num_audio_latents, clock, target_w);
@@ -488,11 +624,13 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
   // video, and the video pass must win: a vision block's text rows are
   // tagged VIDEO by the caller and are inside the text range, so the
   // three passes are not disjoint the way they are in `fl2va`.
-  L.video_indices.reserve((std::size_t)(num_ref_video + num_target_video));
+  L.video_indices.reserve(
+      (std::size_t)(num_ref_video + num_ctx_video + num_target_video));
   for (const RowRun& r : L.video_runs) {
     for (int i = 0; i < r.count; ++i) { L.video_indices.push_back(r.start + i); }
   }
-  L.audio_indices.reserve((std::size_t)(num_ref_audio + num_target_audio));
+  L.audio_indices.reserve(
+      (std::size_t)(num_ref_audio + num_ctx_audio + num_target_audio));
   for (const RowRun& r : L.audio_runs) {
     for (int i = 0; i < r.count; ++i) { L.audio_indices.push_back(r.start + i); }
   }
@@ -502,8 +640,8 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
   for (int r : L.audio_indices) { L.token_tags[(std::size_t)r] = kAudioTag; }
   for (int r : L.video_indices) { L.token_tags[(std::size_t)r] = kVideoTag; }
 
-  L.num_condition_video_rows = num_ref_video;
-  L.num_condition_audio_rows = num_ref_audio;
+  L.num_condition_video_rows = num_ref_video + num_ctx_video;
+  L.num_condition_audio_rows = num_ref_audio + num_ctx_audio;
 
   *out = std::move(L);
   return true;
