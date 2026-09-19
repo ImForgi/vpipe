@@ -1651,6 +1651,42 @@ builtin_catalog_()
                ".safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
+    // The single-image VAE -- the one piece that lets an H3 latent
+    // become a PICTURE.
+    //
+    // WHY IT IS NEEDED, and it is not a convenience. H3's encoder turns
+    // a still into exactly 1 latent frame, and the chunked video decoder
+    // cannot read that back: it spends `token_drop` latent frames
+    // priming its temporal window, so it needs 7 before it emits
+    // anything and refuses 1 outright. So the released model can encode
+    // a picture it is unable to decode. This checkpoint's decoder was
+    // fine-tuned to read one token on its own.
+    //
+    // VERIFIED against the released video VAE rather than taken from the
+    // card: all 116 encoder tensors, `quant_conv` and both whitening
+    // vectors are BYTE-IDENTICAL, while 439 of 440 decoder tensors and
+    // `post_quant_conv` differ. The LATENT SPACE is therefore unchanged
+    // and any H3 latent decodes here -- which is also why this attaches
+    // to either partition and pins no parent: the same file serves
+    // FL2VA and Ref2VA, and duplicating the entry to say so would
+    // fetch 5.2 GB twice under two names.
+    //
+    // DO NOT PUT IT IN A VIDEO GRAPH. Upstream reports that its decoder
+    // materially regresses multi-frame reconstruction -- patch-grid
+    // ghosting and cross-frame mixing. Nothing about the weights
+    // distinguishes the two files (same 562 names, same shapes), so the
+    // two guards are the FILENAME, which loses to a `video_vae` one in
+    // the component resolver's preference order, and the `h3_t1_direct`
+    // flag in its metadata, which is what the decoder checks.
+    {.family = "MiniMax", .version = "H3-Image-VAE", .param_class = "2.4B",
+     .variant = "fp16 single-latent-frame decoder (Mamad8)",
+     .hf_path = "Mamad8/MiniMax-H3-Image-VAE",
+     .model_type = "minimax-h3-image-vae",
+     .inputs = {"image"}, .outputs = {"image"},
+     .files = {"minimax_h3_t1_image_vae_step1597.safetensors"},
+     .weight_format = "comfyui",
+     .needs_tokenizer_json = false,
+     .name = "Mamad8/MiniMax-H3-Image-VAE"},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -1884,6 +1920,14 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // modalities at all, and a picker that filters on need_inputs hid
     // it from exactly the stages that would use it.
     set({"text", "image", "video", "audio"}, {"video", "audio"});
+  } else if (mt == "minimax-h3-image-vae") {
+    // A VAE and nothing else: pixels in, pixels out, with no prompt and
+    // no denoise anywhere in it. It is listed as its own model rather
+    // than as a supplement because it is a COMPLETE autoencoder -- the
+    // frozen H3 encoder plus a decoder retrained to read one latent
+    // frame -- so it round-trips a picture on its own, and because the
+    // same file serves both H3 partitions.
+    set({"image"}, {"image"});
   } else if (mt == "boogu-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "boogu-image") {

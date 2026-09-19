@@ -42,9 +42,11 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/media-decode.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -837,4 +839,296 @@ TEST(minimax_h3_vvae, decode_ane_matches_gpu)
   EXPECT_TRUE(ane.armed);
   EXPECT_TRUE(bad == 0);
   EXPECT_TRUE(rel < 0.02 && rel > 0.0);
+}
+
+// ---------------------------------------------------------------------
+// The SINGLE-LATENT-FRAME image decode.
+//
+// H3's encoder turns one still into exactly one latent frame, and the
+// chunked video decoder cannot turn that back into a picture: it spends
+// `token_drop` frames priming its temporal window, so it needs 7 latent
+// frames before it emits anything and refuses 1 outright. An
+// image-trained checkpoint closes the gap by fine-tuning the decoder to
+// read one token alone -- the encoder, `quant_conv` and the whitening
+// are left frozen, so the LATENT SPACE is the same one and a latent from
+// any H3 model decodes here.
+//
+// What these check that nothing else does:
+//
+//   * the capability is read from the CHECKPOINT and never assumed.
+//     Both files carry the same 562 tensor names at the same shapes, so
+//     nothing about the weights distinguishes them and the video
+//     decoder would return a correctly shaped picture of the wrong
+//     thing.
+//   * which of the `patch_t` pixel frames a latent token expands to is
+//     the picture. Off by one is not a crash and not noise -- it is a
+//     plausible, blurred image, because the neighbouring frames of a
+//     still's block are near-copies of it.
+//
+// Env: VPIPE_MINIMAX_H3_IMAGE_VAE_PATH (the image checkpoint),
+// VPIPE_MINIMAX_H3_IMAGE_SRC (a photograph to round-trip).
+// ---------------------------------------------------------------------
+
+namespace {
+
+// The reference's pixel normalization, which is IMAGENET's and not
+// [-1, 1]: a round trip run in the wrong space reconstructs a
+// contrast-shifted image rather than a broken one.
+constexpr float kInMean[3] = {0.485f, 0.456f, 0.406f};
+constexpr float kInStd[3]  = {0.229f, 0.224f, 0.225f};
+
+}  // namespace
+
+TEST(minimax_h3_vvae, image_capability_is_declared_by_the_checkpoint)
+{
+  const char* img = std::getenv("VPIPE_MINIMAX_H3_IMAGE_VAE_PATH");
+  if (img == nullptr || *img == '\0') { return; }
+
+  MetalMiniMaxH3VideoVae::Config icfg;
+  std::string ierr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(img, icfg, &ierr));
+  if (!ierr.empty()) { std::printf("[minimax_h3_vvae] %s\n", ierr.c_str()); }
+  EXPECT_TRUE(icfg.t1_direct);
+  // The released checkpoint's slice, which is also the pad the chunked
+  // path already discards -- `frame_pre_pad()` for a 17-frame clip at a
+  // temporal stride of 4. Agreeing with that derivation is why the
+  // default is safe; it is still READ, because a later fine-tune is
+  // free to park the picture elsewhere.
+  EXPECT_TRUE(icfg.t1_output_slice == 3);
+  EXPECT_TRUE(icfg.t1_output_slice == icfg.frame_pre_pad());
+  // Same geometry and same latent space as the video checkpoint: this is
+  // what makes it a drop-in decoder rather than a second model.
+  EXPECT_TRUE(icfg.z_channels == 24 && icfg.patch == 16 && icfg.patch_t == 4);
+
+  // The tiling must land on the patch grid, or `split_tiles` lays a
+  // union that overruns the image -- see
+  // minimax_h3_layout.vae_tile_split_needs_patch_aligned_geometry.
+  EXPECT_TRUE(icfg.tile_size % icfg.patch == 0);
+  EXPECT_TRUE(icfg.tile_overlap_min % icfg.patch == 0);
+
+  // And the env override cannot put it off that grid. A value that is
+  // not a whole number of patches is IGNORED rather than honoured,
+  // which is the same answer the config path gives by refusing.
+  const int was = icfg.tile_size;
+  ::setenv("VPIPE_H3_VVAE_TILE", "250", 1);
+  MetalMiniMaxH3VideoVae::Config bad;
+  const bool ok = MetalMiniMaxH3VideoVae::config_from_json(img, bad, nullptr);
+  ::unsetenv("VPIPE_H3_VVAE_TILE");
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(bad.tile_size == was);
+
+  // The VIDEO checkpoint must NOT claim it.
+  const char* vid = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (vid == nullptr || *vid == '\0') { return; }
+  MetalMiniMaxH3VideoVae::Config vcfg;
+  std::string verr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(vid, vcfg, &verr));
+  EXPECT_TRUE(!vcfg.t1_direct);
+}
+
+TEST(minimax_h3_vvae, image_round_trip)
+{
+  const char* img = std::getenv("VPIPE_MINIMAX_H3_IMAGE_VAE_PATH");
+  const char* src = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SRC");
+  if (img == nullptr || *img == '\0' || src == nullptr || *src == '\0') {
+    return;
+  }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  std::string derr;
+  auto pic = decode_image_file(sess.ffmpeg_libraries(), src, &derr);
+  if (!pic.has_value()) { std::printf("[minimax_h3_vvae] %s\n", derr.c_str()); }
+  ASSERT_TRUE(pic.has_value());
+  if (!pic.has_value()) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(img, cfg, &cerr));
+  ASSERT_TRUE(cfg.t1_direct);
+  if (!cfg.t1_direct) { return; }
+
+  // A CENTRE CROP to a whole number of latent cells, not a resample: a
+  // resample is a second lossy step and this measures one. 512 is the
+  // size the checkpoint's own validation number is quoted at.
+  int side = 512;
+  if (const char* s = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SIDE")) {
+    side = std::atoi(s);
+  }
+  side = std::min({side, pic->width, pic->height});
+  side -= side % cfg.patch;
+  ASSERT_TRUE(side >= cfg.patch);
+  if (side < cfg.patch) { return; }
+  const int x0 = (pic->width - side) / 2, y0 = (pic->height - side) / 2;
+
+  const int IC = cfg.in_channels, H = side, W = side;
+  const std::size_t plane = (std::size_t)H * W;
+  SharedBuffer xb = mc->make_shared_buffer((std::size_t)IC * plane * 2);
+  ASSERT_TRUE(!xb.empty());
+  std::vector<float> ref((std::size_t)IC * plane);   // the source, in [0,1]
+  {
+    auto* d = static_cast<std::uint16_t*>(xb.contents());
+    for (int c = 0; c < IC; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          const std::size_t s =
+              ((std::size_t)c * pic->height + (y0 + y)) * pic->width + x0 + x;
+          const float p = (float)pic->rgb[s] / 255.0f;
+          const std::size_t i = (std::size_t)c * plane + (std::size_t)y * W + x;
+          ref[i] = p;
+          d[i] = f32_to_bf16_((p - kInMean[c]) / kInStd[c]);
+        }
+      }
+    }
+  }
+
+  // Slice override, for the sweep that shows the checkpoint's own answer
+  // is the right one: the four pixel frames of a still's block are near
+  // copies of each other, so a wrong slice is a blurred picture rather
+  // than a broken one and no shape check would catch it.
+  if (const char* s = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SLICE")) {
+    cfg.t1_output_slice = std::atoi(s);
+  }
+  auto m = MetalMiniMaxH3VideoVae::load(img, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->can_decode_image());
+
+  // ONE still in, ONE latent frame out -- the encoder's own answer, not
+  // an assumption: `encoded_frames(1)` is 1 because the causal temporal
+  // padding leaves a length-1 axis at length 1.
+  std::string eerr;
+  SharedBuffer mom = m->encode(xb, 1, H, W, &eerr);
+  if (mom.empty()) { std::printf("[minimax_h3_vvae] %s\n", eerr.c_str()); }
+  ASSERT_TRUE(!mom.empty());
+  if (mom.empty()) { return; }
+  ASSERT_TRUE(m->encoded_frames(1) == 1);
+
+  const int lh = H / cfg.patch, lw = W / cfg.patch;
+  const std::size_t voxels = (std::size_t)lh * lw;
+  // Moments are mean|logvar on the channel axis, so the mean is the
+  // leading z_channels planes -- already channel-first, no repacking.
+  SharedBuffer zb = mc->make_shared_buffer(voxels * cfg.z_channels * 2);
+  ASSERT_TRUE(!zb.empty());
+  std::memcpy(zb.contents(), mom.contents(),
+              voxels * (std::size_t)cfg.z_channels * 2);
+
+  // PSNR over the two, in [0, 1] -- the quantity the checkpoint's own
+  // validation number is stated in, so the two are comparable.
+  auto psnr_of = [&](const SharedBuffer& out) {
+    const auto* o = static_cast<const std::uint16_t*>(out.contents());
+    double se = 0.0;
+    for (int c = 0; c < IC; ++c) {
+      for (std::size_t i = 0; i < plane; ++i) {
+        const std::size_t k = (std::size_t)c * plane + i;
+        const float v = bf16_to_f32_(o[k]) * kInStd[c] + kInMean[c];
+        const double d = (double)v - (double)ref[k];
+        se += d * d;
+      }
+    }
+    const double mse = se / (double)((std::size_t)IC * plane);
+    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+  };
+
+  // TILED against WHOLE-IMAGE, because the two are different functions
+  // and only one of them is what the checkpoint was validated as. The
+  // decoder's rope is normalized to the extent it is handed, so a 256
+  // tile and a whole 512 image put every token at a different
+  // coordinate; the video path tiles because attention is quadratic,
+  // which is a cost argument and not a correctness one at image sizes.
+  //
+  // ONE MODEL RESIDENT AT A TIME. `load(dir, ...)` opens a PRIVATE
+  // weight set, so holding both arms at once is two copies of a 5.2 GB
+  // checkpoint -- which on a 16 GB box is not a slow test but a wedged
+  // machine. The first is released before the second is opened, and the
+  // latent outlives both because it is an ordinary buffer.
+  std::string terr;
+  SharedBuffer tiled = m->decode_image(zb, lh, lw, &terr);
+  if (tiled.empty()) { std::printf("[minimax_h3_vvae] %s\n", terr.c_str()); }
+  ASSERT_TRUE(!tiled.empty());
+  if (tiled.empty()) { return; }
+  const double tiled_db = psnr_of(tiled);
+  const int tile_was = cfg.tile_size;
+  tiled = SharedBuffer{};
+  m.reset();
+
+  MetalMiniMaxH3VideoVae::Config wcfg = cfg;
+  wcfg.tile_size = std::max(H, W);          // one tile = no tiling
+  auto wm = MetalMiniMaxH3VideoVae::load(img, mc, wcfg);
+  ASSERT_TRUE(wm != nullptr);
+  if (wm == nullptr) { return; }
+  std::string werr;
+  SharedBuffer whole = wm->decode_image(zb, lh, lw, &werr);
+  if (whole.empty()) { std::printf("[minimax_h3_vvae] %s\n", werr.c_str()); }
+  ASSERT_TRUE(!whole.empty());
+  if (whole.empty()) { return; }
+  const double whole_db = psnr_of(whole);
+
+  std::printf("[minimax_h3_vvae] image round trip %dx%d (latent %dx%d), slice "
+              "%d: PSNR %.2f dB tiled@%d, %.2f dB whole-image | the "
+              "checkpoint reports 30.44 dB over a 64-image 512px set\n",
+              H, W, lh, lw, cfg.t1_output_slice, tiled_db, tile_was, whole_db);
+
+  // A FLOOR, not the published number: that one is a mean over 64
+  // images and this is one crop. What it catches is the failure that
+  // looks like success -- a wrong output slice, the un-fine-tuned
+  // decoder, or the wrong pixel normalization, all of which land far
+  // below this while still producing a picture-shaped buffer.
+  EXPECT_TRUE(tiled_db > 25.0);
+
+  // TILING AT THE CHECKPOINT'S OWN 256 IS REQUIRED, not an optimization,
+  // and this is the assertion that says so. MEASURED on a 512px centre
+  // crop: 30.97 dB tiled against 23.27 dB whole-image -- 7.7 dB, and the
+  // tiled arm lands on the 30.44 dB the checkpoint reports while the
+  // whole-image arm is nowhere near it.
+  //
+  // The reason is the rope, not the seams. `build_rope_` normalizes
+  // every axis to the extent it is HANDED, so a 512px decode puts each
+  // token at a coordinate no 256px tile ever occupies -- and this
+  // decoder was fine-tuned on a 256 -> 384 px curriculum. Bigger tiles
+  // are not "less seam for more compute" here; they are a different
+  // function, and a worse one.
+  //
+  // ONLY ABOVE THE TILE. At or below `tile_size` the image is a single
+  // tile and the two arms are the SAME function -- MEASURED 28.14 dB
+  // against 28.14 dB at 256px -- so asserting a strict win there fails
+  // on an equality rather than on a defect.
+  if (H > tile_was || W > tile_was) {
+    EXPECT_TRUE(tiled_db > whole_db);
+  } else {
+    EXPECT_TRUE(std::fabs(tiled_db - whole_db) < 1e-6);
+  }
+}
+
+TEST(minimax_h3_vvae, decode_image_refuses_a_video_checkpoint)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  ASSERT_TRUE(!cfg.t1_direct);
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  EXPECT_TRUE(!m->can_decode_image());
+  const int lh = 4, lw = 4;
+  SharedBuffer zb =
+      mc->make_shared_buffer((std::size_t)lh * lw * cfg.z_channels * 2);
+  ASSERT_TRUE(!zb.empty());
+  std::memset(zb.contents(), 0, zb.byte_size());
+  std::string err;
+  // Refused, and the refusal must SAY the checkpoint is the problem --
+  // the weights are all present and would produce a picture-shaped
+  // buffer, so a caller has no other way to tell.
+  EXPECT_TRUE(m->decode_image(zb, lh, lw, &err).empty());
+  EXPECT_TRUE(err.find("h3_t1_direct") != std::string::npos);
 }

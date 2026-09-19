@@ -1513,3 +1513,36 @@ TEST(minimax_h3_layout, audio_channels_is_the_stereo_count)
   EXPECT_TRUE(L32.num_audio_rows == naud * 32);
   EXPECT_TRUE(L32.seq_len > L.seq_len);
 }
+
+// WHY the VAE refuses a tile geometry that is not a whole number of
+// patches -- the check in `MetalMiniMaxH3VideoVae::config_from_json`.
+//
+// `split_tiles` pays the leftover slack back in whole `ratio` steps, so
+// the union it lays ends at `length + (slack % ratio)`. At the
+// checkpoint's own 256 / 64 that remainder is always 0 and the coverage
+// is exact; let either number off the patch grid and the last tile ends
+// PAST the axis. Nothing downstream re-checks it: both tilers index the
+// source by the tile's start and extent, and `stitch_` WRITES by them,
+// so an overrun is out-of-bounds memory rather than a wrong picture.
+TEST(minimax_h3_layout, vae_tile_split_needs_patch_aligned_geometry)
+{
+  // Exact for every length that is a whole number of latent cells.
+  for (int len = 16; len <= 4096; len += 16) {
+    const auto s = minimax_h3::split_tiles(len, 256, 64, 16);
+    ASSERT_TRUE(!s.start.empty() && s.start.size() == s.length.size());
+    if (s.start.empty()) { continue; }
+    EXPECT_TRUE(s.start.back() + s.length.back() == len);
+  }
+
+  // A tile that is not a multiple of the patch: 6 tiles ending at 1036
+  // for a 1024 axis, 12 pixels of out-of-bounds.
+  const auto t = minimax_h3::split_tiles(1024, 250, 64, 16);
+  ASSERT_TRUE(!t.start.empty());
+  EXPECT_TRUE(t.start.back() + t.length.back() == 1036);
+
+  // And the minimum OVERLAP matters the same way, which is why the
+  // refusal names both: 3 tiles ending at 520 for a 512 axis.
+  const auto o = minimax_h3::split_tiles(512, 256, 60, 16);
+  ASSERT_TRUE(!o.start.empty());
+  EXPECT_TRUE(o.start.back() + o.length.back() == 520);
+}

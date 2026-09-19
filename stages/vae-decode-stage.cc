@@ -115,7 +115,8 @@ const ConfigKey kAttrs[] = {
        "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va,vosr",
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va,"
+       "minimax-h3-image-vae,vosr",
    .model_channel = "diffusion-model"},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on each decoded VIDEO frame's sideband when "
@@ -1301,6 +1302,23 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           vc.z_channels));
       co_return;
     }
+
+    // ONE latent frame is a PICTURE, and it is the one length the
+    // chunked video decoder cannot read: `token_drop` spends the first
+    // chunk priming the temporal window, so `decode_video` needs 7
+    // latent frames and refuses 1 -- while the encoder turns a still
+    // into exactly 1. Only a checkpoint whose decoder was fine-tuned for
+    // it can decode this, and it declares that itself.
+    const bool one_frame = (LT == 1);
+    if (one_frame && !_h3_vae->can_decode_image()) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): this is a single-frame latent and the "
+          "loaded MiniMax-H3 VAE does not decode one -- its metadata "
+          "declares no 'h3_t1_direct'. Point hf_dir at an image-trained H3 "
+          "VAE (Mamad8/MiniMax-H3-Image-VAE); skipping", this->id()));
+      co_return;
+    }
+
     double fps = _fps;
     if (tbp->sideband.is_object()) {
       FlexData sb = tbp->sideband;        // as_object() is a view: keep it
@@ -1352,8 +1370,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // floor and not a peak. Measure decode_video's high-water mark and
     // fold it in before treating a pass here as a guarantee.
     {
+      // `decoded_frames` answers 0 for a single latent frame -- that is
+      // the refusal, not a size -- so the image path states its own 1
+      // rather than preflighting an allocation of nothing.
       const std::size_t out_frames =
-          (std::size_t)_h3_vae->decoded_frames(LT);
+          one_frame ? 1u : (std::size_t)_h3_vae->decoded_frames(LT);
       const std::size_t px = (std::size_t)(lh * vc.patch) *
                              (std::size_t)(lw * vc.patch) * out_frames;
       const std::size_t need = px * 3 * 2      // decode output, bf16
@@ -1439,7 +1460,17 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         bar.update((std::uint64_t)(done < 0 ? 0 : done),
                    (std::uint64_t)(total < 0 ? 0 : total));
       });
-      rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+      // The two agree on memory: `decode_video` emits channel-first
+      // [3, F, H, W] and `decode_image` [3, H, W], which at F == 1 is
+      // the same buffer. So only the call differs and every line below
+      // -- the u8 quantize, the per-frame beats, the diagnostics -- is
+      // the video path's, unchanged.
+      if (one_frame) {
+        rgb = _h3_vae->decode_image(z, lh, lw, &derr);
+        F = rgb.empty() ? 0 : 1;
+      } else {
+        rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+      }
       // Cleared before the bar it captures leaves scope -- the VAE
       // outlives this call and would otherwise hold a dangling reference
       // into the next decode.
@@ -1486,7 +1517,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // from the beats below rather than from a second pass over `rgb`,
     // so the conversion lives in exactly one place and the two ports
     // cannot drift apart in what they show.
-    auto clip = begin_clip_(ctx, F, H, W);
+    // NOT for a picture. oport1's contract is a CLIP, and this port's
+    // documentation already draws the line: emitting [1, 3, H, W] for a
+    // still would invent a one-frame clip where MiniMax-H3 itself makes
+    // a real distinction between the two -- a reference image advances
+    // its rotary clock by one integer slot, a one-frame video does not.
+    auto clip = one_frame ? nullptr : begin_clip_(ctx, F, H, W);
     for (int f = 0; f < F; ++f) {
       auto out = std::make_unique<TensorBeatPayload>();
       out->dtype = TensorBeat::DType::U8;

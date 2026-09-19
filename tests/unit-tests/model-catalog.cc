@@ -1388,3 +1388,43 @@ TEST(model_catalog, minimax_h3_partitions_resolve_from_their_variant)
   // stage to its "publishes N models" refusal.
   EXPECT_TRUE(catalog_pick_variant(cands, "") == nullptr);
 }
+
+// The MiniMax-H3 single-image VAE, which is what makes a still out of a
+// one-latent-frame H3 latent. Its own entry rather than a supplement:
+// it is a COMPLETE autoencoder (H3's frozen encoder plus a decoder
+// retrained to read one latent frame), and the same file serves both H3
+// partitions, so pinning a parent would either be wrong for one of them
+// or duplicate a 5.2 GB fetch under two names.
+TEST(model_catalog, minimax_h3_image_vae_entry) {
+  const ModelCatalogEntry* e =
+      catalog_by_path("Mamad8/MiniMax-H3-Image-VAE");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->model_type == "minimax-h3-image-vae");
+  EXPECT_TRUE(e->name == "Mamad8/MiniMax-H3-Image-VAE");
+  // Its repo publishes exactly ONE model, so a fetch needs no
+  // model_variant -- the single-candidate path in ModelFetchStage
+  // resolves it from model_path alone.
+  auto cands = catalog_all_by_path("Mamad8/MiniMax-H3-Image-VAE");
+  EXPECT_TRUE(cands.size() == 1);
+  // Weights-only Comfy packing: the config rides the safetensors
+  // __metadata__, so there is no config.json to fetch and no tokenizer
+  // to synthesize.
+  EXPECT_TRUE(e->weight_format == "comfyui");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // The ONE file, pinned by name. It must not be fetched as a whole
+  // repo: the repo also carries a 980 KB example PNG.
+  EXPECT_TRUE(e->files.size() == 1);
+  if (e->files.size() == 1) {
+    EXPECT_TRUE(e->files[0] == "minimax_h3_t1_image_vae_step1597.safetensors");
+    // The filename carries no "video_vae", which is load-bearing: the
+    // component resolver PREFERS that substring, so this file loses to
+    // the real video VAE when both sit in one vae/ directory and can
+    // only be selected by naming it.
+    EXPECT_TRUE(e->files[0].find("video_vae") == string::npos);
+  }
+  // Pixels in, pixels out -- no prompt, no denoise.
+  EXPECT_TRUE(has_(e->inputs, "image"));
+  EXPECT_TRUE(has_(e->outputs, "image"));
+  EXPECT_TRUE(e->inputs.size() == 1 && e->outputs.size() == 1);
+}

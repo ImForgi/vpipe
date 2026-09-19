@@ -111,6 +111,30 @@ class MetalMiniMaxH3VideoVae {
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
 
+    // ---- the single-latent-frame IMAGE decode (checkpoint-declared) --
+    // Whether this checkpoint's decoder was trained to turn ONE latent
+    // frame straight into one picture, and which of the `patch_t` pixel
+    // frames that token expands to is that picture.
+    //
+    // A CAPABILITY OF THE WEIGHTS, never of the request, which is why it
+    // is read from the file rather than configured. Every H3 checkpoint
+    // has the same geometry and the same tensor names, so nothing about
+    // the shapes distinguishes the two -- run `decode_image` on the
+    // stock video decoder and it returns a picture-shaped buffer full of
+    // the wrong thing. The released image checkpoint says so in its
+    // `__metadata__` (`h3_t1_direct` / `h3_t1_output_slice`); a
+    // checkpoint that says nothing does not have it.
+    //
+    // WHY A SLICE AND NOT FRAME 0. The decoder emits a whole `patch_t`
+    // block per token and the chunked video path throws the leading
+    // `frame_pre_pad()` of them away as an implicit pad, so the first
+    // frame a chunk really carries is index 3 -- which is exactly the
+    // slice the released checkpoint names. Read it anyway: agreeing with
+    // a derivation is not the same as being one, and a future fine-tune
+    // is free to park the picture somewhere else.
+    bool t1_direct       = false;
+    int  t1_output_slice = 0;
+
     // Derived temporal-chunk geometry. `clip_length` is deliberately
     // NOT a multiple of `patch_t`, so a chunk's leading `frame_pre_pad`
     // pixel frames belong to an implicit pad and the decoder has to
@@ -175,6 +199,50 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::SharedBuffer
   decode(const metal_compute::SharedBuffer& z, int T, int h, int w,
          std::string* err = nullptr);
+
+  // Decode ONE latent frame as ONE picture: channel-first
+  // [z_channels, 1, h, w] bf16 in, channel-first
+  // [out_channels, h*patch, w*patch] bf16 out -- a still, with no time
+  // axis at all rather than a length-1 one.
+  //
+  // This is the decode `decode_video` CANNOT do. Its chunking spends
+  // `token_drop` latent frames priming the temporal window, so it needs
+  // `tokens_per_chunk() + token_drop` = 7 latent frames before it will
+  // decode anything and refuses 1 outright -- while `encode_video`
+  // turns a single still into exactly 1 latent frame. A checkpoint with
+  // `t1_direct` closes that gap: its decoder was fine-tuned to read one
+  // token on its own.
+  //
+  // False on a checkpoint that does not declare the capability, because
+  // the failure is otherwise invisible: the stock video decoder returns
+  // a correctly shaped picture that merely looks wrong, and the rope is
+  // why. `build_rope_` normalizes the temporal axis by `T` ITSELF, so a
+  // lone latent lands at coordinate 0.0 -- the middle of the spread a
+  // 7-frame chunk gives its frames, and a grid no voxel occupies during
+  // a video decode. The fine-tune is what learned it.
+  //
+  // Spatially tiled exactly as `decode_video` tiles, and the tiling is
+  // REQUIRED rather than an optimization. MEASURED on a 512px centre
+  // crop round-tripped through the released image checkpoint: 30.97 dB
+  // PSNR at the checkpoint's own 256 tile against 23.27 dB decoding the
+  // whole 512 in one go -- and the checkpoint reports 30.44 dB over a
+  // 64-image 512px set, so the tiled arm is the one that reproduces it.
+  //
+  // The reason is the rope and not the seams. `build_rope_` normalizes
+  // each axis to the extent it is HANDED, so decoding a whole image puts
+  // every token at a coordinate no 256px tile occupies, and this decoder
+  // was fine-tuned on a 256 -> 384 px curriculum. Raising `tile_size`
+  // for an image therefore does not trade seam for compute; it computes
+  // a different and worse function.
+  //
+  // Empty on failure, with a reason in `err`.
+  metal_compute::SharedBuffer
+  decode_image(const metal_compute::SharedBuffer& z, int h, int w,
+               std::string* err = nullptr);
+
+  // Whether `decode_image` will run at all -- `t1_direct` under the
+  // name a caller asks its question in.
+  bool can_decode_image() const { return _cfg.t1_direct; }
 
   // Encode ONE temporal clip -- the reference's `_encode_clip` with
   // tiling off. `x` is CHANNEL-FIRST [in_channels, T, H, W] bf16 in
@@ -336,8 +404,13 @@ class MetalMiniMaxH3VideoVae {
   // hands it the WHOLE frame when the frame does not tile. A 1344x768
   // clip through that path is [17547264, 128] = 4.5 GB, twice over the
   // line, and `t * rows * cout` overflows the int it was narrowed to.
-  // VPIPE_H3_VVAE_ROW_BAND forces one.
-  int row_band_(int N) const;
+  // VPIPE_H3_VVAE_ROW_BAND forces one (smaller only -- see the clamp).
+  //
+  // `widest` is the WIDEST ROW of any operand in elements, i.e.
+  // max(N, K) and not N: the mma kernels wrap x, W and y alike in
+  // int32 extents, so the x operand crosses the line first whenever
+  // K > N. Callers pass the max; see gemm_.
+  int row_band_(int widest) const;
   // Dequant-once into _w_deq (quantized) or the weight as-is (dense), then
   // one dense matmul2d tile. False when the shape or the machine does not
   // take it, which leaves gemm_ on its existing path.

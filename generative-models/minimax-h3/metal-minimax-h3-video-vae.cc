@@ -146,6 +146,7 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
   // files one directory apart; the Comfy-Org file carries both in one
   // metadata blob, with the source config nested under "source_config".
   FlexData cfg, wrap;
+  std::string comfy_file;
   if (comfy::is_component(p.string(), kComfyKey)) {
     std::string cerr;
     if (!comfy::metadata_json(p.string(), kComfyKey, wrap, &cerr)) {
@@ -163,6 +164,8 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
     // 256 / 64 -- and they must, because a tile's rope is built from its
     // own extent, so a different tiling is a different function rather
     // than a different seam.
+    //
+    comfy_file = p.string();
   } else {
     if (fs::is_directory(p)) { p = p / "config.json"; }
     std::ifstream f(p);
@@ -350,7 +353,71 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
   // becomes a default.
   if (const char* e = std::getenv("VPIPE_H3_VVAE_TILE")) {
     const int t = std::atoi(e);
-    if (t >= out.patch) { out.tile_size = t; }
+    if (t >= out.patch && t % out.patch == 0) { out.tile_size = t; }
+  }
+
+  // ---- the tiling must COVER the axis exactly ------------------------
+  // `split_tiles` pays the leftover slack back in whole `ratio` steps,
+  // so the union it lays overruns the axis by `slack % ratio` -- and
+  // both tilers and `stitch_` trust the coverage. A tile that ends past
+  // the image is an out-of-bounds READ in encode_tiled_/decode_tiled_
+  // and an out-of-bounds WRITE in stitch_, which is memory corruption
+  // rather than a wrong picture.
+  //
+  // The slack is `tile_size*n - overlap*(n-1) - length` for whichever
+  // `n` the split lands on, and H/W are already multiples of `patch`,
+  // so it is a multiple of `patch` for EVERY n exactly when both the
+  // tile and the minimum overlap are. Checked here rather than in
+  // split_tiles because this is where a checkpoint's numbers arrive,
+  // and refusing a config beats silently retiling one.
+  if (out.tile_size % out.patch != 0 ||
+      out.tile_overlap_min % out.patch != 0) {
+    return fail("vae_tile_size " + std::to_string(out.tile_size) +
+                " and vae_tile_overlap_min " +
+                std::to_string(out.tile_overlap_min) +
+                " must both be multiples of the " +
+                std::to_string(out.patch) +
+                "-pixel patch, or the tiling overruns the image");
+  }
+
+  // ---- the single-frame image capability ------------------------------
+  // Read LAST, because validating the slice needs `patch_t`, and that is
+  // parsed above. It sits BESIDE the wrapper blob rather than inside it:
+  // the source net is the same net, and what a `t1_direct` checkpoint
+  // changed is which weights its decoder was left with. The entries are
+  // bare strings -- "true" and "3" -- where `source_config` is JSON, so
+  // they are read off the raw metadata rather than parsed as JSON.
+  //
+  // Only the single-file packing can carry it. The diffusers layout has
+  // nowhere to put it that is not the source net's own config.json, and
+  // inventing a key there would claim the reference publishes one.
+  if (!comfy_file.empty()) {
+    FlexData meta;
+    if (comfy::read_metadata(comfy_file, meta, nullptr) && meta.is_object()) {
+      auto mo = meta.as_object();
+      auto str = [&](const char* k) -> std::string {
+        if (!mo.contains(k)) { return {}; }
+        const FlexData v = mo.at(k);   // as_string() is a VIEW: bind it
+        return v.is_string() ? std::string(v.as_string("")) : std::string();
+      };
+      const std::string direct = str("h3_t1_direct");
+      out.t1_direct = (direct == "true" || direct == "1");
+      if (out.t1_direct) {
+        // Absent, default to the pad the chunked path already discards,
+        // which is where the released checkpoint puts it. Present and
+        // outside the block, REFUSE rather than clamp: the file is
+        // describing geometry this build did not parse, and quietly
+        // decoding a different frame is the failure worth refusing.
+        const std::string slice = str("h3_t1_output_slice");
+        out.t1_output_slice =
+            slice.empty() ? out.frame_pre_pad() : std::atoi(slice.c_str());
+        if (out.t1_output_slice < 0 || out.t1_output_slice >= out.patch_t) {
+          return fail(comfy_file + ": h3_t1_output_slice '" + slice +
+                      "' is not one of the " + std::to_string(out.patch_t) +
+                      " pixel frames a latent frame decodes to");
+        }
+      }
+    }
   }
   return true;
 }
@@ -701,23 +768,31 @@ MetalMiniMaxH3VideoVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
 }
 
 int
-MetalMiniMaxH3VideoVae::row_band_(int N) const
+MetalMiniMaxH3VideoVae::row_band_(int widest) const
 {
   // VPIPE_H3_VVAE_ROW_BAND forces a band, which is how a shape that
   // fits can be tested against its own banded self.
+  //
+  // CLAMPED to what the band is for, because it is otherwise a way to
+  // reintroduce exactly the overflow this function exists to prevent:
+  // a forced band wide enough puts `M * N` past the int it is narrowed
+  // to at the bias fold, which then reads as a huge unsigned `total`
+  // AND as a 1-D grid of the same wrong size. A forced band may be
+  // SMALLER than the computed one (that is the A/B it is for) and never
+  // larger.
   static const int kForced = [] {
     const char* e = std::getenv("VPIPE_H3_VVAE_ROW_BAND");
     return e != nullptr ? std::atoi(e) : 0;
   }();
-  if (kForced > 0) { return kForced; }
-  if (N <= 0) { return 1 << 30; }
+  if (widest <= 0) { return 1 << 30; }
   // The last row a 32-bit BYTE offset reaches, floored to the 128-row
   // tile the mma kernels step in: a band ending mid-tile would still
   // hand one tile a base past the line.
-  const long long lim = (((long long)1 << 31) - 1) / ((long long)N * 2);
+  const long long lim = (((long long)1 << 31) - 1) / ((long long)widest * 2);
   long long band = (lim / 128) * 128;
   if (band < 128) { band = 128; }
   if (band > (1 << 30)) { band = 1 << 30; }
+  if (kForced > 0 && (long long)kForced < band) { band = kForced; }
   return (int)band;
 }
 
@@ -731,7 +806,18 @@ MetalMiniMaxH3VideoVae::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   // each rebased through the buffer offset so the kernel's own
   // arithmetic stays small. Below the line -- the decode, and every
   // tiled encode -- the band IS M and this is the single pass it was.
-  const int band = row_band_(N);
+  //
+  // THE WIDEST OF THE TWO ROW STRIDES, not the destination's. The mma
+  // kernels wrap EVERY operand in int32 extents, so the X operand is
+  // `band * K * 2` bytes where the destination is `band * N * 2`, and
+  // banding on N alone leaves X past the line whenever K > N. Nothing
+  // reaches it today -- the only GEMMs that see a large unbanded M are
+  // the 1x1x1 convs, where K = cin <= N = cout -- but the decoder's
+  // `w2` is K 8192 against N 2048, so the shape that breaks it is
+  // already in the model and is merely never handed enough rows.
+  // Banding on the max costs nothing when K <= N, which is every case
+  // that runs.
+  const int band = row_band_(std::max(N, K));
   if (M > band) {
     for (int m0 = 0; m0 < M; m0 += band) {
       gemm_(enc, x, x_off + (std::size_t)m0 * K, l, y,
@@ -2289,6 +2375,61 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
     at += p.n;
   }
   if (out_frames != nullptr) { *out_frames = keep; }
+  return out;
+}
+
+SharedBuffer
+MetalMiniMaxH3VideoVae::decode_image(const SharedBuffer& z, int h, int w,
+                                     std::string* err)
+{
+  auto fail = [&](const std::string& m) -> SharedBuffer {
+    if (err != nullptr) { *err = m; }
+    return {};
+  };
+  const Config& c = _cfg;
+  // Refused rather than attempted, and the message names what is
+  // missing: every H3 video VAE has the tensors to run this and would
+  // return a picture-shaped buffer of the wrong picture, so a caller who
+  // pointed at the wrong checkpoint needs to be told which one to use
+  // rather than left to judge the output.
+  if (!c.t1_direct) {
+    return fail("this checkpoint does not decode a single latent frame: it "
+                "declares no 'h3_t1_direct' in its metadata. The chunked "
+                "video decoder needs " +
+                std::to_string(c.tokens_per_chunk() + c.token_drop) +
+                " latent frames; a still is 1, which only an image-trained "
+                "H3 VAE decodes");
+  }
+  if (h <= 0 || w <= 0) { return fail("empty latent grid"); }
+
+  // One latent frame in, one whole `patch_t` block out. Tiled exactly as
+  // a clip is, so a picture and a frame of a clip at the same canvas see
+  // the same rope and the same seams.
+  SharedBuffer block = decode_tiled_(z, 1, h, w, err);
+  if (block.empty()) { return {}; }
+
+  const int OC = c.out_channels;
+  const int H  = h * c.patch;
+  const int W  = w * c.patch;
+  const std::size_t plane = (std::size_t)H * W;
+  const int slice = c.t1_output_slice;
+  // config_from_json bounds this, but decode_image is public and a Config
+  // can also be hand-built, so the read is checked where it is used.
+  if (slice < 0 || slice >= c.patch_t) {
+    return fail("t1_output_slice " + std::to_string(slice) + " is not one of "
+                "the " + std::to_string(c.patch_t) + " pixel frames a latent "
+                "frame decodes to");
+  }
+
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)OC * plane * 2);
+  if (out.empty()) { return fail("output allocation failed"); }
+  const auto* src = static_cast<const std::uint16_t*>(block.contents());
+  auto*       dst = static_cast<std::uint16_t*>(out.contents());
+  for (int ch = 0; ch < OC; ++ch) {
+    std::memcpy(dst + (std::size_t)ch * plane,
+                src + ((std::size_t)ch * c.patch_t + slice) * plane,
+                plane * 2);
+  }
   return out;
 }
 

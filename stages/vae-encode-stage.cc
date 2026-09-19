@@ -228,7 +228,7 @@ const ConfigKey kAttrs[] = {
        "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-image-vae,vosr",
    .model_channel = "diffusion-model"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
    .doc = "letterbox-resize the input to this width before encoding (multiple "
