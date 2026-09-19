@@ -240,6 +240,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc
         image-resample-stage.cc
+        image-levels-stage.cc
+        tensor-io-stage.cc
         temporal-slice-stage.cc
         vae-encode-range.cc
         temporal-stack-stage.cc
