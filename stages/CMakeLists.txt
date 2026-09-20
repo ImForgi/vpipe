@@ -27,6 +27,7 @@ set(LOCAL_SOURCES
   minimax-h3-context.cc
   minimax-h3-context-export-stage.cc
   minimax-h3-context-import-stage.cc
+  minimax-h3-chain-normalize-stage.cc
   minimax-h3-context-trim-stage.cc
   flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
@@ -101,6 +102,7 @@ set(LOCAL_HEADERS
   minimax-h3-context.h
   minimax-h3-context-export-stage.h
   minimax-h3-context-import-stage.h
+  minimax-h3-chain-normalize-stage.h
   minimax-h3-context-trim-stage.h
   flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h

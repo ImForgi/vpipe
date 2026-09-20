@@ -430,6 +430,192 @@ apply_luma_gain(std::uint8_t* rgb, std::int64_t samples, double gain)
   }
 }
 
+// ---- levelling a whole chain -------------------------------------------
+
+namespace {
+
+// The structure band: a box blur of radius 2 against one of radius 8,
+// about 5 px against about 17 px.
+constexpr int kBandInner = 2;
+constexpr int kBandOuter = 8;
+
+// One separable box blur with replicated edges, in place, using `line`
+// as the row/column buffer.
+void
+box_blur_(float* img, int h, int w, int r, std::vector<float>* line)
+{
+  if (r <= 0) { return; }
+  line->resize((std::size_t)std::max(h, w));
+  const double inv = 1.0 / (double)(2 * r + 1);
+  for (int y = 0; y < h; ++y) {
+    float* p = img + (std::size_t)y * w;
+    double sum = 0.0;
+    for (int x = -r; x <= r; ++x) { sum += p[std::clamp(x, 0, w - 1)]; }
+    for (int x = 0; x < w; ++x) {
+      (*line)[(std::size_t)x] = (float)(sum * inv);
+      sum += p[std::clamp(x + r + 1, 0, w - 1)];
+      sum -= p[std::clamp(x - r, 0, w - 1)];
+    }
+    std::memcpy(p, line->data(), (std::size_t)w * sizeof(float));
+  }
+  for (int x = 0; x < w; ++x) {
+    double sum = 0.0;
+    for (int y = -r; y <= r; ++y) {
+      sum += img[(std::size_t)std::clamp(y, 0, h - 1) * w + x];
+    }
+    for (int y = 0; y < h; ++y) {
+      (*line)[(std::size_t)y] = (float)(sum * inv);
+      sum += img[(std::size_t)std::clamp(y + r + 1, 0, h - 1) * w + x];
+      sum -= img[(std::size_t)std::clamp(y - r, 0, h - 1) * w + x];
+    }
+    for (int y = 0; y < h; ++y) {
+      img[(std::size_t)y * w + x] = (*line)[(std::size_t)y];
+    }
+  }
+}
+
+// The grey both measures are taken on -- the mean over channels -- into
+// `g`, returning the population variance of the WHOLE frame, floored, as
+// the reference does. Both measures divide by it, which is what makes
+// them contrast-normalised: a brighter or flatter take does not read as
+// a different amount of detail.
+double
+grey_and_variance_(const std::uint8_t* rgb, int channels, int h, int w,
+                   float* g)
+{
+  const std::size_t plane = (std::size_t)h * w;
+  double sum = 0.0, sum2 = 0.0;
+  for (std::size_t i = 0; i < plane; ++i) {
+    double v = 0.0;
+    for (int c = 0; c < channels; ++c) { v += rgb[(std::size_t)c * plane + i]; }
+    v /= (double)channels;
+    g[i] = (float)v;
+    sum += v;
+    sum2 += v * v;
+  }
+  const double mean = sum / (double)plane;
+  return std::max(sum2 / (double)plane - mean * mean, 1e-9);
+}
+
+}  // namespace
+
+double
+norm_laplacian(const std::uint8_t* rgb, int channels, int h, int w)
+{
+  if (rgb == nullptr || channels <= 0 || h < 3 || w < 3) { return 0.0; }
+  const std::size_t plane = (std::size_t)h * w;
+  std::vector<float> g(plane);
+  // The variance is the whole frame's; the Laplacian below is taken over
+  // the interior only, as the reference does.
+  const double var = grey_and_variance_(rgb, channels, h, w, g.data());
+  double energy = 0.0;
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      const std::size_t i = (std::size_t)y * w + x;
+      const double k =
+          4.0 * g[i] - g[i - w] - g[i + w] - g[i - 1] - g[i + 1];
+      energy += k * k;
+    }
+  }
+  energy /= (double)((h - 2) * (w - 2));
+  return energy / var;
+}
+
+void
+subtract_structure_band(std::uint8_t* rgb, int channels, int h, int w,
+                        double amount, std::vector<float>* scratch)
+{
+  if (rgb == nullptr || channels <= 0 || h < 3 || w < 3) { return; }
+  if (!(amount > 0.0) || scratch == nullptr) { return; }
+  const std::size_t plane = (std::size_t)h * w;
+  scratch->resize(plane * 2);
+  float* inner = scratch->data();
+  float* outer = inner + plane;
+  std::vector<float> line;
+  for (int c = 0; c < channels; ++c) {
+    std::uint8_t* p = rgb + (std::size_t)c * plane;
+    for (std::size_t i = 0; i < plane; ++i) { inner[i] = (float)p[i]; }
+    std::memcpy(outer, inner, plane * sizeof(float));
+    box_blur_(inner, h, w, kBandInner, &line);
+    box_blur_(outer, h, w, kBandOuter, &line);
+    for (std::size_t i = 0; i < plane; ++i) {
+      const double band = (double)inner[i] - (double)outer[i];
+      const long   v    = std::lround((double)p[i] - amount * band);
+      p[i] = (std::uint8_t)std::clamp(v, 0L, 255L);
+    }
+  }
+}
+
+double
+structure_band_energy(const std::uint8_t* rgb, int channels, int h, int w)
+{
+  if (rgb == nullptr || channels <= 0 || h < 3 || w < 3) { return 0.0; }
+  const std::size_t plane = (std::size_t)h * w;
+  std::vector<float> inner(plane), outer(plane);
+  const double var = grey_and_variance_(rgb, channels, h, w, inner.data());
+  outer = inner;
+  std::vector<float> line;
+  box_blur_(inner.data(), h, w, kBandInner, &line);
+  box_blur_(outer.data(), h, w, kBandOuter, &line);
+  double energy = 0.0;
+  for (std::size_t i = 0; i < plane; ++i) {
+    const double d = (double)inner[i] - (double)outer[i];
+    energy += d * d;
+  }
+  return (energy / (double)plane) / var;
+}
+
+void
+channel_cdf(const std::uint8_t* rgb, int channels, int h, int w, int channel,
+            double* cdf256)
+{
+  if (cdf256 == nullptr) { return; }
+  for (int i = 0; i < 256; ++i) { cdf256[i] = 0.0; }
+  if (rgb == nullptr || channel < 0 || channel >= channels || h <= 0 ||
+      w <= 0) {
+    return;
+  }
+  const std::size_t plane = (std::size_t)h * w;
+  const std::uint8_t* p = rgb + (std::size_t)channel * plane;
+  double hist[256] = {};
+  for (std::size_t i = 0; i < plane; ++i) { hist[p[i]] += 1.0; }
+  double run = 0.0;
+  for (int i = 0; i < 256; ++i) {
+    run += hist[i];
+    cdf256[i] = run / (double)plane;
+  }
+}
+
+void
+match_lut(const double* src_cdf256, const double* ref_cdf256,
+          std::uint8_t* lut256)
+{
+  if (lut256 == nullptr) { return; }
+  for (int i = 0; i < 256; ++i) { lut256[i] = (std::uint8_t)i; }
+  if (src_cdf256 == nullptr || ref_cdf256 == nullptr) { return; }
+  // searchsorted(ref, src) with the reference's default side: the first
+  // reference level whose CDF is not below this source level's. Both are
+  // non-decreasing, so one walk covers all 256.
+  int j = 0;
+  for (int i = 0; i < 256; ++i) {
+    while (j < 255 && ref_cdf256[j] < src_cdf256[i]) { ++j; }
+    lut256[i] = (std::uint8_t)j;
+  }
+}
+
+void
+apply_lut(std::uint8_t* rgb, int channels, int h, int w, int channel,
+          const std::uint8_t* lut256)
+{
+  if (rgb == nullptr || lut256 == nullptr || channel < 0 ||
+      channel >= channels || h <= 0 || w <= 0) {
+    return;
+  }
+  const std::size_t plane = (std::size_t)h * w;
+  std::uint8_t* p = rgb + (std::size_t)channel * plane;
+  for (std::size_t i = 0; i < plane; ++i) { p[i] = lut256[p[i]]; }
+}
+
 // ---- the context file --------------------------------------------------
 
 namespace {

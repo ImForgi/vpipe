@@ -22,6 +22,7 @@
 #include "pipeline/typed-stage.h"
 #include "stages/minimax-h3-context-export-stage.h"
 #include "stages/minimax-h3-context-import-stage.h"
+#include "stages/minimax-h3-chain-normalize-stage.h"
 #include "stages/minimax-h3-context-trim-stage.h"
 #include "stages/minimax-h3-context.h"
 
@@ -897,4 +898,212 @@ TEST(minimax_h3_context_stages, the_pcm_waits_for_the_info_beat)
   EXPECT_TRUE(a->shape == (std::vector<std::int64_t>{1, 136000}));
   if (a->shape != (std::vector<std::int64_t>{1, 136000})) { return; }
   EXPECT_TRUE(a->as_f32()[0] == 29333.0f);
+}
+
+// ---- the chain normaliser ------------------------------------------
+namespace {
+
+// Broadband value noise, the way footage is. `fine` scales the top two
+// octaves, `mid` the two the 5-to-17 px band sits in, `bias` the level.
+// Both gains are needed: the correction under test removes the MIDDLE
+// band, so a drift built only from fine octaves is invisible to it --
+// measured, a clip with 2.2x the fine detail moves the band by -2 %.
+std::unique_ptr<BeatPayloadIntf>
+noise_beat_(int h, int w, unsigned seed, double fine, double mid, int bias)
+{
+  std::vector<double> img((std::size_t)h * w, 128.0 + bias);
+  std::uint64_t s = (std::uint64_t)seed * 2654435761u + 1;
+  auto rnd = [&]() {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    return (double)((s >> 11) & 0xffff) / 65535.0 - 0.5;
+  };
+  for (int oct = 0; oct < 6; ++oct) {
+    const int step = 1 << (5 - oct);
+    double gain = 1.0;
+    if (oct >= 4)                  { gain = fine; }
+    else if (oct == 1 || oct == 2) { gain = mid; }
+    const double amp = 18.0 * gain / (1.0 + oct * 0.5);
+    const int gh = h / step + 2, gw = w / step + 2;
+    std::vector<double> g((std::size_t)gh * gw);
+    for (auto& v : g) { v = rnd() * amp; }
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const int gy = y / step, gx = x / step;
+        const double fy = (double)(y % step) / step;
+        const double fx = (double)(x % step) / step;
+        const double a = g[(std::size_t)gy * gw + gx];
+        const double b = g[(std::size_t)gy * gw + gx + 1];
+        const double c = g[(std::size_t)(gy + 1) * gw + gx];
+        const double d = g[(std::size_t)(gy + 1) * gw + gx + 1];
+        img[(std::size_t)y * w + x] +=
+            a + (b - a) * fx + ((c - a) + ((d - c) - (b - a)) * fx) * fy;
+      }
+    }
+  }
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::U8;
+  tb.shape = {3, h, w};
+  tb.resize_contiguous((std::size_t)3 * h * w);
+  const std::size_t plane = (std::size_t)h * w;
+  for (int c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < plane; ++i) {
+      tb.data[(std::size_t)c * plane + i] =
+          (std::uint8_t)std::clamp((int)std::llround(img[i]), 0, 255);
+    }
+  }
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert_or_assign("fps", FlexData::make_real(24.0));
+  tb.sideband = std::move(sb);
+  return tensor_(std::move(tb));
+}
+
+}  // namespace
+
+TEST(minimax_h3_context_stages, chain_normalize_levels_a_drifting_take)
+{
+  constexpr int kH = 72, kW = 96;
+  constexpr int kSkip = 2, kBase = 14, kTail = 24;
+
+  auto run = [&](double strength, bool colour) {
+    Session sess;
+    Pipeline pl("normalize", &sess);
+    auto src_u = std::make_unique<ListSource>(&sess, "frames",
+                                              std::vector<InEdge>{},
+                                              FlexData::make_object());
+    for (int i = 0; i < kSkip + kBase; ++i) {
+      src_u->beats.push_back(noise_beat_(kH, kW, 100 + i, 1.0, 1.0, 0));
+    }
+    // The continuation: finer and brighter, which is what a clip that
+    // continues another comes out as.
+    for (int i = 0; i < kTail; ++i) {
+      src_u->beats.push_back(noise_beat_(kH, kW, 300 + i, 2.2, 2.0, 20));
+    }
+    src_u->allocate_oports(1);
+    auto* src = pl.insert_stage(std::move(src_u));
+    auto* norm = pl.insert_stage(
+        std::make_unique<MiniMaxH3ChainNormalizeStage>(
+            &sess, "norm", std::vector<InEdge>{{src, 0}},
+            cfg_({{"skip_seconds", FlexData::make_real(kSkip / 24.0)},
+                  {"baseline_seconds", FlexData::make_real(kBase / 24.0)},
+                  {"fps", FlexData::make_real(24.0)},
+                  {"ema", FlexData::make_real(1.0)},
+                  {"strength", FlexData::make_real(strength)},
+                  {"colour_match", FlexData::make_bool(colour)}})));
+    auto* cv = static_cast<Collect*>(pl.insert_stage(std::make_unique<Collect>(
+        &sess, "cv", std::vector<InEdge>{{norm, 0}}, FlexData::make_object())));
+    PipelineRuntime rt(&pl, &sess);
+    // band energy, level -- the band is what the correction removes, so
+    // it is what says whether it worked.
+    std::vector<std::pair<double, double>> out;
+    if (!rt.launch()) { return out; }
+    rt.wait_idle();
+    rt.stop();
+    for (auto& b : cv->got) {
+      const auto* t = dynamic_cast<const TensorBeatPayload*>(b.get());
+      if (t == nullptr) { out.push_back({-1.0, -1.0}); continue; }
+      out.push_back({h3ctx::structure_band_energy(t->data.data(), 3, kH, kW),
+                     h3ctx::frame_luma(t->data.data(),
+                                       (std::int64_t)t->data.size())});
+    }
+    return out;
+  };
+
+  const auto off  = run(0.0, false);   // measures, touches nothing
+  const auto both = run(1.0, true);
+  ASSERT_TRUE(off.size() == (std::size_t)(kSkip + kBase + kTail));
+  ASSERT_TRUE(both.size() == off.size());
+  if (both.size() != off.size() ||
+      off.size() < (std::size_t)(kSkip + kBase + 4)) {
+    return;
+  }
+  const std::size_t head = (std::size_t)(kSkip + kBase);
+  auto mean = [](const std::vector<std::pair<double, double>>& v,
+                 std::size_t a, std::size_t b, bool level) {
+    double s = 0.0;
+    for (std::size_t i = a; i < b; ++i) { s += level ? v[i].second : v[i].first; }
+    return s / (double)(b - a);
+  };
+
+  // Uncorrected, the take drifts on both axes.
+  EXPECT_TRUE(mean(off, head, off.size(), false) >
+              mean(off, kSkip, head, false) * 1.15);
+  EXPECT_TRUE(mean(off, head, off.size(), true) >
+              mean(off, kSkip, head, true) + 10.0);
+
+  // Corrected, the grade comes back onto the first clip's...
+  EXPECT_TRUE(std::abs(mean(both, head, both.size(), true) -
+                       mean(both, kSkip, head, true)) < 3.0);
+  // ...and the band the correction removes comes down. The reference
+  // does not claim to remove the drift entirely -- it measured 1.49x to
+  // 1.22x -- so this asks for a clear reduction, not for none.
+  EXPECT_TRUE(mean(both, head, both.size(), false) <
+              mean(off, head, off.size(), false));
+
+  // WHAT IT DOES NOT DO, recorded because it is surprising and it is the
+  // reference's own behaviour, not this port's: the contrast-normalised
+  // Laplacian the correction is DRIVEN by does not come down with it.
+  // The band removed is mid-scale and the measure divides by whole-frame
+  // variance, which that band carries most of, so taking it out raises
+  // the number -- by about a quarter at full correction on this content.
+  // There is no feedback: each frame's target is computed from the frame
+  // as it arrives, never from a corrected one, so nothing runs away.
+  // Assert it, so a future change to either half is noticed here.
+  {
+    auto frame = noise_beat_(kH, kW, 300, 2.2, 2.0, 20);
+    auto* t = dynamic_cast<TensorBeatPayload*>(frame.get());
+    ASSERT_TRUE(t != nullptr);
+    if (t != nullptr) {
+      const double lap0 = h3ctx::norm_laplacian(t->data.data(), 3, kH, kW);
+      const double band0 =
+          h3ctx::structure_band_energy(t->data.data(), 3, kH, kW);
+      std::vector<float> scratch;
+      h3ctx::subtract_structure_band(t->data.data(), 3, kH, kW, 0.85,
+                                     &scratch);
+      EXPECT_TRUE(h3ctx::structure_band_energy(t->data.data(), 3, kH, kW) <
+                  band0);                       // the band: down
+      EXPECT_TRUE(h3ctx::norm_laplacian(t->data.data(), 3, kH, kW) > lap0);
+    }                                           // the measure: up
+  }
+}
+
+TEST(minimax_h3_context_stages, chain_normalize_passes_a_short_take_through)
+{
+  constexpr int kH = 40, kW = 56;
+  Session sess;
+  Pipeline pl("short-take", &sess);
+  auto src_u = std::make_unique<ListSource>(&sess, "frames",
+                                            std::vector<InEdge>{},
+                                            FlexData::make_object());
+  // Under the reference's floor of 8 frames: nothing is levelled, and
+  // every frame comes out as it went in. The window below is set so the
+  // colour reference IS picked (frame 4 of a window of 8) before the
+  // take runs out -- untouched has to mean the grade too.
+  std::vector<std::vector<std::uint8_t>> want;   // plain copies
+  for (int i = 0; i < 6; ++i) {
+    auto b = noise_beat_(kH, kW, 11 + i, 1.0, 1.0, 0);
+    const auto& d = dynamic_cast<const TensorBeatPayload*>(b.get())->data;
+    want.emplace_back(d.begin(), d.end());
+    src_u->beats.push_back(std::move(b));
+  }
+  src_u->allocate_oports(1);
+  auto* src = pl.insert_stage(std::move(src_u));
+  auto* norm = pl.insert_stage(std::make_unique<MiniMaxH3ChainNormalizeStage>(
+      &sess, "norm", std::vector<InEdge>{{src, 0}},
+      cfg_({{"skip_seconds", FlexData::make_real(0.0)},
+            {"baseline_seconds", FlexData::make_real(0.1)},
+            {"fps", FlexData::make_real(24.0)}})));
+  auto* cv = static_cast<Collect*>(pl.insert_stage(std::make_unique<Collect>(
+      &sess, "cv", std::vector<InEdge>{{norm, 0}}, FlexData::make_object())));
+  PipelineRuntime rt(&pl, &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  EXPECT_TRUE(cv->got.size() == want.size());
+  if (cv->got.size() != want.size()) { return; }
+  for (std::size_t k = 0; k < want.size(); ++k) {
+    const auto* t = dynamic_cast<const TensorBeatPayload*>(cv->got[k].get());
+    EXPECT_TRUE(t != nullptr &&
+                std::equal(t->data.begin(), t->data.end(),
+                           want[k].begin(), want[k].end()));
+  }
 }

@@ -1,0 +1,106 @@
+{
+  "id": "minimax-h3-chain-join",
+  "stages": [
+    {
+      "id": "load-parts",
+      "type": "load-video",
+      "iports": [],
+      "config": {
+        "input_url": [
+          "minimax-h3-chain-01.mp4",
+          "minimax-h3-chain-02.mp4",
+          "minimax-h3-chain-03.mp4"
+        ],
+        "enable_video": true,
+        "enable_audio": true
+      }
+    },
+    {
+      "id": "video-to-rgb",
+      "type": "video-to-rgb",
+      "iports": [
+        {
+          "src": "load-parts",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dtype": "u8"
+      }
+    },
+    {
+      "id": "minimax-h3-chain-normalize",
+      "type": "minimax-h3-chain-normalize",
+      "iports": [
+        {
+          "src": "video-to-rgb",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "skip_seconds": 1.0,
+        "baseline_seconds": 3.5,
+        "fps": 24,
+        "strength": 1.0,
+        "deadband": 1.06,
+        "ema": 0.1,
+        "colour_match": true
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "minimax-h3-chain-normalize",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-parts",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "output_sample_rate": 32000,
+        "channels": 2,
+        "chunk_duration_s": 10.0,
+        "max_chunk_duration_s": 30.0
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "minimax-h3-chain.mp4",
+        "enable_video": true,
+        "enable_audio": true,
+        "video_bitrate": 12000000,
+        "video_gop_size": 24,
+        "audio_bitrate": 192000,
+        "muxer_options": {
+          "movflags": "+faststart"
+        }
+      }
+    }
+  ],
+  "subpipelines": []
+}

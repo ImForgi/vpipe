@@ -46,6 +46,7 @@ arrives in **8–16 steps** instead of 30+.
     - [The chain](#the-chain)
     - [The settings](#the-settings)
     - [The flash at the join](#the-flash-at-the-join)
+    - [The texture ratchet](#the-texture-ratchet)
     - [What the context costs](#what-the-context-costs)
     - [The context file](#the-context-file)
   - [The released weights, either partition](#the-released-weights-either-partition)
@@ -1336,6 +1337,60 @@ and a `luma_match_frames` beyond 10 is not useful: the level it aims at is read
 from frames 2–10.
 (ComfyUI's H3Studio found the same artifact in its own chains and corrects it
 the same way, in its reel export.)
+
+#### The texture ratchet
+
+The flash above is a seam. This one is not: a continued clip renders a
+little **crisper** than the clip it continues, and because each clip is
+generated from the one before it, that compounds. ComfyUI-H3-Multishot
+measures it at **about +13 % fine texture per join** at 736×1280, names it
+the **texture ratchet**, and reports that under about four windows it is
+slight while at seven it is visible sharpening. The grade wanders the same
+way. Its own in-loop controls, it says, "damp it but never fully remove
+it", so it levels the finished take instead, in a node called
+H3ChainNormalize.
+
+`minimax-h3-chain-normalize` is that node, ported as it stands. It goes
+over the **joined** chain, just before it becomes a video:
+
+```
+load-video (the clips, as an array) → video-to-rgb
+    → minimax-h3-chain-normalize → rgb-to-video → save-video
+```
+
+[`minimax-h3-chain-join.vpipeline`](pipelines/minimax-h3-chain-join.vpipeline)
+is that graph, and it is the same one for both partitions — it reads the
+finished clips, so nothing in it is FL2VA or Ref2VA specific.
+
+The first clip sets the level. `skip_seconds` (2) drops the opening,
+because H3 opens with an exposure fade-in and letting it into the baseline
+would drag it dark and soften the whole take; the **median** of the next
+`baseline_seconds` (10) becomes the house level. Every frame is then
+measured by the same **contrast-normalised Laplacian**, so a clip that is
+merely brighter is not mistaken for a sharper one, and anything more than
+`deadband` (1.06) over the baseline is pulled back by `strength` (1),
+smoothed by `ema` (0.10) so the correction eases in rather than stepping at
+a window boundary. `colour_match` histogram-matches every frame to one
+reference frame from the first clip, which is what holds the grade still —
+the half no sharpening control touches.
+
+The correction is applied to the **5-to-17 pixel structure band** only —
+the difference of two box blurs — so grain and sensor noise pass through.
+That is deliberate and measured upstream: a whole-frame blur levels the
+drift just as well but costs about 20 % of the fine band, the texture
+worth keeping. On their 84 s gauge the structure-only version took the
+drift from 1.49× to 1.22× with the grain intact.
+
+**`skip_seconds + baseline_seconds` has to fit inside clip one.** Run past
+its end and the window measures the next clip's drift and levels the take
+against that. The defaults suit a first clip of 12 s or more; the chain
+examples here make 124-frame clips, so that pipeline uses 1 s and 3.5 s.
+
+This levels a take that has already drifted rather than preventing the
+drift, and it does not claim to remove it — 1.49× to 1.22× is what the
+reference measured. For a long sequence the other half of the answer is
+its advice too: **keep a chain to about four links** and restart at a
+natural cut.
 
 #### What the context costs
 

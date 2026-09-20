@@ -8,6 +8,7 @@
 
 #include "stages/minimax-h3-context.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -387,4 +388,124 @@ TEST(minimax_h3_context, header_and_tail_reads)
   ASSERT_TRUE(h3ctx::read_context_tail(path, 7, 37, &tail, &err));
   EXPECT_TRUE(tail.video == want_v && tail.audio.empty());
   std::filesystem::remove(path);
+}
+
+
+// Multi-octave value noise: broadband, the way footage is. A single
+// frequency will not do -- `norm_laplacian` divides contrast out, so a
+// lone checker's measure does not move however hard it is softened.
+static std::vector<std::uint8_t>
+noise_frame_(int h, int w, unsigned seed, double fine_gain, int bias)
+{
+  std::vector<double> img((std::size_t)h * w, 128.0 + bias);
+  std::uint64_t s = (std::uint64_t)seed * 2654435761u + 1;
+  auto rnd = [&]() {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    return (double)((s >> 11) & 0xffff) / 65535.0 - 0.5;
+  };
+  for (int oct = 0; oct < 6; ++oct) {
+    const int step = 1 << (5 - oct);
+    const double amp = (oct >= 4 ? 18.0 * fine_gain : 18.0) / (1.0 + oct * 0.5);
+    const int gh = h / step + 2, gw = w / step + 2;
+    std::vector<double> g((std::size_t)gh * gw);
+    for (auto& v : g) { v = rnd() * amp; }
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const int gy = y / step, gx = x / step;
+        const double fy = (double)(y % step) / step;
+        const double fx = (double)(x % step) / step;
+        const double a = g[(std::size_t)gy * gw + gx];
+        const double b = g[(std::size_t)gy * gw + gx + 1];
+        const double c = g[(std::size_t)(gy + 1) * gw + gx];
+        const double d = g[(std::size_t)(gy + 1) * gw + gx + 1];
+        img[(std::size_t)y * w + x] +=
+            a + (b - a) * fx + ((c - a) + ((d - c) - (b - a)) * fx) * fy;
+      }
+    }
+  }
+  std::vector<std::uint8_t> f((std::size_t)3 * h * w);
+  const std::size_t plane = (std::size_t)h * w;
+  for (int c = 0; c < 3; ++c) {
+    for (std::size_t i = 0; i < plane; ++i) {
+      f[(std::size_t)c * plane + i] =
+          (std::uint8_t)std::clamp((int)std::llround(img[i]), 0, 255);
+    }
+  }
+  return f;
+}
+
+// The pieces H3ChainNormalize is built from, pinned to what it expects
+// of them.
+TEST(minimax_h3_context, chain_normalise_parts)
+{
+  constexpr int kH = 96, kW = 128, kC = 3;
+  const std::size_t plane = (std::size_t)kH * kW;
+
+  // The measure divides contrast out: the same frame brighter, or with
+  // its contrast stretched, measures the same. That is the property the
+  // deadband relies on -- a clip that is merely brighter must not be
+  // softened for it.
+  auto f = noise_frame_(kH, kW, 7, 1.0, 0);
+  const double d = h3ctx::norm_laplacian(f.data(), kC, kH, kW);
+  EXPECT_TRUE(d > 0.0);
+  auto brighter = f;
+  for (auto& v : brighter) { v = (std::uint8_t)std::min(255, v + 30); }
+  EXPECT_TRUE(std::abs(h3ctx::norm_laplacian(brighter.data(), kC, kH, kW) / d
+                       - 1.0) < 0.05);
+  // ... but finer structure at the same contrast measures higher.
+  auto finer = noise_frame_(kH, kW, 7, 2.0, 0);
+  EXPECT_TRUE(h3ctx::norm_laplacian(finer.data(), kC, kH, kW) > d * 1.2);
+
+  // The correction takes the 5-to-17 px band and leaves the fine one:
+  // that is the whole reason it is a band and not a blur.
+  std::vector<float> scratch;
+  auto band_removed = f;
+  h3ctx::subtract_structure_band(band_removed.data(), kC, kH, kW, 0.0,
+                                 &scratch);
+  EXPECT_TRUE(band_removed == f);                   // amount 0 changes nothing
+  h3ctx::subtract_structure_band(band_removed.data(), kC, kH, kW, 0.5,
+                                 &scratch);
+  // It took energy OUT of the band it names, which is the point. Note
+  // that `norm_laplacian` moves the other way here: that band carries
+  // whole-frame variance, and the measure divides by it.
+  EXPECT_TRUE(h3ctx::structure_band_energy(band_removed.data(), kC, kH, kW) <
+              h3ctx::structure_band_energy(f.data(), kC, kH, kW) * 0.9);
+  // The fine band survives it. Measured as the frame against its own 3x3
+  // blur, which is what "grain passes through" means.
+  auto fine_energy = [&](const std::vector<std::uint8_t>& x) {
+    double e = 0.0;
+    for (int y = 1; y < kH - 1; ++y) {
+      for (int xx = 1; xx < kW - 1; ++xx) {
+        const std::size_t i = (std::size_t)y * kW + xx;
+        double b = 0.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            b += x[i + (std::size_t)(dy * kW + dx)];
+          }
+        }
+        const double v = (double)x[i] - b / 9.0;
+        e += v * v;
+      }
+    }
+    return e;
+  };
+  EXPECT_TRUE(fine_energy(band_removed) > fine_energy(f) * 0.8);
+
+  // Histogram matching carries one frame's distribution onto another's,
+  // and matching a frame to itself is the identity.
+  double cdf_src[256], cdf_ref[256];
+  std::uint8_t lut[256];
+  h3ctx::channel_cdf(brighter.data(), kC, kH, kW, 0, cdf_src);
+  h3ctx::channel_cdf(f.data(), kC, kH, kW, 0, cdf_ref);
+  h3ctx::match_lut(cdf_src, cdf_ref, lut);
+  auto matched = brighter;
+  h3ctx::apply_lut(matched.data(), kC, kH, kW, 0, lut);
+  double m1 = 0.0, m2 = 0.0;
+  for (std::size_t i = 0; i < plane; ++i) { m1 += matched[i]; m2 += f[i]; }
+  EXPECT_TRUE(std::abs(m1 - m2) / (double)plane < 1.5);
+  h3ctx::channel_cdf(f.data(), kC, kH, kW, 0, cdf_src);
+  h3ctx::match_lut(cdf_src, cdf_src, lut);
+  auto self = f;
+  h3ctx::apply_lut(self.data(), kC, kH, kW, 0, lut);
+  EXPECT_TRUE(self == f);
 }

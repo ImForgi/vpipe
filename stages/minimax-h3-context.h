@@ -215,6 +215,54 @@ double luma_gain(const LumaTrend& body, double level, int k, int frames);
 // Multiply one frame by `gain`, saturating at 0 and 255.
 void apply_luma_gain(std::uint8_t* rgb, std::int64_t samples, double gain);
 
+// ---- levelling a whole chain -------------------------------------------
+//
+// A chain drifts in two ways the per-clip luma match cannot see, because
+// each belongs to the TAKE rather than to one join: fine texture
+// compounds clip by clip -- ComfyUI-H3-Multishot measures "about +13 %
+// fine texture per join" and calls it the texture ratchet -- and the
+// colour grade wanders away from the opening shot.
+//
+// These are the pieces of that pack's H3ChainNormalize node, ported as
+// it stands. The measure, the band, the deadband and the smoothing are
+// its choices, not ours: it was tuned against far more footage than we
+// have, so it is worth trying on its own terms before changing anything.
+
+// Contrast-normalised Laplacian energy for one frame: the mean squared
+// 4-neighbour Laplacian over the interior, divided by the variance of
+// the whole grey frame. Normalised, so a frame that is merely brighter
+// or higher-contrast does not read as sharper.
+double norm_laplacian(const std::uint8_t* rgb, int channels, int h, int w);
+
+// Subtract `amount` of the 5-to-17 pixel STRUCTURE band -- a box blur of
+// radius 2 minus one of radius 8 -- leaving grain and sensor noise
+// alone. A whole-frame blur levels the drift just as well but takes
+// about 20 % of the fine band with it, which is the texture worth
+// keeping. `scratch` is reused between frames and resized as needed.
+void subtract_structure_band(std::uint8_t* rgb, int channels, int h, int w,
+                             double amount, std::vector<float>* scratch);
+
+// The energy in that same band, normalised the same way the Laplacian
+// is. NOT part of the ported algorithm -- the reference neither measures
+// this nor needs to -- but it is the only thing that shows whether the
+// correction did what it says, because the measure the reference drives
+// itself by moves the OTHER way when the band is removed: taking out
+// mid-scale structure drops the whole-frame variance it divides by. So
+// the tests, and anyone inspecting a take, need this to see the effect.
+double structure_band_energy(const std::uint8_t* rgb, int channels, int h,
+                             int w);
+
+// Histogram matching, one channel at a time: `channel_cdf` measures,
+// `match_lut` maps one CDF onto another, `apply_lut` rewrites the plane.
+// Split this way so a stage can keep the reference's 256 numbers per
+// channel rather than the reference frame itself.
+void channel_cdf(const std::uint8_t* rgb, int channels, int h, int w,
+                 int channel, double* cdf256);
+void match_lut(const double* src_cdf256, const double* ref_cdf256,
+               std::uint8_t* lut256);
+void apply_lut(std::uint8_t* rgb, int channels, int h, int w, int channel,
+               const std::uint8_t* lut256);
+
 // ---- the context file --------------------------------------------------
 //
 // One safetensors file:
